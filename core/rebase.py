@@ -34,6 +34,8 @@ The live preview mode (core/ablation) applies the SAME transform via hooks on th
 RMSNorm output: the preview and the exported checkpoint differ only by rounding.
 """
 
+from dataclasses import dataclass
+
 import torch
 
 from core.ablation import effective_coeffs
@@ -84,19 +86,113 @@ def _submodule(block, dotted):
     return module
 
 
+@dataclass(frozen=True)
+class TransformTarget:
+    """A residual-coordinate tensor, without assuming ``nn.Linear.weight``.
+
+    ``state_suffix`` is the exact checkpoint suffix.  ``accessor`` names the
+    module/parameter on the instantiated block, ``axis`` is the residual input
+    axis (negative indexing), and ``lora_supported`` distinguishes ordinary
+    module weights from packed functional parameters.
+    """
+
+    state_suffix: str
+    accessor: str
+    norm_name: str
+    axis: int = -1
+    activation_accessor: str | None = None
+    lora_supported: bool = True
+
+    def tensor(self, block):
+        obj = _submodule(block, self.accessor)
+        if obj is None:
+            return None
+        return obj.weight if self.state_suffix.endswith(".weight") else obj
+
+
+@dataclass(frozen=True)
+class RebaseCapabilities:
+    readthrough_supported: bool
+    readthrough_reason: str
+    exact_supported: bool
+    exact_reason: str
+
+
+_MOE_READS = (
+    TransformTarget("mlp.gate.weight", "mlp.gate", "post_attention_layernorm"),
+    TransformTarget("mlp.experts.gate_up_proj", "mlp.experts.gate_up_proj", "post_attention_layernorm", lora_supported=False),
+    TransformTarget("mlp.shared_expert.gate_proj.weight", "mlp.shared_expert.gate_proj", "post_attention_layernorm"),
+    TransformTarget("mlp.shared_expert.up_proj.weight", "mlp.shared_expert.up_proj", "post_attention_layernorm"),
+    TransformTarget("mlp.shared_expert_gate.weight", "mlp.shared_expert_gate", "post_attention_layernorm"),
+)
+
+
+def _norm_is_supported(norm, hidden):
+    if norm is None or not hasattr(norm, "weight") or tuple(norm.weight.shape) != (hidden,):
+        return False
+    # RMS norms operate independently on the last dimension. LayerNorm's bias
+    # and mean subtraction are not compatible with gamma conjugation.
+    return not hasattr(norm, "bias") or norm.bias is None
+
+
+def block_capabilities(block):
+    """Positively validate a complete supported topology; unknowns fail closed."""
+    try:
+        for marker in _UNSUPPORTED_MARKERS:
+            if getattr(block, marker, None) is not None:
+                raise ValueError(f"layer has unsupported residual branch {marker}")
+        full = _submodule(block, "self_attn") is not None
+        linear = _submodule(block, "linear_attn") is not None
+        if full == linear:
+            raise ValueError("token-mixer topology is unknown or ambiguous")
+        mixer = (("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj") if full else
+                 ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_b", "linear_attn.in_proj_a"))
+        first = _submodule(block, mixer[0])
+        hidden = first.weight.shape[-1] if first is not None and hasattr(first, "weight") else None
+        if hidden is None:
+            raise ValueError(f"required reader {mixer[0]}.weight is absent")
+        if not _norm_is_supported(getattr(block, "input_layernorm", None), hidden):
+            raise ValueError("input_layernorm is not a supported RMS normalization")
+        targets = [TransformTarget(s + ".weight", s, "input_layernorm") for s in mixer]
+        sparse = _submodule(block, "mlp.experts.gate_up_proj") is not None
+        if sparse:
+            targets.extend(_MOE_READS)
+            if not _norm_is_supported(getattr(block, "post_attention_layernorm", None), hidden):
+                raise ValueError("post_attention_layernorm is not a supported RMS normalization")
+        else:
+            for s in ("mlp.gate_proj", "mlp.up_proj"):
+                if _submodule(block, s) is None:
+                    raise ValueError(f"required reader {s}.weight is absent")
+                targets.append(TransformTarget(s + ".weight", s, "post_attention_layernorm" if getattr(block, "post_attention_layernorm", None) is not None else "input_layernorm"))
+        for target in targets:
+            tensor = target.tensor(block)
+            if tensor is None:
+                raise ValueError(f"required reader {target.state_suffix} is absent")
+            if tensor.ndim < 2 or tensor.shape[target.axis] != hidden:
+                raise ValueError(f"reader {target.state_suffix} has wrong residual hidden axis")
+        exact_ok = not sparse
+        exact_reason = ("supported" if exact_ok else
+            "packed routed and shared-expert residual writers require a separate implementation and aggregate-MoE live oracle")
+        return RebaseCapabilities(True, "supported", exact_ok, exact_reason)
+    except ValueError as exc:
+        return RebaseCapabilities(False, str(exc), False, f"readthrough unsupported: {exc}")
+
+
 def check_block_supported(block):
-    for marker in _UNSUPPORTED_MARKERS:
-        if getattr(block, marker, None) is not None:
-            raise ValueError(
-                "architecture not supported by the readthrough/exact modes: "
-                f"the layer has {marker} (write norm, Gemma style) — "
-                "the read transform would be incorrect there"
-            )
+    capability = block_capabilities(block)
+    if not capability.readthrough_supported:
+        raise ValueError("architecture not supported by readthrough: " + capability.readthrough_reason)
 
 
 def iter_reads(block):
     """Yields ``(suffix, module, norm)`` for each residual read."""
     check_block_supported(block)
+    if _submodule(block, "mlp.experts.gate_up_proj") is not None:
+        mixer = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj") if _submodule(block, "self_attn") is not None else ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_b", "linear_attn.in_proj_a")
+        targets = [TransformTarget(s + ".weight", s, "input_layernorm") for s in mixer] + list(_MOE_READS)
+        for target in targets:
+            yield target, target.tensor(block), getattr(block, target.norm_name)
+        return
     for suffix, norm_name in READS.items():
         module = _submodule(block, suffix)
         if module is None:
@@ -106,7 +202,7 @@ def iter_reads(block):
         norm = getattr(block, norm_name, None)
         if norm is None or not hasattr(norm, "weight"):
             raise ValueError(f"RMSNorm {norm_name} not found for {suffix}")
-        yield suffix, module, norm
+        yield TransformTarget(suffix + ".weight", suffix, norm_name), module.weight, norm
 
 
 def iter_writes(block):
@@ -205,9 +301,16 @@ def gamma_pair(norm, U, V):
 
 
 def apply_read(W, Ug, Vg):
-    """``W ← W·(I + Ug·Vgᵀ)``; returns ``(W_new, B, A)`` with delta = B·A."""
+    """Right-transform ``[..., output_features, hidden_size]`` tensors."""
+    if W.ndim < 2:
+        raise ValueError("read tensor must have at least two dimensions")
+    if W.shape[-1] != Ug.shape[0] or Ug.shape[0] != Vg.shape[0]:
+        raise ValueError("read tensor residual hidden axis does not match transform")
     B = W @ Ug  # [out, r]
-    return W + B @ Vg.T, B, Vg.T.contiguous()
+    result = W + B @ Vg.T
+    if result.shape != W.shape:
+        raise ValueError("read transform changed tensor shape")
+    return result, B, Vg.T.contiguous()
 
 
 def inverse_uv(U, V):
@@ -269,11 +372,14 @@ def build_plan(rules, jl, scale, exact=False):
     for m in sorted(k for k in cums if k < n_layers):
         U, V = cums[m]
         block = jl.layers[m]
-        for suffix, _module, norm in iter_reads(block):
+        caps = block_capabilities(block)
+        if exact and not caps.exact_supported:
+            raise ValueError("exact mode is unavailable: " + caps.exact_reason)
+        for target, _tensor, norm in iter_reads(block):
             Ug, Vg = gamma_pair(norm, U, V)
             g_min = effective_gamma(norm).abs().min().item()
             min_gamma = g_min if min_gamma is None else min(min_gamma, g_min)
-            transforms[f"{path}.layers.{m}.{suffix}.weight"] = ("read", Ug, Vg)
+            transforms[f"{path}.layers.{m}.{target.state_suffix}"] = ("read", Ug, Vg)
         if exact:
             U_inv, Vw, regularized = inverse_uv(U, V)
             if regularized:
@@ -296,5 +402,6 @@ def build_plan(rules, jl, scale, exact=False):
         "layers_span": [min(cums), n_layers - 1],
         "regularized_layers": regularized_layers,
         "min_gamma": min_gamma,
+        "targets": {f"{path}.layers.{m}.{target.state_suffix}": target for m in sorted(k for k in cums if k < n_layers) for target, _tensor, _norm in iter_reads(jl.layers[m])},
     }
     return transforms, info

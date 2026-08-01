@@ -414,15 +414,11 @@ def api_interventions_scale(req: InterventionsScale):
         interventions.set_scale(req.scale)
     try:
         if req.mode is not None:
-            if (
-                req.mode in ("readthrough", "exact")
-                and manager.meta is not None
-                and manager.meta.get("rebase_supported") is False
-            ):
+            capability = f"{req.mode}_supported" if req.mode in ("readthrough", "exact") else None
+            if capability and manager.meta is not None and manager.meta.get(capability, manager.meta.get("rebase_supported")) is False:
                 raise HTTPException(
                     422,
-                    "read projection unavailable on this architecture (write "
-                    "norms, Gemma style) — use \"abliteration\" for pure weights",
+                    manager.meta.get(f"{req.mode}_reason", "read projection unavailable on this architecture"),
                 )
             interventions.set_mode(req.mode)
     except ValueError as exc:

@@ -502,12 +502,11 @@ class ModelManager:
                 # style) can't take the reads change of basis — the UI falls
                 # back to the global abliteration for pure-weights edits.
                 from core import rebase
-                try:
-                    for block in self.jl.layers:
-                        rebase.check_block_supported(block)
-                    rebase_supported = True
-                except ValueError:
-                    rebase_supported = False
+                capabilities = [rebase.block_capabilities(block) for block in self.jl.layers]
+                readthrough_supported = all(c.readthrough_supported for c in capabilities)
+                exact_supported = all(c.exact_supported for c in capabilities)
+                readthrough_reason = next((c.readthrough_reason for c in capabilities if not c.readthrough_supported), "supported")
+                exact_reason = next((c.exact_reason for c in capabilities if not c.exact_supported), "supported")
                 self.meta = {
                     "model_id": model_id,
                     "revision": _resolve_revision(source),
@@ -516,7 +515,12 @@ class ModelManager:
                     "device": device,
                     "n_layers": text_config.num_hidden_layers,
                     "d_model": text_config.hidden_size,
-                    "rebase_supported": rebase_supported,
+                    # Legacy UI field means the safe pure-weight/readthrough path.
+                    "rebase_supported": readthrough_supported,
+                    "readthrough_supported": readthrough_supported,
+                    "readthrough_reason": readthrough_reason,
+                    "exact_supported": exact_supported,
+                    "exact_reason": exact_reason,
                     "chat_template_source": chat_template_source,
                     "chat_template_fallback": chat_template_fallback,
                     "load_seconds": round(time.perf_counter() - started, 1),

@@ -378,6 +378,19 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
     transforms, info = rebase.build_plan(rules, jl, scale, exact=exact)
     lm_head_key = info["lm_head_key"]
 
+    packed = [key for key, target in info["targets"].items()
+              if not target.lora_supported or target.tensor(jl.layers[int(key.split(".layers.", 1)[1].split(".", 1)[0])]).ndim > 2]
+    if packed and fmt == "lora":
+        raise ValueError(
+            "LoRA export is unavailable for packed MoE parameters. "
+            "Use full-checkpoint export."
+        )
+    if packed and fmt == "layers":
+        raise ValueError(
+            "modified-layers export is unavailable for packed MoE parameters: "
+            "bounded-memory sharding is not implemented. Use full-checkpoint export."
+        )
+
     delta_max = 0.0
     applied = set()
 
@@ -385,7 +398,10 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
         nonlocal delta_max
         W = tensor.detach().to("cpu", torch.float32)
         W_new, _B, _A = rebase.apply_transform(transforms[key], W)
-        delta_max = max(delta_max, (W_new - W).abs().max().item())
+        # Chunking avoids a third full-sized float32 packed-expert allocation.
+        flat_new, flat_old = W_new.reshape(-1), W.reshape(-1)
+        for start in range(0, flat_new.numel(), 1 << 20):
+            delta_max = max(delta_max, (flat_new[start:start + (1 << 20)] - flat_old[start:start + (1 << 20)]).abs().max().item())
         applied.add(key)
         return W_new
 
@@ -504,6 +520,12 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
         transforms = {to_disk(k): fn for k, fn in transforms.items()}
         lm_head_key = to_disk(lm_head_key)
         embed_key = to_disk(info["embed_key"])
+        if any(key.startswith("mtp.") for key in disk_keys):
+            warnings.append(
+                "MTP weights were preserved but not transformed. Ordinary Transformers "
+                "generation does not use them, but MTP/speculative decoding fidelity is not "
+                "guaranteed for this edited checkpoint."
+            )
 
         lm_head_written = False
         embed_shard_name = None
