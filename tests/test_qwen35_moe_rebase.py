@@ -759,7 +759,62 @@ def test_superscript_reserved_names_fail_core_and_api(base, style, tmp_path):
     app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
     with pytest.raises(app.HTTPException) as exc:
         asyncio.run(app.api_edit_export_gguf(SimpleNamespace(name=value, gguf_type="bf16")))
-    assert exc.value.status_code == 422
+    assert exc.value.status_code == 422 and "reserved" in exc.value.detail
+
+
+@pytest.mark.parametrize("name", ["COM¹", "com²", "COM³.txt", "LPT¹", "lpt².json", "folder/LPT³"])
+def test_gguf_reserved_cache_hit_rejected_before_side_effects(name, tmp_path, monkeypatch):
+    import api.app as app
+    from fastapi.testclient import TestClient
+    monkeypatch.setattr(app.editing, "EDITS_DIR", tmp_path / "edits")
+    cached = app.editing.EDITS_DIR / name / "hf"; cached.mkdir(parents=True)
+    sentinel = cached / "config.json"; sentinel.write_text('{"old": true}')
+    def forbidden(*_args, **_kwargs): raise AssertionError("validation ordering violated")
+    monkeypatch.setattr(app, "_llamacpp_paths", forbidden)
+    monkeypatch.setattr(app.editing, "export_rebase", forbidden)
+    monkeypatch.setattr(app, "threading", SimpleNamespace(Thread=forbidden))
+    original_state = {"state": "idle", "name": None, "step": None, "error": None, "result": None}
+    app._gguf_state.update(original_state)
+    response = TestClient(app.app).post("/api/edit/export-gguf", json={"name": name, "gguf_type": "bf16"})
+    assert response.status_code == 422 and "reserved" in response.json()["detail"]
+    assert sentinel.read_text() == '{"old": true}' and app._gguf_state == original_state
+
+
+@pytest.mark.parametrize("name", ["COM¹", "com²", "COM³.txt", "LPT¹", "lpt².json", "folder/LPT³"])
+def test_gguf_reserved_cache_delete_preserves_sentinel(name, tmp_path, monkeypatch):
+    import api.app as app
+    from fastapi.testclient import TestClient
+    monkeypatch.setattr(app.editing, "EDITS_DIR", tmp_path / "edits")
+    cached = app.editing.EDITS_DIR / name / "hf"; cached.mkdir(parents=True)
+    sentinel = cached / "keep.bin"; sentinel.write_bytes(b"keep")
+    original_state = {"state": "idle", "name": None, "step": None, "error": None, "result": None}
+    app._gguf_state.update(original_state)
+    response = TestClient(app.app).post("/api/edit/gguf-cache/delete", json={"name": name})
+    assert response.status_code == 422 and "reserved" in response.json()["detail"]
+    assert sentinel.read_bytes() == b"keep" and app._gguf_state == original_state
+
+
+def test_gguf_valid_cached_reuse_and_delete(tmp_path, monkeypatch):
+    import api.app as app
+    from fastapi.testclient import TestClient
+    monkeypatch.setattr(app.editing, "EDITS_DIR", tmp_path / "edits")
+    cached = app.editing.EDITS_DIR / "job" / "hf"; cached.mkdir(parents=True)
+    (cached / "config.json").write_text("{}")
+    monkeypatch.setattr(app, "_llamacpp_paths", lambda: (tmp_path / "convert.py", None, None))
+    monkeypatch.setattr(app.editing, "export_rebase",
+                        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("cache was not reused")))
+    started = []
+    class FakeThread:
+        def __init__(self, *args, **kwargs): started.append((args, kwargs))
+        def start(self): pass
+    monkeypatch.setattr(app, "threading", SimpleNamespace(Thread=FakeThread))
+    app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
+    client = TestClient(app.app)
+    response = client.post("/api/edit/export-gguf", json={"name": "job", "gguf_type": "bf16"})
+    assert response.status_code == 200 and response.json()["checkpoint"] == "reused" and started
+    app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
+    response = client.post("/api/edit/gguf-cache/delete", json={"name": "job"})
+    assert response.status_code == 200 and not cached.exists()
 
 
 def test_superscript_reserved_index_shard_is_rejected(tiny, tmp_path, monkeypatch):

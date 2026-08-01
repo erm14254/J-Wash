@@ -36,6 +36,9 @@ Names are first checked under POSIX and Windows lexical rules, rejecting absolut
 drive/UNC, traversal, dot, reserved-device, and nonportable components.
 Reserved devices include the Unicode Windows aliases `COM¹`–`COM³` and
 `LPT¹`–`LPT³`, including extension and nested-component forms.
+GGUF preparation and cache deletion call this same public validator before any
+cache probe, llama.cpp lookup, export, state mutation, worker creation, or delete;
+invalid legacy cache names therefore return HTTP 422 without touching the cache.
 It streams source shards, preserves unmatched tensors and
 raw tensor dtype/rank, and maps the in-memory `model.layers` prefix to the
 official `model.language_model.layers` disk prefix. MTP tensors are copied

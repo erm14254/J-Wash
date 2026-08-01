@@ -638,7 +638,12 @@ def _gguf_worker(name, gguf_type, hf_dir, convert, quantize, gguf_py):
 
 @app.post("/api/edit/export-gguf")
 async def api_edit_export_gguf(req: GGUFExportRequest):
-    req.name = _safe_name(req.name)
+    try:
+        name_parts = editing.validate_export_name(req.name)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    validated_name = "/".join(name_parts)
+    job_dir = editing.EDITS_DIR.joinpath(*name_parts)
     if _gguf_state["state"] == "running":
         raise HTTPException(409, "a GGUF export is already in progress")
     if req.gguf_type not in GGUF_BASE_TYPES + GGUF_QUANT_TYPES:
@@ -650,7 +655,7 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
     if req.gguf_type not in GGUF_BASE_TYPES and quantize is None:
         raise HTTPException(422, "llama-quantize not found — pick bf16 or f16")
 
-    hf_dir = editing.EDITS_DIR / req.name / "hf"
+    hf_dir = job_dir / "hf"
     baked = "reused"
     if not (hf_dir / "config.json").exists():
         # no cached checkpoint: bake one from the ACTIVE rules (same path as a
@@ -671,7 +676,7 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
         try:
             await asyncio.to_thread(
                 export_fn, rules, manager.jl, manager.meta,
-                fmt="full", name=f"{req.name}/hf", source_dir=source_dir,
+                fmt="full", name="/".join((*name_parts, "hf")), source_dir=source_dir,
                 scale=interventions.global_scale, **kwargs,
             )
         except ValueError as exc:
@@ -680,10 +685,10 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
             raise HTTPException(500, str(exc))
         baked = "baked"
 
-    _gguf_state.update(state="running", name=req.name, step="starting", error=None, result=None)
+    _gguf_state.update(state="running", name=validated_name, step="starting", error=None, result=None)
     threading.Thread(
         target=_gguf_worker,
-        args=(req.name, req.gguf_type, hf_dir, convert, quantize, gguf_py),
+        args=(validated_name, req.gguf_type, hf_dir, convert, quantize, gguf_py),
         daemon=True,
     ).start()
     return {"started": True, "checkpoint": baked, "state": dict(_gguf_state)}
@@ -697,10 +702,15 @@ class GGUFCacheRequest(BaseModel):
 def api_gguf_cache_delete(req: GGUFCacheRequest):
     """Drop the cached HF checkpoint of a GGUF export (the .gguf files stay)."""
     import shutil
-    hf_dir = editing.EDITS_DIR / _safe_name(req.name) / "hf"
+    try:
+        name_parts = editing.validate_export_name(req.name)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    validated_name = "/".join(name_parts)
+    hf_dir = editing.EDITS_DIR.joinpath(*name_parts) / "hf"
     if not hf_dir.is_dir():
         raise HTTPException(404, f"no cached checkpoint for {req.name}")
-    if _gguf_state["state"] == "running" and _gguf_state["name"] == req.name:
+    if _gguf_state["state"] == "running" and _gguf_state["name"] == validated_name:
         raise HTTPException(409, "a GGUF export is using this cache")
     freed = sum(f.stat().st_size for f in hf_dir.rglob("*") if f.is_file())
     shutil.rmtree(hf_dir)

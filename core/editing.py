@@ -465,7 +465,7 @@ _WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 1
                      "COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³"}
 
 
-def _safe_relative_parts(name):
+def validate_export_name(name):
     """Lexically validate a portable relative export name before resolution."""
     if not isinstance(name, str) or not name:
         raise ValueError("export name must be a nonempty relative path")
@@ -482,7 +482,12 @@ def _safe_relative_parts(name):
             raise ValueError(f"export name contains Windows-reserved component {part!r}")
         if any(ord(char) < 32 or char in '<>:"|?*' for char in part):
             raise ValueError(f"export name contains nonportable component {part!r}")
-    return raw
+    return tuple(raw)
+
+
+def _safe_relative_parts(name):
+    """Backward-compatible private alias for the public validator."""
+    return validate_export_name(name)
 
 
 def apply_transform_bounded(entry, tensor, *, row_budget=REBASE_EXPORT_ROW_BUDGET,
@@ -523,7 +528,7 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
     rejected and never modified.  All construction occurs in a unique sibling
     staging directory which is removed on every failure.
     """
-    parts = _safe_relative_parts(name)
+    parts = validate_export_name(name)
     root = EDITS_DIR.resolve()
     final_dir = root.joinpath(*parts).resolve()
     try:
