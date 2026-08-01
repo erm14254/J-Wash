@@ -14,9 +14,10 @@ For any reader shaped `[..., output_features, hidden_size]`, the bake applies
 Live preview hooks each input/post-attention RMSNorm once, plus the final norm,
 and therefore applies the same residual-coordinate read transform.
 
-Architecture detection is positive and fail-closed: the mixer, complete reader
-inventory, RMS norms, and hidden axes must match. Older unpacked checkpoints and
-future renamed/fused layouts are rejected rather than partially edited.
+Within the tested version window, architecture detection is positive and
+fail-closed: the mixer, complete reader inventory, RMS norms, and hidden axes
+must match. No compatibility claim is made for later Transformers releases;
+the upper bound is widened only after their integration tests pass.
 
 Full-checkpoint export is built in a unique sibling staging directory and
 published by atomic rename; an existing destination is rejected and preserved.
