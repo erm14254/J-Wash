@@ -567,6 +567,10 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
         missing = set(transforms) - applied
         if missing:
             sample = sorted(missing)[:3]
+            # A streamed full export may already have written earlier shards.
+            # Never leave a checkpoint that looks usable but is only partially
+            # edited when the source inventory fails the completeness guard.
+            shutil.rmtree(out_dir, ignore_errors=True)
             raise ValueError(
                 f"{len(missing)} parameter(s) to transform absent from the source "
                 f"checkpoint (e.g. {sample}) — unexpected key names, export cancelled "

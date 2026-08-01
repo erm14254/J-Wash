@@ -170,9 +170,43 @@ def block_capabilities(block):
                 raise ValueError(f"required reader {target.state_suffix} is absent")
             if tensor.ndim < 2 or tensor.shape[target.axis] != hidden:
                 raise ValueError(f"reader {target.state_suffix} has wrong residual hidden axis")
-        exact_ok = not sparse
-        exact_reason = ("supported" if exact_ok else
-            "packed routed and shared-expert residual writers require a separate implementation and aggregate-MoE live oracle")
+        exact_ok = False
+        if sparse:
+            exact_reason = (
+                "packed routed and shared-expert residual writers require a separate "
+                "implementation and aggregate-MoE live oracle"
+            )
+        else:
+            # Exact preview hooks, and the bake left-multiplies, every residual
+            # writer.  Claim support only when the complete inventory for the
+            # positively identified mixer exists and has the contract used by
+            # both paths.  In particular a bias would be transformed by the
+            # live output hook but is not represented in the current bake.
+            expected_writes = (("self_attn.o_proj",) if full else
+                               ("linear_attn.out_proj",)) + ("mlp.down_proj",)
+            exact_reason = "supported"
+            for name in expected_writes:
+                writer = _submodule(block, name)
+                weight = getattr(writer, "weight", None)
+                if writer is None or weight is None:
+                    exact_reason = f"required residual writer {name}.weight is absent"
+                    break
+                if weight.ndim != 2 or weight.shape[0] != hidden:
+                    exact_reason = f"residual writer {name}.weight has wrong residual output axis"
+                    break
+                if getattr(writer, "bias", None) is not None:
+                    exact_reason = f"residual writer {name} has an untransformed bias"
+                    break
+                if not callable(writer) or not callable(getattr(writer, "register_forward_hook", None)):
+                    exact_reason = f"residual writer {name} is not hookable by the live exact path"
+                    break
+            else:
+                # No additional writers may silently escape the inventory.
+                present = {name for name in WRITES if _submodule(block, name) is not None}
+                if present != set(expected_writes):
+                    exact_reason = "residual writer inventory is ambiguous or incomplete"
+                else:
+                    exact_ok = True
         return RebaseCapabilities(True, "supported", exact_ok, exact_reason)
     except ValueError as exc:
         return RebaseCapabilities(False, str(exc), False, f"readthrough unsupported: {exc}")

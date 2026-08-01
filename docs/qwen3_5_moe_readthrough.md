@@ -1,7 +1,10 @@
 # Qwen3.5-MoE readthrough support
 
-Phase 1 supports the packed ordinary-decoder layout shipped by Transformers
-5.5.0. Each downstream full-attention block transforms q/k/v; each linear
+Phase 1 supports Transformers 5.5 and later when the installed Qwen3.5-MoE
+classes pass the complete positive topology checks. Integration tests always
+construct the installed implementation (rather than silently skipping newer
+versions), so a future incompatible layout fails clearly. Each downstream
+full-attention block transforms q/k/v; each linear
 attention block transforms all four `in_proj_*` readers; and every sparse block
 transforms the router, packed `experts.gate_up_proj` parameter, shared gate/up,
 and shared-expert gate. The exact raw packed key never receives `.weight`.
