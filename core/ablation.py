@@ -330,6 +330,10 @@ class Interventions:
         if not active:
             return
         n_layers = len(jl.layers)
+        # Model-wide Phase-1 contract: capability does not depend on which rule
+        # happens to be last.  This also validates the final norm before any
+        # hook registration is attempted.
+        rebase.model_preflight(jl, exact=exact)
         cums = rebase.cumulative(active, self._scale, n_layers)
         if not cums:
             return
@@ -355,7 +359,10 @@ class Interventions:
 
             return hook
 
-        handles = []
+        # Resolve the entire hook plan transactionally before registering any
+        # hook.  Unknown topology, missing writers, or an invalid final norm can
+        # therefore never leave a partially attached intervention.
+        sites = []
         for m in sorted(k for k in cums if k < n_layers):
             U, V = cums[m]
             block = jl.layers[m]
@@ -363,15 +370,21 @@ class Interventions:
             for _suffix, _module, norm in rebase.iter_reads(block):
                 norms[id(norm)] = norm
             for norm in norms.values():
-                handles.append(norm.register_forward_hook(read_hook_for(norm, U, V)))
+                sites.append((norm, read_hook_for(norm, U, V)))
             if exact:
                 U_inv, Vw, _regularized = rebase.inverse_uv(U, V)
                 for _suffix, module in rebase.iter_writes(block):
-                    handles.append(module.register_forward_hook(write_hook_for(module, U_inv, Vw)))
+                    sites.append((module, write_hook_for(module, U_inv, Vw)))
         U, V = cums[n_layers]
-        handles.append(
-            jl._final_norm.register_forward_hook(read_hook_for(jl._final_norm, U, V))
-        )
+        sites.append((jl._final_norm, read_hook_for(jl._final_norm, U, V)))
+        handles = []
+        try:
+            for module, hook in sites:
+                handles.append(module.register_forward_hook(hook))
+        except Exception:
+            for handle in handles:
+                handle.remove()
+            raise
         self._handles = handles
 
     def detach(self):

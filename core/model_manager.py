@@ -436,6 +436,28 @@ def _sample(logits, temperature, top_p, top_k, generator=None, penalty=1.0, pena
     return int(torch.multinomial(probs / probs.sum(), 1, generator=generator))
 
 
+def _rebase_capability_meta(jl):
+    """Public metadata contract, kept testable without loading a checkpoint."""
+    from core import rebase
+    try:
+        rebase.model_preflight(jl, exact=False)
+        readthrough_supported, readthrough_reason = True, "supported"
+    except ValueError as exc:
+        readthrough_supported, readthrough_reason = False, str(exc)
+    try:
+        rebase.model_preflight(jl, exact=True)
+        exact_supported, exact_reason = True, "supported"
+    except ValueError as exc:
+        exact_supported, exact_reason = False, str(exc)
+    return {
+        "rebase_supported": readthrough_supported,
+        "readthrough_supported": readthrough_supported,
+        "readthrough_reason": readthrough_reason,
+        "exact_supported": exact_supported,
+        "exact_reason": exact_reason,
+    }
+
+
 class ModelManager:
     def __init__(self):
         self._lock = threading.Lock()
@@ -501,12 +523,7 @@ class ModelManager:
                 # Read-projection support: write-norm architectures (Gemma
                 # style) can't take the reads change of basis — the UI falls
                 # back to the global abliteration for pure-weights edits.
-                from core import rebase
-                capabilities = [rebase.block_capabilities(block) for block in self.jl.layers]
-                readthrough_supported = all(c.readthrough_supported for c in capabilities)
-                exact_supported = all(c.exact_supported for c in capabilities)
-                readthrough_reason = next((c.readthrough_reason for c in capabilities if not c.readthrough_supported), "supported")
-                exact_reason = next((c.exact_reason for c in capabilities if not c.exact_supported), "supported")
+                capability_meta = _rebase_capability_meta(self.jl)
                 self.meta = {
                     "model_id": model_id,
                     "revision": _resolve_revision(source),
@@ -515,12 +532,8 @@ class ModelManager:
                     "device": device,
                     "n_layers": text_config.num_hidden_layers,
                     "d_model": text_config.hidden_size,
-                    # Legacy UI field means the safe pure-weight/readthrough path.
-                    "rebase_supported": readthrough_supported,
-                    "readthrough_supported": readthrough_supported,
-                    "readthrough_reason": readthrough_reason,
-                    "exact_supported": exact_supported,
-                    "exact_reason": exact_reason,
+                    # Includes legacy rebase_supported = safe readthrough support.
+                    **capability_meta,
                     "chat_template_source": chat_template_source,
                     "chat_template_fallback": chat_template_fallback,
                     "load_seconds": round(time.perf_counter() - started, 1),

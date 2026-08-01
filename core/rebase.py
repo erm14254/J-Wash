@@ -127,12 +127,37 @@ _MOE_READS = (
 )
 
 
-def _norm_is_supported(norm, hidden):
-    if norm is None or not hasattr(norm, "weight") or tuple(norm.weight.shape) != (hidden,):
-        return False
-    # RMS norms operate independently on the last dimension. LayerNorm's bias
-    # and mean subtraction are not compatible with gamma conjugation.
-    return not hasattr(norm, "bias") or norm.bias is None
+def validate_rms_norm(norm, hidden, name="RMSNorm"):
+    """Validate the structural and functional contract used by read hooks.
+
+    Class names alone are insufficient (and biasless LayerNorm looks similar),
+    so a nonconstant-vector shift probe rejects mean-subtracting normalization
+    while accepting ordinary-gain and zero-centered-gain RMSNorm variants.
+    """
+    if norm is None or not callable(norm):
+        raise ValueError(f"{name} is absent or noncallable")
+    if not callable(getattr(norm, "register_forward_hook", None)):
+        raise ValueError(f"{name} is not hookable")
+    weight = getattr(norm, "weight", None)
+    if weight is None or tuple(weight.shape) != (hidden,):
+        raise ValueError(f"{name} has wrong hidden width")
+    if isinstance(norm, torch.nn.LayerNorm):
+        raise ValueError(f"{name} is mean-subtracting LayerNorm, not RMSNorm")
+    device = weight.device
+    try:
+        with torch.no_grad():
+            x = torch.linspace(-1.25, 2.0, hidden, device=device, dtype=torch.float32).unsqueeze(0)
+            y = norm(x)
+            shifted = norm(x + 0.731)
+        if y.shape != x.shape or shifted.shape != x.shape or not torch.isfinite(y).all():
+            raise ValueError(f"{name} failed the RMS semantic probe")
+        if torch.allclose(y, shifted, rtol=2e-4, atol=2e-5):
+            raise ValueError(f"{name} is mean-subtracting rather than RMS-style")
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"{name} failed the RMS semantic probe: {exc}") from exc
+    return norm
 
 
 def block_capabilities(block):
@@ -151,14 +176,13 @@ def block_capabilities(block):
         hidden = first.weight.shape[-1] if first is not None and hasattr(first, "weight") else None
         if hidden is None:
             raise ValueError(f"required reader {mixer[0]}.weight is absent")
-        if not _norm_is_supported(getattr(block, "input_layernorm", None), hidden):
-            raise ValueError("input_layernorm is not a supported RMS normalization")
+        validate_rms_norm(getattr(block, "input_layernorm", None), hidden, "input_layernorm")
         targets = [TransformTarget(s + ".weight", s, "input_layernorm") for s in mixer]
         sparse = _submodule(block, "mlp.experts.gate_up_proj") is not None
         if sparse:
             targets.extend(_MOE_READS)
-            if not _norm_is_supported(getattr(block, "post_attention_layernorm", None), hidden):
-                raise ValueError("post_attention_layernorm is not a supported RMS normalization")
+            validate_rms_norm(getattr(block, "post_attention_layernorm", None), hidden,
+                              "post_attention_layernorm")
         else:
             for s in ("mlp.gate_proj", "mlp.up_proj"):
                 if _submodule(block, s) is None:
@@ -170,6 +194,7 @@ def block_capabilities(block):
                 raise ValueError(f"required reader {target.state_suffix} is absent")
             if tensor.ndim < 2 or tensor.shape[target.axis] != hidden:
                 raise ValueError(f"reader {target.state_suffix} has wrong residual hidden axis")
+            validate_rms_norm(getattr(block, target.norm_name, None), hidden, target.norm_name)
         exact_ok = False
         if sparse:
             exact_reason = (
@@ -210,6 +235,21 @@ def block_capabilities(block):
         return RebaseCapabilities(True, "supported", exact_ok, exact_reason)
     except ValueError as exc:
         return RebaseCapabilities(False, str(exc), False, f"readthrough unsupported: {exc}")
+
+
+def model_preflight(jl, *, exact=False):
+    """Model-wide capability contract, including the final normalization."""
+    if not getattr(jl, "layers", None):
+        raise ValueError("model has no decoder blocks")
+    hidden = jl._lm_head.weight.shape[-1]
+    for index, block in enumerate(jl.layers):
+        cap = block_capabilities(block)
+        if not cap.readthrough_supported:
+            raise ValueError(f"layer {index} readthrough unsupported: {cap.readthrough_reason}")
+        if exact and not cap.exact_supported:
+            raise ValueError(f"exact mode is unavailable for this model: layer {index}: {cap.exact_reason}")
+    validate_rms_norm(getattr(jl, "_final_norm", None), hidden, "final norm")
+    return True
 
 
 def check_block_supported(block):
@@ -388,6 +428,7 @@ def build_plan(rules, jl, scale, exact=False):
     The names follow the model's layout (``{path}.layers.{m}.{suffix}.weight``,
     ``{lm_head}.weight``); the guard matching them against the checkpoint keys is
     done by the export."""
+    model_preflight(jl, exact=exact)
     active = [r for r in rules if r["layers"]]
     if not active:
         raise ValueError("no active rule (all have 0 layers): nothing to export")

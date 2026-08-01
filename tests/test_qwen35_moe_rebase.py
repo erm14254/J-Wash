@@ -11,6 +11,7 @@ from torch import nn
 
 from core import editing, rebase
 from core.ablation import Interventions
+from core.model_manager import _rebase_capability_meta
 
 
 FULL_READERS = {
@@ -92,6 +93,8 @@ def test_capabilities_fail_closed_and_dense_exact_is_positive():
     assert not rebase.block_capabilities(b).readthrough_supported
     b = block(); b.input_layernorm = nn.LayerNorm(8)
     assert not rebase.block_capabilities(b).readthrough_supported
+    b = block(); b.pre_feedforward_layernorm = RMS(8)
+    assert "unsupported residual branch" in rebase.block_capabilities(b).readthrough_reason
 
 
 def test_official_packed_memory_dimensions():
@@ -103,8 +106,8 @@ def test_official_packed_memory_dimensions():
 def tiny():
     import transformers
     from packaging.version import Version
-    assert Version(transformers.__version__) >= Version("5.5"), (
-        "Qwen3.5-MoE integration requires transformers>=5.5; installed " + transformers.__version__)
+    assert Version("5.5") <= Version(transformers.__version__) < Version("5.15"), (
+        "Qwen3.5-MoE integration requires transformers>=5.5,<5.15; installed " + transformers.__version__)
     from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
     from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM
     cfg = Qwen3_5MoeTextConfig(
@@ -140,6 +143,14 @@ def rules_for(model, mode="replace", factor=1.0):
              "replacement_id": 5 if mode == "replace" else None,
              "replacement": "<5>" if mode == "replace" else None, "layers": [0],
              "dirs_a": {0: unit(3)}, "dirs_b": {0: unit(5)} if mode == "replace" else None}]
+
+
+def rule_at(model, layer):
+    rule = rules_for(model)[0]
+    rule["layers"] = [layer]
+    rule["dirs_a"] = {layer: rule["dirs_a"][0]}
+    rule["dirs_b"] = {layer: rule["dirs_b"][0]}
+    return [rule]
 
 
 def bake(model, rules, scale=1.0):
@@ -232,6 +243,76 @@ def test_tiny_supported_inventory_and_version_contract(tiny):
     assert "model.layers.1.mlp.experts.gate_up_proj" in tiny.state_dict()
 
 
+@pytest.mark.parametrize("layer", [0, 1, 2])
+def test_packed_exact_is_model_wide_and_live_rejection_is_clean(tiny, layer):
+    jl = lens(tiny); rules = rule_at(tiny, layer)
+    with pytest.raises(ValueError, match="exact mode is unavailable for this model"):
+        rebase.build_plan(rules, jl, 1.0, exact=True)
+    before = [len(module._forward_hooks) for module in tiny.modules()]
+    iv = Interventions(); iv._rules = rules; iv.set_mode("exact")
+    with pytest.raises(ValueError, match="exact mode is unavailable for this model"):
+        iv.attach(jl)
+    assert before == [len(module._forward_hooks) for module in tiny.modules()]
+    assert iv._handles == []
+
+
+def test_api_and_legacy_capability_fields(tiny):
+    meta = _rebase_capability_meta(lens(tiny))
+    assert meta["readthrough_supported"] and meta["rebase_supported"]
+    assert not meta["exact_supported"] and "aggregate-MoE" in meta["exact_reason"]
+    bad = lens(tiny); bad.layers[0].pre_feedforward_layernorm = RMS(32)
+    try:
+        rejected = _rebase_capability_meta(bad)
+        assert not rejected["readthrough_supported"] and not rejected["rebase_supported"]
+        assert "unsupported residual branch" in rejected["readthrough_reason"]
+    finally:
+        del bad.layers[0].pre_feedforward_layernorm
+
+
+def test_live_registration_failure_rolls_back(tiny, monkeypatch):
+    jl = lens(tiny); iv = Interventions(); iv._rules = rules_for(tiny)
+    iv.set_mode("readthrough")
+    before = [len(module._forward_hooks) for module in tiny.modules()]
+    def fail(_hook): raise RuntimeError("injected final registration failure")
+    monkeypatch.setattr(jl._final_norm, "register_forward_hook", fail)
+    with pytest.raises(RuntimeError, match="injected"):
+        iv.attach(jl)
+    assert before == [len(module._forward_hooks) for module in tiny.modules()]
+    assert iv._handles == []
+
+
+def test_norm_semantics_and_final_norm_preflight(tiny):
+    # Positive regressions: Qwen3.5 zero-centered RMSNorm and our dense-style RMS.
+    rebase.validate_rms_norm(tiny.model.norm, 32, "qwen final")
+    rebase.validate_rms_norm(RMS(8), 8, "test RMS")
+    for where in ("input", "post"):
+        dense = block(sparse=False)
+        setattr(dense, "input_layernorm" if where == "input" else "post_attention_layernorm",
+                nn.LayerNorm(8, bias=False))
+        cap = rebase.block_capabilities(dense)
+        assert not cap.readthrough_supported and "LayerNorm" in cap.readthrough_reason
+    bad = lens(tiny); bad._final_norm = nn.LayerNorm(32, bias=False)
+    with pytest.raises(ValueError, match="LayerNorm"):
+        rebase.model_preflight(bad)
+    for value, phrase in ((SimpleNamespace(weight=torch.ones(32)), "noncallable"),
+                          (lambda x: x, "hookable")):
+        bad = lens(tiny); bad._final_norm = value
+        with pytest.raises(ValueError, match=phrase): rebase.model_preflight(bad)
+
+
+@pytest.mark.parametrize("shape", [(9, 8), (3, 7, 8)])
+@pytest.mark.parametrize("budget", [1, 2, 64])
+def test_bounded_read_transform_matches_math(shape, budget):
+    torch.manual_seed(4); source = torch.randn(*shape, dtype=torch.bfloat16)
+    U, V = torch.randn(8, 3), torch.randn(8, 3); seen = []
+    got, delta = editing.apply_transform_bounded(
+        ("read", U, V), source, row_budget=budget, observer=seen.append)
+    expected = rebase.apply_read(source.float(), U, V)[0].to(source.dtype)
+    assert torch.equal(got, expected)
+    assert got.shape == source.shape and got.dtype == source.dtype
+    assert seen and max(seen) <= budget and delta > 0
+
+
 def test_packed_export_rejections_are_early_and_clean(tiny, tmp_path, monkeypatch):
     monkeypatch.setattr(editing, "EDITS_DIR", tmp_path); jl = lens(tiny); rules = rules_for(tiny)
     def forbidden(): raise AssertionError("full state traversal occurred")
@@ -255,15 +336,24 @@ def _rewrite_prefix(source: Path):
         save_file(rewritten, str(shard))
 
 
+def make_source(model, path, *, dtype=None, two_shards=False):
+    model.save_pretrained(path, safe_serialization=True)
+    for old_shard in path.glob("*.safetensors"): old_shard.unlink()
+    state = {k: v.detach().cpu().to(dtype or v.dtype) for k, v in model.state_dict().items()}
+    if two_shards:
+        names = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+        groups = [{}, {}]; weight_map = {}
+        for i, (key, value) in enumerate(state.items()):
+            groups[i % 2][key] = value; weight_map[key] = names[i % 2]
+        for name, group in zip(names, groups): save_file(group, str(path / name))
+        (path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+    else:
+        save_file(state, str(path / "model.safetensors"))
+    _rewrite_prefix(path)
+
+
 def test_full_checkpoint_export_reload_mapping_mtp_and_missing(tiny, tmp_path, monkeypatch):
-    source = tmp_path / "source"; tiny.save_pretrained(source, safe_serialization=True)
-    # save_pretrained in newer Transformers may serialize a compatibility
-    # unpacked view; the production source format under test is the raw packed
-    # safetensors state used by Qwen3.5-MoE checkpoints.
-    for old_shard in source.glob("*.safetensors"): old_shard.unlink()
-    save_file({k: v.detach().cpu() for k, v in tiny.state_dict().items()},
-              str(source / "model.safetensors"))
-    _rewrite_prefix(source)
+    source = tmp_path / "source"; make_source(tiny, source)
     shard = next(source.glob("*.safetensors")); state = load_file(str(shard))
     sentinel = torch.arange(12, dtype=torch.int16).reshape(3, 4)
     state["mtp.sentinel"] = sentinel; save_file(state, str(shard))
@@ -279,18 +369,13 @@ def test_full_checkpoint_export_reload_mapping_mtp_and_missing(tiny, tmp_path, m
     assert torch.equal(out_state["mtp.sentinel"], sentinel)
     meta = json.loads((out / "edit_meta.json").read_text())
     assert any("MTP" in warning for warning in meta["warnings"])
-    # Transformers' in-memory prefix is restored only for the local reload.
-    reload_dir = tmp_path / "reload"; copytree = __import__("shutil").copytree
-    copytree(out, reload_dir)
-    reload_shard = reload_dir / shard.name; reload_state = load_file(str(reload_shard))
-    reload_state = {("model." + k.removeprefix("model.language_model."))
-                    if k.startswith("model.language_model.") else k: v
-                    for k, v in reload_state.items() if not k.startswith("mtp.")}
-    save_file(reload_state, str(reload_shard))
-    reloaded = type(tiny).from_pretrained(reload_dir, local_files_only=True).float().eval()
+    # Reload the artifact exactly as emitted: no prefix rewrite and no MTP deletion.
+    from transformers import AutoModelForCausalLM
+    reloaded = AutoModelForCausalLM.from_pretrained(out, local_files_only=True).float().eval()
     baked_model = bake(tiny, rules); ids = torch.tensor([[1, 8, 4]])
     with torch.no_grad():
         torch.testing.assert_close(reloaded(ids).logits, baked_model(ids).logits, rtol=2e-5, atol=2e-6)
+    copytree = __import__("shutil").copytree
     broken = tmp_path / "broken"; copytree(source, broken)
     broken_shard = next(broken.glob("*.safetensors")); broken_state = load_file(str(broken_shard))
     del broken_state[packed_key]; save_file(broken_state, str(broken_shard))
@@ -298,3 +383,129 @@ def test_full_checkpoint_export_reload_mapping_mtp_and_missing(tiny, tmp_path, m
         editing.export_rebase(rules, lens(tiny), {"dtype": "fp16"}, fmt="full",
                               name="broken-output", source_dir=broken)
     assert not (editing.EDITS_DIR / "broken-output").exists()
+
+
+def test_existing_export_is_never_overwritten(tiny, tmp_path, monkeypatch):
+    monkeypatch.setattr(editing, "EDITS_DIR", tmp_path)
+    existing = tmp_path / "same"; existing.mkdir(); marker = existing / "valid"
+    marker.write_bytes(b"preserve me")
+    with pytest.raises(ValueError, match="already exists"):
+        editing.export_rebase(rules_for(tiny), lens(tiny), {"dtype": "fp16"},
+                              fmt="full", name="same", source_dir=tmp_path / "missing")
+    assert marker.read_bytes() == b"preserve me"
+    assert not list(tmp_path.glob(".same.tmp-*"))
+
+
+@pytest.mark.parametrize("failure", ["second_shard", "config", "auxiliary", "metadata"])
+def test_full_export_staging_rolls_back_every_failure(tiny, tmp_path, monkeypatch, failure):
+    source = tmp_path / "source"; make_source(tiny, source, two_shards=True)
+    (source / "tokenizer.txt").write_text("sentinel")
+    edits = tmp_path / "edits"; monkeypatch.setattr(editing, "EDITS_DIR", edits)
+    if failure == "second_shard":
+        original = editing.save_file; calls = 0
+        def failing_save(*args, **kwargs):
+            nonlocal calls; calls += 1
+            if calls == 2: raise OSError("second shard")
+            return original(*args, **kwargs)
+        monkeypatch.setattr(editing, "save_file", failing_save)
+    elif failure == "auxiliary":
+        monkeypatch.setattr(editing.shutil, "copy2", lambda *_a, **_k: (_ for _ in ()).throw(OSError("auxiliary")))
+    else:
+        original = Path.write_text
+        target = "config.json" if failure == "config" else "edit_meta.json"
+        def failing_write(self, *args, **kwargs):
+            if self.name == target: raise OSError(failure)
+            return original(self, *args, **kwargs)
+        monkeypatch.setattr(Path, "write_text", failing_write)
+    with pytest.raises(OSError, match=failure.replace("_", " ") if failure == "second_shard" else failure):
+        editing.export_rebase(rules_for(tiny), lens(tiny), {"dtype": "fp32"},
+                              fmt="full", name="failed", source_dir=source)
+    assert not (edits / "failed").exists()
+    assert not list(edits.glob(".failed.tmp-*"))
+
+
+def test_bf16_live_bake_and_direct_reload(tiny, tmp_path, monkeypatch):
+    model = copy.deepcopy(tiny).bfloat16().eval(); rules = rules_for(model)
+    ids = torch.tensor([[1, 8, 4]])
+    oracle, _ = run_variant(model, ids, rules, "oracle")
+    production, _ = run_variant(model, ids, rules, "production")
+    baked_model = bake(model, rules); baked, _ = run_variant(baked_model, ids)
+    torch.testing.assert_close(oracle["logits"], production["logits"], rtol=2e-2, atol=2e-2)
+    torch.testing.assert_close(oracle["logits"], baked["logits"], rtol=2e-2, atol=2e-2)
+    source = tmp_path / "bf16-source"; make_source(model, source, dtype=torch.bfloat16)
+    monkeypatch.setattr(editing, "EDITS_DIR", tmp_path / "edits")
+    result = editing.export_rebase(rules, lens(model), {"dtype": "bf16"}, fmt="full",
+                                   name="bf16", source_dir=source)
+    out = Path(result["out_dir"])
+    packed = load_file(str(next(out.glob("*.safetensors"))))[
+        "model.language_model.layers.1.mlp.experts.gate_up_proj"]
+    assert packed.dtype == torch.bfloat16
+    from transformers import AutoModelForCausalLM
+    reloaded = AutoModelForCausalLM.from_pretrained(out, local_files_only=True).eval()
+    with torch.no_grad():
+        torch.testing.assert_close(reloaded(ids).logits, baked_model(ids).logits,
+                                   rtol=2e-2, atol=2e-2)
+
+
+def dense_lens():
+    class DenseHF(nn.Module):
+        def __init__(self):
+            super().__init__(); self.model = nn.Module()
+            self.model.layers = nn.ModuleList([block(sparse=False), block(sparse=False)])
+            self.model.embed_tokens = nn.Embedding(17, 8); self.model.norm = RMS(8)
+            self.lm_head = nn.Linear(8, 17, False)
+    model = DenseHF()
+    return SimpleNamespace(layers=model.model.layers, _final_norm=model.model.norm,
+        _lm_head=model.lm_head, _embed_tokens=model.model.embed_tokens, _hf_model=model,
+        layout=SimpleNamespace(path="model", lm_head="lm_head", embed="embed_tokens"))
+
+
+def test_shared_dense_full_layers_and_lora_exports(tmp_path, monkeypatch):
+    jl = dense_lens(); torch.manual_seed(2); direction = torch.randn(8); direction /= direction.norm()
+    rules = [{"id": 1, "token_id": 1, "token": "x", "mode": "scale", "factor": 0.5,
+              "replacement_id": None, "replacement": None, "layers": [0],
+              "dirs_a": {0: direction}, "dirs_b": None}]
+    source = tmp_path / "dense-source"; source.mkdir()
+    save_file({k: v.detach() for k, v in jl._hf_model.state_dict().items()},
+              str(source / "model.safetensors"))
+    (source / "config.json").write_text("{}")
+    monkeypatch.setattr(editing, "EDITS_DIR", tmp_path / "edits")
+    full = editing.export_rebase(rules, jl, {"dtype": "fp16"}, fmt="full",
+                                 name="dense-full", source_dir=source)
+    assert (Path(full["out_dir"]) / "model.safetensors").exists()
+    layers = editing.export_rebase(rules, jl, {"dtype": "fp16"}, fmt="layers",
+                                   name="dense-layers", source_dir=source)
+    assert load_file(str(Path(layers["out_dir"]) / "modified_layers.safetensors"))
+    lora = editing.export_rebase(rules, jl, {"dtype": "fp16", "model_id": "local"},
+                                 fmt="lora", name="dense-lora")
+    lora_dir = Path(lora["out_dir"])
+    assert load_file(str(lora_dir / "adapter_model.safetensors"))
+    config = json.loads((lora_dir / "adapter_config.json").read_text())
+    assert config["peft_type"] == "LORA" and config["bias"] == "none"
+
+
+def test_transaction_rolls_back_index_write_failure(tmp_path, monkeypatch):
+    jl = dense_lens(); jl._lm_head.weight = jl._embed_tokens.weight
+    direction = torch.randn(8); direction /= direction.norm()
+    rules = [{"id": 1, "token_id": 1, "token": "x", "mode": "scale", "factor": 0.5,
+              "replacement_id": None, "replacement": None, "layers": [0],
+              "dirs_a": {0: direction}, "dirs_b": None}]
+    source = tmp_path / "source"; source.mkdir()
+    state = {k: v.detach() for k, v in jl._hf_model.state_dict().items() if k != "lm_head.weight"}
+    save_file(state, str(source / "model.safetensors"))
+    (source / "config.json").write_text(json.dumps({"tie_word_embeddings": True}))
+    (source / "model.safetensors.index.json").write_text(json.dumps({
+        "metadata": {"total_size": 1},
+        "weight_map": {key: "model.safetensors" for key in state},
+    }))
+    monkeypatch.setattr(editing, "EDITS_DIR", tmp_path / "edits")
+    original = Path.write_text
+    def fail_index(self, *args, **kwargs):
+        if self.name == "model.safetensors.index.json": raise OSError("index")
+        return original(self, *args, **kwargs)
+    monkeypatch.setattr(Path, "write_text", fail_index)
+    with pytest.raises(OSError, match="index"):
+        editing.export_rebase(rules, jl, {"dtype": "fp16"}, fmt="full",
+                              name="index-failure", source_dir=source)
+    assert not (editing.EDITS_DIR / "index-failure").exists()
+    assert not list(editing.EDITS_DIR.glob(".index-failure.tmp-*"))

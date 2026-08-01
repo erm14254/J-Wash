@@ -1,6 +1,7 @@
 import json
 import re
 import shutil
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -361,7 +362,69 @@ def _disk_mapper(mem_embed_key, disk_keys):
     return to_disk
 
 
+REBASE_EXPORT_ROW_BUDGET = 4096
+REBASE_EXPORT_CHUNK_OBSERVER = None
+
+
+def apply_transform_bounded(entry, tensor, *, row_budget=REBASE_EXPORT_ROW_BUDGET,
+                            observer=None):
+    """Apply a read transform with bounded float32 row temporaries.
+
+    The destination is allocated directly in the source dtype.  Write
+    transforms are ordinary dense matrices and retain the established path.
+    """
+    kind, X, Y = entry
+    if kind != "read":
+        source = tensor.detach().to("cpu", torch.float32)
+        updated, _B, _A = rebase.apply_transform(entry, source)
+        return updated.to(tensor.dtype), float((updated - source).abs().max())
+    if row_budget < 1:
+        raise ValueError("row_budget must be positive")
+    source = tensor.detach().cpu().contiguous()
+    rows = source.reshape(-1, source.shape[-1])
+    destination = torch.empty_like(source)
+    dest_rows = destination.reshape_as(rows)
+    delta_max = 0.0
+    for start in range(0, rows.shape[0], row_budget):
+        count = min(row_budget, rows.shape[0] - start)
+        if observer is not None:
+            observer(count)
+        chunk = rows[start:start + count].float()
+        B = chunk @ X
+        updated = chunk + B @ Y.T
+        delta_max = max(delta_max, float((updated - chunk).abs().max()))
+        dest_rows[start:start + count].copy_(updated.to(source.dtype))
+    return destination, delta_max
+
+
 def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.0, exact=False):
+    """Transactionally construct and atomically publish a rebase export.
+
+    Overwrite policy is deliberately conservative: an existing destination is
+    rejected and never modified.  All construction occurs in a unique sibling
+    staging directory which is removed on every failure.
+    """
+    final_dir = EDITS_DIR / name
+    if final_dir.exists():
+        raise ValueError(f"export destination already exists: {final_dir}")
+    EDITS_DIR.mkdir(parents=True, exist_ok=True)
+    stage = EDITS_DIR / f".{name}.tmp-{uuid.uuid4().hex}"
+    stage.mkdir()
+    try:
+        result = _export_rebase_impl(
+            rules, jl, model_meta, fmt=fmt, name=name, source_dir=source_dir,
+            scale=scale, exact=exact, out_dir=stage,
+        )
+        stage.replace(final_dir)
+        result["out_dir"] = str(final_dir)
+        return result
+    except Exception:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+
+
+def _export_rebase_impl(rules, jl, model_meta, *, fmt, name, source_dir=None,
+                        scale=1.0, exact=False, out_dir):
     """Pure-weight export by change of basis of the reads (cf. core/rebase).
 
     ``readthrough`` (exact=False): the downstream read matrices + lm_head.
@@ -396,17 +459,14 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
 
     def bake(key, tensor):
         nonlocal delta_max
-        W = tensor.detach().to("cpu", torch.float32)
-        W_new, _B, _A = rebase.apply_transform(transforms[key], W)
-        # Chunking avoids a third full-sized float32 packed-expert allocation.
-        flat_new, flat_old = W_new.reshape(-1), W.reshape(-1)
-        for start in range(0, flat_new.numel(), 1 << 20):
-            delta_max = max(delta_max, (flat_new[start:start + (1 << 20)] - flat_old[start:start + (1 << 20)]).abs().max().item())
+        W_new, chunk_delta = apply_transform_bounded(
+            transforms[key], tensor, row_budget=REBASE_EXPORT_ROW_BUDGET,
+            observer=REBASE_EXPORT_CHUNK_OBSERVER,
+        )
+        delta_max = max(delta_max, chunk_delta)
         applied.add(key)
         return W_new
 
-    out_dir = EDITS_DIR / name
-    out_dir.mkdir(parents=True, exist_ok=True)
     dtype = torch.bfloat16 if model_meta.get("dtype") == "bf16" else torch.float16
     warnings = []
     if exact and info["regularized_layers"]:
@@ -520,6 +580,16 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
         transforms = {to_disk(k): fn for k, fn in transforms.items()}
         lm_head_key = to_disk(lm_head_key)
         embed_key = to_disk(info["embed_key"])
+        required = set(transforms)
+        if info["tied"] and lm_head_key not in disk_keys and embed_key in disk_keys:
+            required.remove(lm_head_key)
+        missing_source = required - disk_keys
+        if missing_source:
+            sample = sorted(missing_source)[:3]
+            raise ValueError(
+                f"{len(missing_source)} parameter(s) to transform absent from the source "
+                f"checkpoint (e.g. {sample}) — export cancelled before writing"
+            )
         if any(key.startswith("mtp.") for key in disk_keys):
             warnings.append(
                 "MTP weights were preserved but not transformed. Ordinary Transformers "
@@ -570,7 +640,6 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
             # A streamed full export may already have written earlier shards.
             # Never leave a checkpoint that looks usable but is only partially
             # edited when the source inventory fails the completeness guard.
-            shutil.rmtree(out_dir, ignore_errors=True)
             raise ValueError(
                 f"{len(missing)} parameter(s) to transform absent from the source "
                 f"checkpoint (e.g. {sample}) — unexpected key names, export cancelled "
@@ -605,7 +674,6 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
             index_path.write_text(json.dumps(index, indent=1), encoding="utf-8")
 
     if delta_max < 1e-8:
-        shutil.rmtree(out_dir, ignore_errors=True)
         raise ValueError(
             "the bake changes no weight (null directions?) — the export would be "
             "identical to the original model, folder deleted"
