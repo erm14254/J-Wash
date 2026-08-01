@@ -461,7 +461,8 @@ REBASE_EXPORT_ROW_BUDGET = 4096
 REBASE_EXPORT_CHUNK_OBSERVER = None
 
 _WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
-                     *(f"LPT{i}" for i in range(1, 10))}
+                     *(f"LPT{i}" for i in range(1, 10)),
+                     "COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³"}
 
 
 def _safe_relative_parts(name):

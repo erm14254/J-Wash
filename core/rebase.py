@@ -137,6 +137,53 @@ _AUDITED_RMS_NORMS = {
 }
 
 
+class ParameterInspectionError(ValueError):
+    """A small parameter could not be inspected without disturbing dispatch."""
+
+
+def materialize_parameter_for_inspection(module, parameter_name):
+    """Return an owned CPU copy of a resident or Accelerate-offloaded parameter."""
+    parameter = getattr(module, parameter_name, None)
+    if parameter is None:
+        raise ParameterInspectionError(f"parameter {parameter_name!r} is absent")
+    if parameter.device.type != "meta":
+        return parameter.detach().cpu().clone()
+    hook = getattr(module, "_hf_hook", None)
+    weights_map = getattr(hook, "weights_map", None)
+    if hook is None or weights_map is None:
+        raise ParameterInspectionError(
+            f"meta parameter {parameter_name!r} has no supported Accelerate weights_map"
+        )
+    candidates = [parameter_name]
+    try:
+        keys = list(weights_map.keys())
+    except (AttributeError, TypeError):
+        keys = []
+    candidates.extend(key for key in keys
+                      if isinstance(key, str) and key.rsplit(".", 1)[-1] == parameter_name)
+    errors = []
+    for key in dict.fromkeys(candidates):
+        try:
+            value = weights_map[key]
+            if isinstance(value, torch.Tensor) and value.device.type != "meta":
+                return value.detach().cpu().clone()
+        except (KeyError, OSError, RuntimeError, ValueError, TypeError) as exc:
+            errors.append(str(exc))
+    detail = f": {'; '.join(errors[:2])}" if errors else ""
+    raise ParameterInspectionError(
+        f"Accelerate weights_map cannot materialize {parameter_name!r}{detail}"
+    )
+
+
+def _norm_probe_device(norm, placeholder):
+    if placeholder.device.type != "meta":
+        return placeholder.device
+    device = getattr(getattr(norm, "_hf_hook", None), "execution_device", None)
+    if device is None or torch.device(device).type == "meta":
+        raise ParameterInspectionError("offloaded norm has no usable execution_device")
+    return torch.device(device)
+
+
 def validate_rms_norm(norm, hidden, name="RMSNorm"):
     """Validate the structural and functional contract used by read hooks.
 
@@ -147,19 +194,20 @@ def validate_rms_norm(norm, hidden, name="RMSNorm"):
         raise ValueError(f"{name} is absent or noncallable")
     if not callable(getattr(norm, "register_forward_hook", None)):
         raise ValueError(f"{name} is not hookable")
-    weight = getattr(norm, "weight", None)
-    if weight is None or tuple(weight.shape) != (hidden,):
+    weight_parameter = getattr(norm, "weight", None)
+    if weight_parameter is None or tuple(weight_parameter.shape) != (hidden,):
         raise ValueError(f"{name} has wrong hidden width")
     cls = type(norm)
     gain_kind = _AUDITED_RMS_NORMS.get((cls.__module__, cls.__name__))
     if gain_kind is None:
         raise ValueError(f"{name} class {cls.__module__}.{cls.__name__} is not audited")
-    if not torch.isfinite(weight).all():
+    weight = materialize_parameter_for_inspection(norm, "weight")
+    if not bool(torch.isfinite(weight).all()):
         raise ValueError(f"{name} gain is nonfinite")
     epsilon = getattr(norm, "variance_epsilon", getattr(norm, "eps", None))
     if not isinstance(epsilon, (float, int)) or not (0 < float(epsilon) < 1):
         raise ValueError(f"{name} has invalid RMS epsilon")
-    device = weight.device
+    device = _norm_probe_device(norm, weight_parameter)
     probe_dtype = weight.dtype if weight.dtype in (torch.float16, torch.bfloat16, torch.float32) else torch.float32
     rtol, atol = ((3e-2, 3e-3) if probe_dtype == torch.bfloat16 else
                   (5e-3, 5e-4) if probe_dtype == torch.float16 else
@@ -178,16 +226,19 @@ def validate_rms_norm(norm, hidden, name="RMSNorm"):
                               rtol=0, atol=atol):
             raise ValueError(f"{name} has an additive offset")
         gamma = outputs[1].float()[0, 0]
-        expected_gain = weight.float() + (1 if gain_kind == "zero-centered" else 0)
+        expected_gain = weight.float().to(gamma.device) + (1 if gain_kind == "zero-centered" else 0)
         if not torch.allclose(gamma, expected_gain, rtol=rtol, atol=atol):
             raise ValueError(f"{name} effective gain does not match audited {gain_kind} semantics")
         if (gamma.abs() <= max(atol, 1e-6)).any():
             raise ValueError(f"{name} has an effectively singular gain channel")
         for x, output in zip(probes, outputs[2:]):
-            channel_scale = (output.float() / gamma) / x.float()
-            scalars = channel_scale.mean(-1, keepdim=True)
-            if not torch.isfinite(channel_scale).all() or not torch.allclose(
-                    channel_scale, scalars.expand_as(channel_scale), rtol=rtol, atol=atol):
+            z = output.float() / gamma.float()
+            x32 = x.float()
+            tiny = torch.finfo(torch.float32).tiny
+            alpha = (z * x32).sum(-1, keepdim=True) / (x32.square().sum(-1, keepdim=True) + tiny)
+            expected = alpha * x32
+            if not torch.isfinite(z).all() or not torch.allclose(
+                    z, expected, rtol=rtol, atol=atol):
                 raise ValueError(f"{name} is not rank-3 direction-preserving RMS normalization")
     except ValueError:
         raise
@@ -405,10 +456,18 @@ def effective_gamma(norm):
     zero-centered RMSNorm where γ = 1 + weight — dividing by ``weight`` (~0, of
     arbitrary sign) made the transform chaotic (live preview → random tokens,
     measured). The functional measurement covers both styles."""
-    weight = norm.weight
-    with torch.no_grad():
-        ones = torch.ones(1, weight.shape[-1], device=weight.device, dtype=torch.float32)
-        return norm(ones).detach().flatten().float().cpu()
+    placeholder = norm.weight
+    weight = materialize_parameter_for_inspection(norm, "weight").float()
+    cls = type(norm)
+    gain_kind = _AUDITED_RMS_NORMS.get((cls.__module__, cls.__name__))
+    if gain_kind is None:
+        raise ValueError(f"norm class {cls.__module__}.{cls.__name__} is not audited")
+    epsilon = float(getattr(norm, "variance_epsilon", getattr(norm, "eps", 0.0)))
+    gamma = weight + (1 if gain_kind == "zero-centered" else 0)
+    gamma = gamma / (1.0 + epsilon) ** 0.5
+    if placeholder.device.type == "meta" and not torch.isfinite(gamma).all():
+        raise ParameterInspectionError("offloaded norm gain is nonfinite")
+    return gamma.detach().clone()
 
 
 def gamma_pair(norm, U, V):

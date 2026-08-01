@@ -15,7 +15,11 @@ Live preview hooks each input/post-attention RMSNorm once, plus the final norm,
 and therefore applies the same residual-coordinate read transform. Norm support
 is an exact-class allowlist for audited Transformers RMSNorm implementations,
 supplemented by uncached rank-3, dtype-aware semantic validation on each model
-preflight. Live factors are cast from their canonical form to the actual hook
+preflight. Direction preservation uses a zero-safe per-token least-squares
+reconstruction in float32, including production-width BF16 probes. Resident or
+Accelerate-offloaded norm gains are inspected through a small owned CPU copy;
+normal disk-offload hooks remain intact and `effective_gamma` never moves the
+whole model. Live factors are cast from their canonical form to the actual hook
 output's device and dtype at invocation. Dense exact writers are restricted to
 biasless `torch.nn.Linear` tensor-returning projections.
 
@@ -30,6 +34,8 @@ Nested cache names such as `job/hf` stage beside the final `hf` directory, and
 resolved destinations outside the edits root are rejected.
 Names are first checked under POSIX and Windows lexical rules, rejecting absolute,
 drive/UNC, traversal, dot, reserved-device, and nonportable components.
+Reserved devices include the Unicode Windows aliases `COM¹`–`COM³` and
+`LPT¹`–`LPT³`, including extension and nested-component forms.
 It streams source shards, preserves unmatched tensors and
 raw tensor dtype/rank, and maps the in-memory `model.layers` prefix to the
 official `model.language_model.layers` disk prefix. MTP tensors are copied

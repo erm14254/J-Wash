@@ -350,6 +350,75 @@ def test_audited_hf_rmsnorm_classes_and_dtypes(dtype):
         rebase.validate_rms_norm(cls(8).to(dtype=dtype), 8, cls.__name__)
 
 
+@pytest.mark.parametrize("hidden", [2048, 3072])
+def test_production_width_bf16_allowlisted_rmsnorms(hidden):
+    from transformers.models.llama.modeling_llama import LlamaRMSNorm
+    from transformers.models.mistral.modeling_mistral import MistralRMSNorm
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNorm
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeRMSNorm
+    for cls in (LlamaRMSNorm, MistralRMSNorm, Qwen2RMSNorm, Qwen3RMSNorm,
+                Qwen3_5RMSNorm, Qwen3_5MoeRMSNorm):
+        rebase.validate_rms_norm(cls(hidden).to(torch.bfloat16), hidden, cls.__name__)
+
+
+@pytest.mark.parametrize("hidden", [2048, 3072])
+def test_production_width_qwen35_moe_block_capability(hidden):
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeRMSNorm
+    b = nn.Module(); b.self_attn = nn.Module()
+    b.self_attn.q_proj = nn.Linear(hidden, 8, False, dtype=torch.bfloat16)
+    b.self_attn.k_proj = nn.Linear(hidden, 8, False, dtype=torch.bfloat16)
+    b.self_attn.v_proj = nn.Linear(hidden, 8, False, dtype=torch.bfloat16)
+    b.mlp = nn.Module(); b.mlp.gate = nn.Linear(hidden, 4, False, dtype=torch.bfloat16)
+    b.mlp.experts = nn.Module(); b.mlp.experts.gate_up_proj = nn.Parameter(torch.randn(2, 8, hidden, dtype=torch.bfloat16))
+    b.mlp.shared_expert = nn.Module()
+    b.mlp.shared_expert.gate_proj = nn.Linear(hidden, 8, False, dtype=torch.bfloat16)
+    b.mlp.shared_expert.up_proj = nn.Linear(hidden, 8, False, dtype=torch.bfloat16)
+    b.mlp.shared_expert_gate = nn.Linear(hidden, 1, False, dtype=torch.bfloat16)
+    b.input_layernorm = Qwen3_5MoeRMSNorm(hidden).to(torch.bfloat16)
+    b.post_attention_layernorm = Qwen3_5MoeRMSNorm(hidden).to(torch.bfloat16)
+    cap = rebase.block_capabilities(b)
+    assert cap.readthrough_supported and not cap.exact_supported
+
+
+def test_meta_norm_without_accelerate_hook_fails_closed():
+    from transformers.models.llama.modeling_llama import LlamaRMSNorm
+    jl = dense_lens(); bad = LlamaRMSNorm(8).to(device="meta")
+    jl.layers[0].input_layernorm = bad
+    meta = _rebase_capability_meta(jl)
+    assert not meta["readthrough_supported"] and not meta["exact_supported"]
+    assert "no supported Accelerate weights_map" in meta["readthrough_reason"]
+
+
+def test_actual_auto_disk_offload_norm_inspection(tmp_path):
+    from transformers import AutoModelForCausalLM, LlamaConfig, LlamaForCausalLM
+    config = LlamaConfig(vocab_size=1024, hidden_size=128, intermediate_size=256,
+                         num_hidden_layers=4, num_attention_heads=4,
+                         num_key_value_heads=2, max_position_embeddings=32)
+    source = tmp_path / "source"; LlamaForCausalLM(config).save_pretrained(source, safe_serialization=True)
+    loaded = AutoModelForCausalLM.from_pretrained(
+        source, device_map="auto", max_memory={"cpu": "2MB"},
+        offload_folder=tmp_path / "offload", dtype=torch.float32, local_files_only=True).eval()
+    norms = [loaded.model.norm] + [n for layer in loaded.model.layers
+                                  for n in (layer.input_layernorm, layer.post_attention_layernorm)]
+    offloaded = next((norm for norm in norms if norm.weight.device.type == "meta"), None)
+    assert offloaded is not None and getattr(offloaded, "_hf_hook", None) is not None
+    before = offloaded.weight.device
+    gain = rebase.materialize_parameter_for_inspection(offloaded, "weight")
+    assert gain.device.type == "cpu" and gain._base is None
+    gamma = rebase.effective_gamma(offloaded)
+    assert gamma.device.type == "cpu" and torch.isfinite(gamma).all()
+    U, V = torch.randn(128, 1), torch.randn(128, 1)
+    Ug, Vg = rebase.gamma_pair(offloaded, U, V)
+    assert torch.isfinite(Ug).all() and torch.isfinite(Vg).all()
+    jl = lens(loaded); first = _rebase_capability_meta(jl); second = _rebase_capability_meta(jl)
+    assert first["readthrough_supported"] and second == first
+    assert offloaded.weight.device == before
+    with torch.no_grad(): output = loaded(torch.tensor([[1, 2, 3]]))
+    assert torch.isfinite(output.logits).all() and offloaded.weight.device == before
+
+
 def test_norm_contract_revalidates_mutation_and_rejects_unknowns():
     from transformers.models.llama.modeling_llama import LlamaRMSNorm
     norm = LlamaRMSNorm(8); rebase.validate_rms_norm(norm, 8)
@@ -677,6 +746,31 @@ def test_api_gguf_maps_generic_export_error_to_500(tmp_path, monkeypatch):
     with pytest.raises(app.HTTPException) as exc:
         asyncio.run(app.api_edit_export_gguf(SimpleNamespace(name="job", gguf_type="bf16")))
     assert exc.value.status_code == 500 and exc.value.detail == "disk failed"
+
+
+@pytest.mark.parametrize("base", ["COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³"])
+@pytest.mark.parametrize("style", ["bare", "mixed", "extension", "nested"])
+def test_superscript_reserved_names_fail_core_and_api(base, style, tmp_path):
+    value = {"bare": base, "mixed": base.lower(), "extension": base + ".txt",
+             "nested": "folder/" + base}[style]
+    with pytest.raises(ValueError, match="reserved"):
+        editing._safe_relative_parts(value)
+    import api.app as app
+    app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(app.api_edit_export_gguf(SimpleNamespace(name=value, gguf_type="bf16")))
+    assert exc.value.status_code == 422
+
+
+def test_superscript_reserved_index_shard_is_rejected(tiny, tmp_path, monkeypatch):
+    source = tmp_path / "source"; make_source(tiny, source, two_shards=True)
+    index_path = source / "model.safetensors.index.json"; index = json.loads(index_path.read_text())
+    index["weight_map"][next(iter(index["weight_map"]))] = "COM¹.safetensors"
+    index_path.write_text(json.dumps(index))
+    monkeypatch.setattr(editing, "EDITS_DIR", tmp_path / "edits")
+    with pytest.raises(ValueError, match="reserved"):
+        editing.export_rebase(rules_for(tiny), lens(tiny), {"dtype": "fp32"},
+                              fmt="full", name="bad-index", source_dir=source)
 
 
 def make_hardlinked_indexed_source(model, path):
