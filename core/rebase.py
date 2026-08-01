@@ -35,6 +35,7 @@ RMSNorm output: the preview and the exported checkpoint differ only by rounding.
 """
 
 from dataclasses import dataclass
+import weakref
 
 import torch
 
@@ -127,12 +128,15 @@ _MOE_READS = (
 )
 
 
+_VALIDATED_RMS_NORMS = weakref.WeakKeyDictionary()
+
+
 def validate_rms_norm(norm, hidden, name="RMSNorm"):
     """Validate the structural and functional contract used by read hooks.
 
-    Class names alone are insufficient (and biasless LayerNorm looks similar),
-    so a nonconstant-vector shift probe rejects mean-subtracting normalization
-    while accepting ordinary-gain and zero-centered-gain RMSNorm variants.
+    The read conjugation requires ``N(x) / gamma`` to preserve the direction of
+    each token vector.  Class names alone are insufficient, so several probes
+    enforce that contract for ordinary- and zero-centered-gain RMSNorms.
     """
     if norm is None or not callable(norm):
         raise ValueError(f"{name} is absent or noncallable")
@@ -143,20 +147,48 @@ def validate_rms_norm(norm, hidden, name="RMSNorm"):
         raise ValueError(f"{name} has wrong hidden width")
     if isinstance(norm, torch.nn.LayerNorm):
         raise ValueError(f"{name} is mean-subtracting LayerNorm, not RMSNorm")
+    cache_key = (hidden, weight.dtype, weight.device, getattr(weight, "_version", None))
+    if _VALIDATED_RMS_NORMS.get(norm) == cache_key:
+        return norm
     device = weight.device
+    probe_dtype = weight.dtype if weight.dtype in (torch.float16, torch.bfloat16, torch.float32) else torch.float32
+    rtol, atol = ((3e-2, 3e-3) if probe_dtype == torch.bfloat16 else
+                  (5e-3, 5e-4) if probe_dtype == torch.float16 else
+                  (3e-4, 3e-5))
     try:
         with torch.no_grad():
-            x = torch.linspace(-1.25, 2.0, hidden, device=device, dtype=torch.float32).unsqueeze(0)
-            y = norm(x)
-            shifted = norm(x + 0.731)
-        if y.shape != x.shape or shifted.shape != x.shape or not torch.isfinite(y).all():
-            raise ValueError(f"{name} failed the RMS semantic probe")
-        if torch.allclose(y, shifted, rtol=2e-4, atol=2e-5):
-            raise ValueError(f"{name} is mean-subtracting rather than RMS-style")
+            zero = torch.zeros(1, hidden, device=device, dtype=probe_dtype)
+            ones = torch.ones_like(zero)
+            probes = (
+                torch.linspace(-1.37, 2.11, hidden, device=device, dtype=probe_dtype).unsqueeze(0),
+                torch.linspace(0.23, 1.91, hidden, device=device, dtype=probe_dtype).flip(-1).unsqueeze(0),
+                torch.where(torch.arange(hidden, device=device) % 2 == 0,
+                            torch.tensor(0.61, device=device),
+                            torch.tensor(-1.43, device=device)).to(probe_dtype).unsqueeze(0),
+            )
+            outputs = [norm(zero), norm(ones)] + [norm(x) for x in probes]
+        if any(out.shape != zero.shape or not torch.isfinite(out).all() for out in outputs):
+            raise ValueError(f"{name} produced nonfinite or wrong-shaped probe output")
+        if not torch.allclose(outputs[0].float(), torch.zeros_like(outputs[0].float()),
+                              rtol=0, atol=atol):
+            raise ValueError(f"{name} has an additive offset")
+        gamma = outputs[1].float().flatten()
+        valid = gamma.abs() > max(atol, 1e-6)
+        if int(valid.sum()) < min(hidden, 2):
+            raise ValueError(f"{name} has insufficient nonzero effective gain channels")
+        for x, output in zip(probes, outputs[2:]):
+            xv = x.float().flatten()[valid]
+            normalized = output.float().flatten()[valid] / gamma[valid]
+            channel_scale = normalized / xv
+            scalar = channel_scale.mean()
+            if not torch.isfinite(channel_scale).all() or not torch.allclose(
+                    channel_scale, scalar.expand_as(channel_scale), rtol=rtol, atol=atol):
+                raise ValueError(f"{name} is not direction-preserving RMS-style normalization")
     except ValueError:
         raise
     except Exception as exc:
         raise ValueError(f"{name} failed the RMS semantic probe: {exc}") from exc
+    _VALIDATED_RMS_NORMS[norm] = cache_key
     return norm
 
 

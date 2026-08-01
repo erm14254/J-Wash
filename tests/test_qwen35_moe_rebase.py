@@ -1,4 +1,5 @@
 import copy
+import asyncio
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,6 +36,34 @@ class RMS(nn.Module):
 
     def forward(self, x):
         return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-6) * (1 + self.weight)
+
+
+class OrdinaryRMS(nn.Module):
+    def __init__(self, n, dtype=torch.float32):
+        super().__init__(); self.weight = nn.Parameter(torch.ones(n, dtype=dtype))
+    def forward(self, x):
+        return (self.weight * x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + 1e-6)).to(x.dtype)
+
+
+class BadNorm(nn.Module):
+    def __init__(self, n, kind, dtype=torch.float32):
+        super().__init__(); self.weight = nn.Parameter(torch.ones(n, dtype=dtype)); self.kind = kind
+    def forward(self, x):
+        xf = x.float(); rms = xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + 1e-6)
+        if self.kind == "offset": out = rms + 0.2
+        elif self.kind == "rotated": out = rms.roll(1, -1)
+        elif self.kind == "cubic": out = xf ** 3
+        elif self.kind == "tanh": out = xf.tanh()
+        elif self.kind == "mean": out = (xf - xf.mean(-1, keepdim=True)) * torch.rsqrt(xf.var(-1, unbiased=False, keepdim=True) + 1e-6)
+        elif self.kind == "nonfinite":
+            out = rms
+            if bool((xf[..., 0] < -1).any()): out = out * torch.tensor(float("nan"), device=x.device)
+        return (self.weight.float() * out).to(x.dtype)
+
+
+class CallableNotHookable:
+    def __init__(self, n): self.weight = torch.ones(n)
+    def __call__(self, x): return x
 
 
 def block(linear=False, hidden=8, sparse=True):
@@ -300,6 +329,87 @@ def test_norm_semantics_and_final_norm_preflight(tiny):
         with pytest.raises(ValueError, match=phrase): rebase.model_preflight(bad)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_audited_hf_rmsnorm_classes_and_dtypes(dtype):
+    from transformers.models.llama.modeling_llama import LlamaRMSNorm
+    from transformers.models.mistral.modeling_mistral import MistralRMSNorm
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
+    from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeRMSNorm
+    for cls in (LlamaRMSNorm, MistralRMSNorm, Qwen2RMSNorm, Qwen3_5MoeRMSNorm):
+        rebase.validate_rms_norm(cls(8).to(dtype=dtype), 8, cls.__name__)
+
+
+@pytest.mark.parametrize("site", ["input", "post", "final"])
+@pytest.mark.parametrize("kind", ["layernorm", "mean", "offset", "rotated", "cubic", "tanh", "nonfinite", "nonhookable"])
+def test_adversarial_norms_fail_closed(tiny, site, kind):
+    candidate = (nn.LayerNorm(8, bias=False) if kind == "layernorm" else
+                 CallableNotHookable(8) if kind == "nonhookable" else
+                 BadNorm(8, kind, torch.bfloat16 if kind == "mean" else torch.float32))
+    if site == "final":
+        jl = dense_lens(); jl._final_norm = candidate
+        meta = _rebase_capability_meta(jl)
+        assert not meta["readthrough_supported"] and not meta["exact_supported"]
+    else:
+        dense = block(sparse=False)
+        attr = "input_layernorm" if site == "input" else "post_attention_layernorm"
+        if kind == "nonhookable":
+            dense._modules.pop(attr); object.__setattr__(dense, attr, candidate)
+        else:
+            setattr(dense, attr, candidate)
+        cap = rebase.block_capabilities(dense)
+        assert not cap.readthrough_supported and not cap.exact_supported
+
+
+def test_live_read_hook_uses_bf16_output_not_fp32_gain(tiny):
+    import types
+    def mixed_model():
+        model = copy.deepcopy(tiny).bfloat16().eval()
+        norms = [model.model.norm]
+        norms += [n for layer in model.model.layers
+                  for n in (layer.input_layernorm, layer.post_attention_layernorm)]
+        for norm in norms:
+            norm.weight.data = norm.weight.data.float()
+            norm.forward = types.MethodType(
+                lambda self, x: type(self).forward(self, x).to(x.dtype), norm)
+        return model
+    model, oracle_model = mixed_model(), mixed_model()
+    rules = rules_for(model); ids = torch.tensor([[1, 8, 4]])
+    oracle_rules = rules_for(oracle_model); oracle_sites = oracle_handles(oracle_model, oracle_rules)
+    with torch.no_grad(): oracle_logits = oracle_model(ids).logits
+    for handle in oracle_sites: handle.remove()
+    iv = Interventions(); iv._rules = rules; iv.set_mode("readthrough"); iv.attach(lens(model))
+    try:
+        with torch.no_grad(): got = model(ids).logits
+        assert got.dtype == torch.bfloat16 and torch.isfinite(got).all()
+        torch.testing.assert_close(got, oracle_logits, rtol=4e-3, atol=4e-3)
+    finally:
+        iv.detach()
+    assert iv._handles == [] and all(len(module._forward_hooks) == 0 for module in model.modules())
+
+
+def test_exact_writer_hook_uses_runtime_output_dtype():
+    jl = dense_lens(); direction = torch.randn(8); direction /= direction.norm()
+    rules = [{"id": 1, "token_id": 1, "token": "x", "mode": "scale", "factor": 0.8,
+              "replacement_id": None, "replacement": None, "layers": [0],
+              "dirs_a": {0: direction}, "dirs_b": None}]
+    writer = jl.layers[1].self_attn.o_proj
+    original_forward = writer.forward
+    writer.forward = lambda x: original_forward(x.float()).to(torch.bfloat16)
+    iv = Interventions(); iv._rules = rules; iv.set_mode("exact"); iv.attach(jl)
+    try:
+        x = torch.randn(2, 8)
+        raw = original_forward(x).to(torch.bfloat16)
+        U, V = rebase.cumulative(rules, 1.0, 2)[1]
+        U_inv, Vw, _ = rebase.inverse_uv(U, V)
+        expected = raw - (raw @ Vw.to(raw)) @ U_inv.to(raw).T
+        got = writer(x)
+        assert got.dtype == torch.bfloat16
+        torch.testing.assert_close(got, expected, rtol=4e-3, atol=4e-3)
+    finally:
+        iv.detach()
+    assert iv._handles == [] and len(writer._forward_hooks) == 0
+
+
 @pytest.mark.parametrize("shape", [(9, 8), (3, 7, 8)])
 @pytest.mark.parametrize("budget", [1, 2, 64])
 def test_bounded_read_transform_matches_math(shape, budget):
@@ -311,6 +421,25 @@ def test_bounded_read_transform_matches_math(shape, budget):
     assert torch.equal(got, expected)
     assert got.shape == source.shape and got.dtype == source.dtype
     assert seen and max(seen) <= budget and delta > 0
+
+
+def test_full_export_observer_covers_every_bounded_row(tiny, tmp_path, monkeypatch):
+    source = tmp_path / "source"; make_source(tiny, source)
+    disk = load_file(str(next(source.glob("*.safetensors"))))
+    transforms, info = rebase.build_plan(rules_for(tiny), lens(tiny), 1.0)
+    mapper = editing._disk_mapper(info["embed_key"], set(disk))
+    row_counts = [disk[mapper(key)].numel() // disk[mapper(key)].shape[-1]
+                  for key, entry in transforms.items() if entry[0] == "read"]
+    observed = []
+    monkeypatch.setattr(editing, "EDITS_DIR", tmp_path / "edits")
+    monkeypatch.setattr(editing, "REBASE_EXPORT_ROW_BUDGET", 3)
+    monkeypatch.setattr(editing, "REBASE_EXPORT_CHUNK_OBSERVER", observed.append)
+    editing.export_rebase(rules_for(tiny), lens(tiny), {"dtype": "fp32"},
+                          fmt="full", name="observed", source_dir=source)
+    assert sum(observed) == sum(row_counts)
+    assert len(observed) == sum((rows + 2) // 3 for rows in row_counts)
+    assert max(observed) == 3 and all(0 < count <= 3 for count in observed)
+    assert any(count < 3 for count in observed)
 
 
 def test_packed_export_rejections_are_early_and_clean(tiny, tmp_path, monkeypatch):
@@ -334,6 +463,15 @@ def _rewrite_prefix(source: Path):
             rewritten[("model.language_model." + key.removeprefix("model."))
                       if key.startswith("model.") else key] = value
         save_file(rewritten, str(shard))
+    index_path = source / "model.safetensors.index.json"
+    if index_path.exists():
+        index = json.loads(index_path.read_text())
+        index["weight_map"] = {
+            (("model.language_model." + key.removeprefix("model."))
+             if key.startswith("model.") else key): value
+            for key, value in index["weight_map"].items()
+        }
+        index_path.write_text(json.dumps(index))
 
 
 def make_source(model, path, *, dtype=None, two_shards=False):
@@ -394,6 +532,142 @@ def test_existing_export_is_never_overwritten(tiny, tmp_path, monkeypatch):
                               fmt="full", name="same", source_dir=tmp_path / "missing")
     assert marker.read_bytes() == b"preserve me"
     assert not list(tmp_path.glob(".same.tmp-*"))
+
+
+def test_nested_gguf_style_export_is_transactional(tiny, tmp_path, monkeypatch):
+    source = tmp_path / "source"; make_source(tiny, source)
+    edits = tmp_path / "edits"; monkeypatch.setattr(editing, "EDITS_DIR", edits)
+    result = editing.export_rebase(rules_for(tiny), lens(tiny), {"dtype": "fp32"},
+                                   fmt="full", name="job/hf", source_dir=source)
+    final = edits / "job" / "hf"
+    assert Path(result["out_dir"]) == final.resolve() and (final / "edit_meta.json").exists()
+    assert not list(final.parent.glob(".hf.tmp-*"))
+    with pytest.raises(ValueError, match="already exists"):
+        editing.export_rebase(rules_for(tiny), lens(tiny), {"dtype": "fp32"},
+                              fmt="full", name="job/hf", source_dir=source)
+    assert (final / "edit_meta.json").exists()
+    for unsafe in ("../escape", "/tmp/escape"):
+        with pytest.raises(ValueError, match="beneath"):
+            editing.export_rebase(rules_for(tiny), lens(tiny), {"dtype": "fp32"},
+                                  fmt="full", name=unsafe, source_dir=source)
+
+
+@pytest.mark.parametrize("failure", ["shard", "metadata"])
+def test_nested_gguf_style_failures_leave_no_partial(tiny, tmp_path, monkeypatch, failure):
+    source = tmp_path / "source"; make_source(tiny, source)
+    edits = tmp_path / "edits"; monkeypatch.setattr(editing, "EDITS_DIR", edits)
+    if failure == "shard":
+        monkeypatch.setattr(editing, "save_file", lambda *_a, **_k: (_ for _ in ()).throw(OSError("shard")))
+    else:
+        original = Path.write_text
+        def fail_meta(self, *args, **kwargs):
+            if self.name == "edit_meta.json": raise OSError("metadata")
+            return original(self, *args, **kwargs)
+        monkeypatch.setattr(Path, "write_text", fail_meta)
+    with pytest.raises(OSError, match=failure):
+        editing.export_rebase(rules_for(tiny), lens(tiny), {"dtype": "fp32"},
+                              fmt="full", name="job/hf", source_dir=source)
+    parent = edits / "job"
+    assert not (parent / "hf").exists() and not list(parent.glob(".hf.tmp-*"))
+
+
+def test_api_gguf_preparation_uses_nested_hf_name(tmp_path, monkeypatch):
+    import api.app as app
+    captured = {}
+    monkeypatch.setattr(app.editing, "EDITS_DIR", tmp_path / "edits")
+    monkeypatch.setattr(app, "_llamacpp_paths", lambda: (tmp_path / "convert.py", None, None))
+    monkeypatch.setattr(app, "resolve_local_dir", lambda _model: tmp_path / "source")
+    monkeypatch.setattr(app.manager, "hf_model", object())
+    monkeypatch.setattr(app.manager, "jl", object())
+    monkeypatch.setattr(app.manager, "meta", {"model_id": "local"})
+    monkeypatch.setattr(app.interventions, "active_rules_full", lambda: [{"layers": [0]}])
+    monkeypatch.setattr(app.interventions, "_mode", "readthrough")
+    monkeypatch.setattr(app.interventions, "_scale", 1.0)
+    def fake_export(*_args, **kwargs):
+        captured["name"] = kwargs["name"]
+        target = app.editing.EDITS_DIR / kwargs["name"]
+        target.mkdir(parents=True); (target / "config.json").write_text("{}")
+        return {"out_dir": str(target)}
+    monkeypatch.setattr(app.editing, "export_rebase", fake_export)
+    monkeypatch.setattr(app, "_gguf_worker", lambda *_args: None)
+    app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
+    result = asyncio.run(app.api_edit_export_gguf(SimpleNamespace(name="job", gguf_type="bf16")))
+    assert captured["name"] == "job/hf" and result["checkpoint"] == "baked"
+    assert (app.editing.EDITS_DIR / "job" / "hf" / "config.json").exists()
+
+
+def make_hardlinked_indexed_source(model, path):
+    model.save_pretrained(path, safe_serialization=True)
+    for shard in path.glob("*.safetensors"): shard.unlink()
+    disk_state = {("model.language_model." + k.removeprefix("model."))
+                  if k.startswith("model.") else k: v.detach().cpu()
+                  for k, v in model.state_dict().items()}
+    first = path / "model-00001-of-00002.safetensors"
+    second = path / "model-00002-of-00002.safetensors"
+    save_file(disk_state, str(first)); __import__("os").link(first, second)
+    names = [first.name, second.name]
+    weight_map = {key: names[i % 2] for i, key in enumerate(disk_state)}
+    total = sum(value.numel() * value.element_size() for value in disk_state.values())
+    (path / "model.safetensors.index.json").write_text(json.dumps({
+        "metadata": {"total_size": total}, "weight_map": weight_map}))
+    return names
+
+
+def test_hardlinked_indexed_aliases_are_all_emitted_and_reload(tiny, tmp_path, monkeypatch):
+    source = tmp_path / "source"; names = make_hardlinked_indexed_source(tiny, source)
+    from transformers import AutoModelForCausalLM
+    AutoModelForCausalLM.from_pretrained(source, local_files_only=True)
+    monkeypatch.setattr(editing, "EDITS_DIR", tmp_path / "edits")
+    result = editing.export_rebase(rules_for(tiny), lens(tiny), {"dtype": "fp32"},
+                                   fmt="full", name="aliases", source_dir=source)
+    out = Path(result["out_dir"])
+    assert all((out / name).is_file() for name in names)
+    reloaded = AutoModelForCausalLM.from_pretrained(out, local_files_only=True).float().eval()
+    baked_model = bake(tiny, rules_for(tiny)); ids = torch.tensor([[1, 8, 4]])
+    with torch.no_grad():
+        torch.testing.assert_close(reloaded(ids).logits, baked_model(ids).logits,
+                                   rtol=2e-5, atol=2e-6)
+
+
+def test_noninformative_inode_does_not_affect_indexed_aliases(tiny, tmp_path, monkeypatch):
+    source = tmp_path / "source"; names = make_hardlinked_indexed_source(tiny, source)
+    original_stat = Path.stat
+    def zero_inode(self, *args, **kwargs):
+        value = original_stat(self, *args, **kwargs)
+        if self.name in names:
+            return SimpleNamespace(st_mode=value.st_mode, st_ino=0)
+        return value
+    monkeypatch.setattr(Path, "stat", zero_inode)
+    monkeypatch.setattr(editing, "EDITS_DIR", tmp_path / "edits")
+    result = editing.export_rebase(rules_for(tiny), lens(tiny), {"dtype": "fp32"},
+                                   fmt="full", name="inode-zero", source_dir=source)
+    assert all((Path(result["out_dir"]) / name).is_file() for name in names)
+
+
+def test_equal_mocked_inodes_do_not_collapse_distinct_shards(tiny, tmp_path, monkeypatch):
+    source = tmp_path / "source"; make_source(tiny, source, two_shards=True)
+    names = [path.name for path in source.glob("*.safetensors")]
+    original_stat = Path.stat
+    def same_inode(self, *args, **kwargs):
+        value = original_stat(self, *args, **kwargs)
+        if self.name in names:
+            return SimpleNamespace(st_mode=value.st_mode, st_ino=123)
+        return value
+    monkeypatch.setattr(Path, "stat", same_inode)
+    monkeypatch.setattr(editing, "EDITS_DIR", tmp_path / "edits")
+    result = editing.export_rebase(rules_for(tiny), lens(tiny), {"dtype": "fp32"},
+                                   fmt="full", name="same-inode", source_dir=source)
+    assert all((Path(result["out_dir"]) / name).is_file() for name in names)
+
+
+def test_indexed_missing_alias_is_rejected_without_publication(tiny, tmp_path, monkeypatch):
+    source = tmp_path / "source"; names = make_hardlinked_indexed_source(tiny, source)
+    (source / names[1]).unlink()
+    monkeypatch.setattr(editing, "EDITS_DIR", tmp_path / "edits")
+    with pytest.raises(ValueError, match="indexed shard.*missing"):
+        editing.export_rebase(rules_for(tiny), lens(tiny), {"dtype": "fp32"},
+                              fmt="full", name="missing-alias", source_dir=source)
+    assert not (editing.EDITS_DIR / "missing-alias").exists()
 
 
 @pytest.mark.parametrize("failure", ["second_shard", "config", "auxiliary", "metadata"])

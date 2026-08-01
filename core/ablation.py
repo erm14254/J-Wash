@@ -340,22 +340,25 @@ class Interventions:
 
         def read_hook_for(norm, U, V):
             Ug, Vg = rebase.gamma_pair(norm, U, V)
-            weight = norm.weight
-            Ug = Ug.to(weight.device, weight.dtype)
-            Vg = Vg.to(weight.device, weight.dtype)
 
             def hook(module, inputs, output):
-                return output + (output @ Vg) @ Ug.T
+                residual = output[0] if isinstance(output, tuple) else output
+                ug = Ug.to(device=residual.device, dtype=residual.dtype)
+                vg = Vg.to(device=residual.device, dtype=residual.dtype)
+                changed = residual + (residual @ vg) @ ug.T
+                return ((changed,) + tuple(output[1:])
+                        if isinstance(output, tuple) else changed)
 
             return hook
 
         def write_hook_for(module, U_inv, V):
-            weight = module.weight
-            U_inv = U_inv.to(weight.device, weight.dtype)
-            V = V.to(weight.device, weight.dtype)
-
             def hook(module, inputs, output):
-                return output - (output @ V) @ U_inv.T
+                residual = output[0] if isinstance(output, tuple) else output
+                u_inv = U_inv.to(device=residual.device, dtype=residual.dtype)
+                v = V.to(device=residual.device, dtype=residual.dtype)
+                changed = residual - (residual @ v) @ u_inv.T
+                return ((changed,) + tuple(output[1:])
+                        if isinstance(output, tuple) else changed)
 
             return hook
 

@@ -404,11 +404,18 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
     rejected and never modified.  All construction occurs in a unique sibling
     staging directory which is removed on every failure.
     """
-    final_dir = EDITS_DIR / name
+    root = EDITS_DIR.resolve()
+    final_dir = (root / name).resolve()
+    try:
+        relative = final_dir.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("export name must remain beneath the edits directory") from exc
+    if not relative.parts:
+        raise ValueError("export name must identify a directory beneath the edits directory")
     if final_dir.exists():
         raise ValueError(f"export destination already exists: {final_dir}")
-    EDITS_DIR.mkdir(parents=True, exist_ok=True)
-    stage = EDITS_DIR / f".{name}.tmp-{uuid.uuid4().hex}"
+    final_dir.parent.mkdir(parents=True, exist_ok=True)
+    stage = final_dir.parent / f".{final_dir.name}.tmp-{uuid.uuid4().hex}"
     stage.mkdir()
     try:
         result = _export_rebase_impl(
@@ -563,17 +570,27 @@ def _export_rebase_impl(rules, jl, model_meta, *, fmt, name, source_dir=None,
         if source_dir is None or not Path(source_dir).is_dir():
             raise ValueError("full checkpoint: model source folder not found")
         source_dir = Path(source_dir)
-        shards = sorted(source_dir.glob("*.safetensors"))
+        source_index_path = source_dir / "model.safetensors.index.json"
+        source_index = None
+        if source_index_path.exists():
+            source_index = json.loads(source_index_path.read_text(encoding="utf-8"))
+            weight_map = source_index.get("weight_map")
+            if not isinstance(weight_map, dict) or not weight_map:
+                raise ValueError("full checkpoint: safetensors index has no weight_map")
+            shard_names = list(dict.fromkeys(weight_map.values()))
+            if any(not isinstance(n, str) or Path(n).name != n for n in shard_names):
+                raise ValueError("full checkpoint: index contains an unsafe shard filename")
+            shards = [source_dir / filename for filename in shard_names]
+            missing_shards = [shard.name for shard in shards if not shard.is_file()]
+            if missing_shards:
+                raise ValueError(f"full checkpoint: indexed shard(s) missing: {missing_shards}")
+        else:
+            shards = sorted(source_dir.glob("*.safetensors"))
         if not shards:
             raise ValueError("full checkpoint: no safetensors in the source")
 
         disk_keys = set()
-        seen = set()
         for shard in shards:
-            ino = shard.stat().st_ino
-            if ino in seen:
-                continue
-            seen.add(ino)
             with safe_open(str(shard), framework="pt") as f:
                 disk_keys.update(f.keys())
         to_disk = _disk_mapper(info["embed_key"], disk_keys)
@@ -599,12 +616,7 @@ def _export_rebase_impl(rules, jl, model_meta, *, fmt, name, source_dir=None,
 
         lm_head_written = False
         embed_shard_name = None
-        seen = set()
         for shard in shards:
-            ino = shard.stat().st_ino
-            if ino in seen:
-                continue
-            seen.add(ino)
             out = {}
             with safe_open(str(shard), framework="pt") as f:
                 for key in f.keys():
@@ -672,6 +684,25 @@ def _export_rebase_impl(rules, jl, model_meta, *, fmt, name, source_dir=None,
                     lm_head_value.numel() * lm_head_value.element_size()
                 )
             index_path.write_text(json.dumps(index, indent=1), encoding="utf-8")
+
+        # Validate the logical indexed artifact, never physical inode identity.
+        if source_index is not None:
+            staged_index = json.loads(index_path.read_text(encoding="utf-8"))
+            staged_map = staged_index.get("weight_map", {})
+            referenced = list(dict.fromkeys(staged_map.values()))
+            absent_files = [name for name in referenced if not (out_dir / name).is_file()]
+            if absent_files:
+                raise ValueError(f"staged index references missing shard(s): {absent_files}")
+            for key in transforms:
+                filename = staged_map.get(key)
+                if filename is None:
+                    raise ValueError(f"transformed key {key} is absent from the staged index")
+                with safe_open(str(out_dir / filename), framework="pt") as f:
+                    if key not in f.keys():
+                        raise ValueError(
+                            f"staged index maps transformed key {key} to {filename}, "
+                            "but that shard does not contain it"
+                        )
 
     if delta_max < 1e-8:
         raise ValueError(
