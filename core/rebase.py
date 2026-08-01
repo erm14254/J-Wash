@@ -35,7 +35,6 @@ RMSNorm output: the preview and the exported checkpoint differ only by rounding.
 """
 
 from dataclasses import dataclass
-import weakref
 
 import torch
 
@@ -128,15 +127,21 @@ _MOE_READS = (
 )
 
 
-_VALIDATED_RMS_NORMS = weakref.WeakKeyDictionary()
+_AUDITED_RMS_NORMS = {
+    ("transformers.models.llama.modeling_llama", "LlamaRMSNorm"): "ordinary",
+    ("transformers.models.mistral.modeling_mistral", "MistralRMSNorm"): "ordinary",
+    ("transformers.models.qwen2.modeling_qwen2", "Qwen2RMSNorm"): "ordinary",
+    ("transformers.models.qwen3.modeling_qwen3", "Qwen3RMSNorm"): "ordinary",
+    ("transformers.models.qwen3_5.modeling_qwen3_5", "Qwen3_5RMSNorm"): "zero-centered",
+    ("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe", "Qwen3_5MoeRMSNorm"): "zero-centered",
+}
 
 
 def validate_rms_norm(norm, hidden, name="RMSNorm"):
     """Validate the structural and functional contract used by read hooks.
 
-    The read conjugation requires ``N(x) / gamma`` to preserve the direction of
-    each token vector.  Class names alone are insufficient, so several probes
-    enforce that contract for ordinary- and zero-centered-gain RMSNorms.
+    Phase 1 accepts only exact audited Transformers classes.  Rank-3 functional
+    probes are defense in depth, not generic RMS recognition.
     """
     if norm is None or not callable(norm):
         raise ValueError(f"{name} is absent or noncallable")
@@ -145,11 +150,15 @@ def validate_rms_norm(norm, hidden, name="RMSNorm"):
     weight = getattr(norm, "weight", None)
     if weight is None or tuple(weight.shape) != (hidden,):
         raise ValueError(f"{name} has wrong hidden width")
-    if isinstance(norm, torch.nn.LayerNorm):
-        raise ValueError(f"{name} is mean-subtracting LayerNorm, not RMSNorm")
-    cache_key = (hidden, weight.dtype, weight.device, getattr(weight, "_version", None))
-    if _VALIDATED_RMS_NORMS.get(norm) == cache_key:
-        return norm
+    cls = type(norm)
+    gain_kind = _AUDITED_RMS_NORMS.get((cls.__module__, cls.__name__))
+    if gain_kind is None:
+        raise ValueError(f"{name} class {cls.__module__}.{cls.__name__} is not audited")
+    if not torch.isfinite(weight).all():
+        raise ValueError(f"{name} gain is nonfinite")
+    epsilon = getattr(norm, "variance_epsilon", getattr(norm, "eps", None))
+    if not isinstance(epsilon, (float, int)) or not (0 < float(epsilon) < 1):
+        raise ValueError(f"{name} has invalid RMS epsilon")
     device = weight.device
     probe_dtype = weight.dtype if weight.dtype in (torch.float16, torch.bfloat16, torch.float32) else torch.float32
     rtol, atol = ((3e-2, 3e-3) if probe_dtype == torch.bfloat16 else
@@ -157,42 +166,37 @@ def validate_rms_norm(norm, hidden, name="RMSNorm"):
                   (3e-4, 3e-5))
     try:
         with torch.no_grad():
-            zero = torch.zeros(1, hidden, device=device, dtype=probe_dtype)
+            zero = torch.zeros(2, 3, hidden, device=device, dtype=probe_dtype)
             ones = torch.ones_like(zero)
-            probes = (
-                torch.linspace(-1.37, 2.11, hidden, device=device, dtype=probe_dtype).unsqueeze(0),
-                torch.linspace(0.23, 1.91, hidden, device=device, dtype=probe_dtype).flip(-1).unsqueeze(0),
-                torch.where(torch.arange(hidden, device=device) % 2 == 0,
-                            torch.tensor(0.61, device=device),
-                            torch.tensor(-1.43, device=device)).to(probe_dtype).unsqueeze(0),
-            )
+            base = torch.linspace(-1.37, 2.11, hidden, device=device, dtype=probe_dtype)
+            probes = (torch.stack([base.roll(i) * (1 + i / 7) for i in range(6)]).reshape(2, 3, hidden),
+                      torch.stack([base.flip(0).roll(2 * i) - i / 9 for i in range(6)]).reshape(2, 3, hidden))
             outputs = [norm(zero), norm(ones)] + [norm(x) for x in probes]
         if any(out.shape != zero.shape or not torch.isfinite(out).all() for out in outputs):
             raise ValueError(f"{name} produced nonfinite or wrong-shaped probe output")
         if not torch.allclose(outputs[0].float(), torch.zeros_like(outputs[0].float()),
                               rtol=0, atol=atol):
             raise ValueError(f"{name} has an additive offset")
-        gamma = outputs[1].float().flatten()
-        valid = gamma.abs() > max(atol, 1e-6)
-        if int(valid.sum()) < min(hidden, 2):
-            raise ValueError(f"{name} has insufficient nonzero effective gain channels")
+        gamma = outputs[1].float()[0, 0]
+        expected_gain = weight.float() + (1 if gain_kind == "zero-centered" else 0)
+        if not torch.allclose(gamma, expected_gain, rtol=rtol, atol=atol):
+            raise ValueError(f"{name} effective gain does not match audited {gain_kind} semantics")
+        if (gamma.abs() <= max(atol, 1e-6)).any():
+            raise ValueError(f"{name} has an effectively singular gain channel")
         for x, output in zip(probes, outputs[2:]):
-            xv = x.float().flatten()[valid]
-            normalized = output.float().flatten()[valid] / gamma[valid]
-            channel_scale = normalized / xv
-            scalar = channel_scale.mean()
+            channel_scale = (output.float() / gamma) / x.float()
+            scalars = channel_scale.mean(-1, keepdim=True)
             if not torch.isfinite(channel_scale).all() or not torch.allclose(
-                    channel_scale, scalar.expand_as(channel_scale), rtol=rtol, atol=atol):
-                raise ValueError(f"{name} is not direction-preserving RMS-style normalization")
+                    channel_scale, scalars.expand_as(channel_scale), rtol=rtol, atol=atol):
+                raise ValueError(f"{name} is not rank-3 direction-preserving RMS normalization")
     except ValueError:
         raise
     except Exception as exc:
         raise ValueError(f"{name} failed the RMS semantic probe: {exc}") from exc
-    _VALIDATED_RMS_NORMS[norm] = cache_key
     return norm
 
 
-def block_capabilities(block):
+def block_capabilities(block, _validated_norms=None):
     """Positively validate a complete supported topology; unknowns fail closed."""
     try:
         for marker in _UNSUPPORTED_MARKERS:
@@ -208,13 +212,16 @@ def block_capabilities(block):
         hidden = first.weight.shape[-1] if first is not None and hasattr(first, "weight") else None
         if hidden is None:
             raise ValueError(f"required reader {mixer[0]}.weight is absent")
-        validate_rms_norm(getattr(block, "input_layernorm", None), hidden, "input_layernorm")
+        validated = _validated_norms if _validated_norms is not None else set()
+        def validate(norm, label):
+            if id(norm) not in validated:
+                validate_rms_norm(norm, hidden, label); validated.add(id(norm))
+        validate(getattr(block, "input_layernorm", None), "input_layernorm")
         targets = [TransformTarget(s + ".weight", s, "input_layernorm") for s in mixer]
         sparse = _submodule(block, "mlp.experts.gate_up_proj") is not None
         if sparse:
             targets.extend(_MOE_READS)
-            validate_rms_norm(getattr(block, "post_attention_layernorm", None), hidden,
-                              "post_attention_layernorm")
+            validate(getattr(block, "post_attention_layernorm", None), "post_attention_layernorm")
         else:
             for s in ("mlp.gate_proj", "mlp.up_proj"):
                 if _submodule(block, s) is None:
@@ -226,7 +233,7 @@ def block_capabilities(block):
                 raise ValueError(f"required reader {target.state_suffix} is absent")
             if tensor.ndim < 2 or tensor.shape[target.axis] != hidden:
                 raise ValueError(f"reader {target.state_suffix} has wrong residual hidden axis")
-            validate_rms_norm(getattr(block, target.norm_name, None), hidden, target.norm_name)
+            validate(getattr(block, target.norm_name, None), target.norm_name)
         exact_ok = False
         if sparse:
             exact_reason = (
@@ -254,6 +261,9 @@ def block_capabilities(block):
                 if getattr(writer, "bias", None) is not None:
                     exact_reason = f"residual writer {name} has an untransformed bias"
                     break
+                if type(writer) is not torch.nn.Linear:
+                    exact_reason = f"residual writer {name} is not an audited tensor-returning Linear"
+                    break
                 if not callable(writer) or not callable(getattr(writer, "register_forward_hook", None)):
                     exact_reason = f"residual writer {name} is not hookable by the live exact path"
                     break
@@ -274,13 +284,16 @@ def model_preflight(jl, *, exact=False):
     if not getattr(jl, "layers", None):
         raise ValueError("model has no decoder blocks")
     hidden = jl._lm_head.weight.shape[-1]
+    validated_norms = set()
     for index, block in enumerate(jl.layers):
-        cap = block_capabilities(block)
+        cap = block_capabilities(block, validated_norms)
         if not cap.readthrough_supported:
             raise ValueError(f"layer {index} readthrough unsupported: {cap.readthrough_reason}")
         if exact and not cap.exact_supported:
             raise ValueError(f"exact mode is unavailable for this model: layer {index}: {cap.exact_reason}")
-    validate_rms_norm(getattr(jl, "_final_norm", None), hidden, "final norm")
+    final_norm = getattr(jl, "_final_norm", None)
+    if id(final_norm) not in validated_norms:
+        validate_rms_norm(final_norm, hidden, "final norm")
     return True
 
 

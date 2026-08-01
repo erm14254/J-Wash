@@ -12,9 +12,12 @@ and shared-expert gate. The exact raw packed key never receives `.weight`.
 For any reader shaped `[..., output_features, hidden_size]`, the bake applies
 `B = W @ Ug` and `W' = W + B @ Vg.T`. Leading expert dimensions broadcast.
 Live preview hooks each input/post-attention RMSNorm once, plus the final norm,
-and therefore applies the same residual-coordinate read transform. Norms pass a
-cached, dtype-aware direction-preservation probe; live factors are cast from
-their canonical form to the actual hook output's device and dtype at invocation.
+and therefore applies the same residual-coordinate read transform. Norm support
+is an exact-class allowlist for audited Transformers RMSNorm implementations,
+supplemented by uncached rank-3, dtype-aware semantic validation on each model
+preflight. Live factors are cast from their canonical form to the actual hook
+output's device and dtype at invocation. Dense exact writers are restricted to
+biasless `torch.nn.Linear` tensor-returning projections.
 
 Within the tested version window, architecture detection is positive and
 fail-closed: the mixer, complete reader inventory, RMS norms, and hidden axes
@@ -25,6 +28,8 @@ Full-checkpoint export is built in a unique sibling staging directory and
 published by atomic rename; an existing destination is rejected and preserved.
 Nested cache names such as `job/hf` stage beside the final `hf` directory, and
 resolved destinations outside the edits root are rejected.
+Names are first checked under POSIX and Windows lexical rules, rejecting absolute,
+drive/UNC, traversal, dot, reserved-device, and nonportable components.
 It streams source shards, preserves unmatched tensors and
 raw tensor dtype/rank, and maps the in-memory `model.layers` prefix to the
 official `model.language_model.layers` disk prefix. MTP tensors are copied
@@ -41,7 +46,9 @@ tensor plus destination tensor, low-rank factors, and one configured float32 row
 chunk (including its low-rank product), rather than full float32 source/delta/
 result tensors. No real 35B/122B peak-memory measurement is claimed.
 
-Indexed exports treat every filename in `weight_map` as a logical artifact.
+Indexed exports validate the index schema, portable/reserved filenames, metadata
+size, exact key-to-shard placement, complete tensor coverage, and auxiliary-name
+collisions before publication. Every filename in `weight_map` is a logical artifact.
 Hard-linked or inode-colliding source names are never deduplicated by inode, and
 the staged index, referenced shard files, and transformed-key placement are
 validated before publication.

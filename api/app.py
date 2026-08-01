@@ -676,6 +676,8 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
             )
         except ValueError as exc:
             raise HTTPException(422, str(exc))
+        except Exception as exc:
+            raise HTTPException(500, str(exc))
         baked = "baked"
 
     _gguf_state.update(state="running", name=req.name, step="starting", error=None, result=None)

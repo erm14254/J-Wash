@@ -353,12 +353,11 @@ class Interventions:
 
         def write_hook_for(module, U_inv, V):
             def hook(module, inputs, output):
-                residual = output[0] if isinstance(output, tuple) else output
-                u_inv = U_inv.to(device=residual.device, dtype=residual.dtype)
-                v = V.to(device=residual.device, dtype=residual.dtype)
-                changed = residual - (residual @ v) @ u_inv.T
-                return ((changed,) + tuple(output[1:])
-                        if isinstance(output, tuple) else changed)
+                if not isinstance(output, torch.Tensor):
+                    raise TypeError("exact residual writers must return torch.Tensor")
+                u_inv = U_inv.to(device=output.device, dtype=output.dtype)
+                v = V.to(device=output.device, dtype=output.dtype)
+                return output - (output @ v) @ u_inv.T
 
             return hook
 

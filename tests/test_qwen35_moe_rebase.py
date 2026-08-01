@@ -67,6 +67,7 @@ class CallableNotHookable:
 
 
 def block(linear=False, hidden=8, sparse=True):
+    from transformers.models.llama.modeling_llama import LlamaRMSNorm
     mixer = nn.Module()
     names = ({"in_proj_qkv": 12, "in_proj_z": 8, "in_proj_b": 2, "in_proj_a": 2,
               "out_proj": hidden} if linear else
@@ -84,7 +85,8 @@ def block(linear=False, hidden=8, sparse=True):
         mlp.gate_proj = nn.Linear(hidden, 3, False); mlp.up_proj = nn.Linear(hidden, 3, False)
         mlp.down_proj = nn.Linear(3, hidden, False)
     result = nn.Module(); setattr(result, "linear_attn" if linear else "self_attn", mixer)
-    result.mlp = mlp; result.input_layernorm = RMS(hidden); result.post_attention_layernorm = RMS(hidden)
+    result.mlp = mlp; result.input_layernorm = LlamaRMSNorm(hidden)
+    result.post_attention_layernorm = LlamaRMSNorm(hidden)
     return result
 
 
@@ -257,9 +259,14 @@ def test_tiny_semantic_prefill_and_cached_decode(tiny, mode, factor):
             torch.testing.assert_close(oracle[key], baked[key], rtol=2e-5, atol=2e-6)
     assert not torch.allclose(base["logits"], oracle["logits"])
     next_id = torch.tensor([[9]])
-    oracle_d, _ = run_variant(tiny, next_id, rules, "oracle", oracle_past)
-    production_d, _ = run_variant(tiny, next_id, rules, "production", production_past)
-    baked_d, _ = run_variant(baked_model, next_id, past=baked_past)
+    assert oracle_past is not None and production_past is not None and baked_past is not None
+    before = oracle_past.get_seq_length()
+    oracle_d, oracle_next = run_variant(tiny, next_id, rules, "oracle", oracle_past)
+    production_d, production_next = run_variant(tiny, next_id, rules, "production", production_past)
+    baked_d, baked_next = run_variant(baked_model, next_id, past=baked_past)
+    assert oracle_next.get_seq_length() == before + 1
+    assert production_next.get_seq_length() == before + 1
+    assert baked_next.get_seq_length() == before + 1
     torch.testing.assert_close(oracle_d["logits"], production_d["logits"], rtol=2e-5, atol=2e-6)
     torch.testing.assert_close(oracle_d["logits"], baked_d["logits"], rtol=2e-5, atol=2e-6)
 
@@ -311,9 +318,10 @@ def test_live_registration_failure_rolls_back(tiny, monkeypatch):
 
 
 def test_norm_semantics_and_final_norm_preflight(tiny):
-    # Positive regressions: Qwen3.5 zero-centered RMSNorm and our dense-style RMS.
+    from transformers.models.llama.modeling_llama import LlamaRMSNorm
+    # Positive regressions: Qwen3.5 zero-centered RMSNorm and audited dense RMS.
     rebase.validate_rms_norm(tiny.model.norm, 32, "qwen final")
-    rebase.validate_rms_norm(RMS(8), 8, "test RMS")
+    rebase.validate_rms_norm(LlamaRMSNorm(8), 8, "Llama RMS")
     for where in ("input", "post"):
         dense = block(sparse=False)
         setattr(dense, "input_layernorm" if where == "input" else "post_attention_layernorm",
@@ -334,9 +342,58 @@ def test_audited_hf_rmsnorm_classes_and_dtypes(dtype):
     from transformers.models.llama.modeling_llama import LlamaRMSNorm
     from transformers.models.mistral.modeling_mistral import MistralRMSNorm
     from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNorm
     from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeRMSNorm
-    for cls in (LlamaRMSNorm, MistralRMSNorm, Qwen2RMSNorm, Qwen3_5MoeRMSNorm):
+    for cls in (LlamaRMSNorm, MistralRMSNorm, Qwen2RMSNorm, Qwen3RMSNorm,
+                Qwen3_5RMSNorm, Qwen3_5MoeRMSNorm):
         rebase.validate_rms_norm(cls(8).to(dtype=dtype), 8, cls.__name__)
+
+
+def test_norm_contract_revalidates_mutation_and_rejects_unknowns():
+    from transformers.models.llama.modeling_llama import LlamaRMSNorm
+    norm = LlamaRMSNorm(8); rebase.validate_rms_norm(norm, 8)
+    norm.weight = nn.Parameter(torch.tensor([0., 1., 1., 1., 1., 1., 1., 1.]))
+    with pytest.raises(ValueError, match="singular"): rebase.validate_rms_norm(norm, 8)
+    norm = LlamaRMSNorm(8); rebase.validate_rms_norm(norm, 8)
+    norm.weight.data[0] = 0
+    with pytest.raises(ValueError, match="singular"): rebase.validate_rms_norm(norm, 8)
+    norm = LlamaRMSNorm(8); norm.variance_epsilon = -1
+    with pytest.raises(ValueError, match="epsilon"): rebase.validate_rms_norm(norm, 8)
+    with pytest.raises(ValueError, match="not audited"):
+        rebase.validate_rms_norm(OrdinaryRMS(8), 8)
+
+
+class ContainerWriter(nn.Module):
+    def __init__(self, kind):
+        super().__init__(); self.weight = nn.Parameter(torch.eye(8)); self.bias = None; self.kind = kind
+    def forward(self, x):
+        value = nn.functional.linear(x, self.weight)
+        if self.kind == "tuple": return (value,)
+        if self.kind == "namedtuple":
+            from collections import namedtuple
+            return namedtuple("Output", "hidden")(value)
+        if self.kind == "list": return [value]
+        if self.kind == "mapping": return {"hidden": value}
+        return value
+
+
+@pytest.mark.parametrize("kind", ["tensor", "tuple", "namedtuple", "list", "mapping"])
+def test_exact_writer_contract_is_linear_tensor_only(kind):
+    jl = dense_lens(); dense = jl.layers[1]
+    if kind != "tensor": dense.self_attn.o_proj = ContainerWriter(kind)
+    cap = rebase.block_capabilities(dense)
+    assert cap.exact_supported is (kind == "tensor")
+    if kind != "tensor":
+        assert "audited tensor-returning Linear" in cap.exact_reason
+        direction = torch.randn(8); direction /= direction.norm()
+        iv = Interventions(); iv._rules = [{"id": 1, "token_id": 1, "token": "x",
+            "mode": "scale", "factor": .8, "replacement_id": None, "replacement": None,
+            "layers": [0], "dirs_a": {0: direction}, "dirs_b": None}]
+        iv.set_mode("exact"); before = [len(module._forward_hooks) for module in jl._hf_model.modules()]
+        with pytest.raises(ValueError, match="audited tensor-returning Linear"): iv.attach(jl)
+        assert before == [len(module._forward_hooks) for module in jl._hf_model.modules()]
+        assert iv._handles == []
 
 
 @pytest.mark.parametrize("site", ["input", "post", "final"])
@@ -484,7 +541,9 @@ def make_source(model, path, *, dtype=None, two_shards=False):
         for i, (key, value) in enumerate(state.items()):
             groups[i % 2][key] = value; weight_map[key] = names[i % 2]
         for name, group in zip(names, groups): save_file(group, str(path / name))
-        (path / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+        total = sum(value.numel() * value.element_size() for value in state.values())
+        (path / "model.safetensors.index.json").write_text(json.dumps({
+            "metadata": {"total_size": total}, "weight_map": weight_map}))
     else:
         save_file(state, str(path / "model.safetensors"))
     _rewrite_prefix(path)
@@ -546,10 +605,18 @@ def test_nested_gguf_style_export_is_transactional(tiny, tmp_path, monkeypatch):
         editing.export_rebase(rules_for(tiny), lens(tiny), {"dtype": "fp32"},
                               fmt="full", name="job/hf", source_dir=source)
     assert (final / "edit_meta.json").exists()
-    for unsafe in ("../escape", "/tmp/escape"):
-        with pytest.raises(ValueError, match="beneath"):
+    inside_absolute = str((edits / "inside").resolve())
+    for unsafe in ("../escape", "/tmp/escape", inside_absolute, "job/../other",
+                   r"..\escape", r"C:\drive\leaf", r"\\server\share", "job/./hf",
+                   "CON/file", "job/leaf."):
+        with pytest.raises(ValueError):
             editing.export_rebase(rules_for(tiny), lens(tiny), {"dtype": "fp32"},
                                   fmt="full", name=unsafe, source_dir=source)
+    outside = tmp_path / "outside"; outside.mkdir()
+    (edits / "link").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="beneath"):
+        editing.export_rebase(rules_for(tiny), lens(tiny), {"dtype": "fp32"},
+                              fmt="full", name="link/hf", source_dir=source)
 
 
 @pytest.mark.parametrize("failure", ["shard", "metadata"])
@@ -594,6 +661,22 @@ def test_api_gguf_preparation_uses_nested_hf_name(tmp_path, monkeypatch):
     result = asyncio.run(app.api_edit_export_gguf(SimpleNamespace(name="job", gguf_type="bf16")))
     assert captured["name"] == "job/hf" and result["checkpoint"] == "baked"
     assert (app.editing.EDITS_DIR / "job" / "hf" / "config.json").exists()
+
+
+def test_api_gguf_maps_generic_export_error_to_500(tmp_path, monkeypatch):
+    import api.app as app
+    monkeypatch.setattr(app.editing, "EDITS_DIR", tmp_path / "edits")
+    monkeypatch.setattr(app, "_llamacpp_paths", lambda: (tmp_path / "convert.py", None, None))
+    monkeypatch.setattr(app, "resolve_local_dir", lambda _model: tmp_path / "source")
+    monkeypatch.setattr(app.manager, "hf_model", object()); monkeypatch.setattr(app.manager, "jl", object())
+    monkeypatch.setattr(app.manager, "meta", {"model_id": "local"})
+    monkeypatch.setattr(app.interventions, "active_rules_full", lambda: [{"layers": [0]}])
+    monkeypatch.setattr(app.interventions, "_mode", "readthrough")
+    monkeypatch.setattr(app.editing, "export_rebase", lambda *_a, **_k: (_ for _ in ()).throw(OSError("disk failed")))
+    app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(app.api_edit_export_gguf(SimpleNamespace(name="job", gguf_type="bf16")))
+    assert exc.value.status_code == 500 and exc.value.detail == "disk failed"
 
 
 def make_hardlinked_indexed_source(model, path):
@@ -670,6 +753,61 @@ def test_indexed_missing_alias_is_rejected_without_publication(tiny, tmp_path, m
     assert not (editing.EDITS_DIR / "missing-alias").exists()
 
 
+@pytest.mark.parametrize("case", [
+    "root", "metadata", "total_missing", "total_negative", "total_float", "total_bool",
+    "empty_map", "empty_key", "filename_none", "filename_list", "tokenizer_name",
+    "edit_meta_name", "casefold", "non_safetensors", "traversal", "windows",
+    "bogus_key", "wrong_shard",
+])
+def test_malformed_index_is_controlled_and_never_published(tiny, tmp_path, monkeypatch, case):
+    source = tmp_path / "source"; make_source(tiny, source, two_shards=True)
+    index_path = source / "model.safetensors.index.json"
+    index = json.loads(index_path.read_text()); names = list(dict.fromkeys(index["weight_map"].values()))
+    if case == "root": payload = []
+    else:
+        payload = index
+        if case == "metadata": payload.pop("metadata")
+        elif case == "total_missing": payload["metadata"].pop("total_size")
+        elif case == "total_negative": payload["metadata"]["total_size"] = -1
+        elif case == "total_float": payload["metadata"]["total_size"] = 1.5
+        elif case == "total_bool": payload["metadata"]["total_size"] = True
+        elif case == "empty_map": payload["weight_map"] = {}
+        elif case == "empty_key": payload["weight_map"][""] = names[0]
+        elif case == "filename_none": next_key = next(iter(payload["weight_map"])); payload["weight_map"][next_key] = None
+        elif case == "filename_list": next_key = next(iter(payload["weight_map"])); payload["weight_map"][next_key] = [names[0]]
+        elif case in ("tokenizer_name", "edit_meta_name", "non_safetensors", "traversal", "windows"):
+            value = {"tokenizer_name": "tokenizer.json", "edit_meta_name": "edit_meta.json",
+                     "non_safetensors": "weights.bin", "traversal": "../evil.safetensors",
+                     "windows": r"C:\evil.safetensors"}[case]
+            payload["weight_map"][next(iter(payload["weight_map"]))] = value
+        elif case == "casefold":
+            keys = list(payload["weight_map"]); payload["weight_map"][keys[0]] = "Alias.safetensors"
+            payload["weight_map"][keys[1]] = "alias.safetensors"
+        elif case == "bogus_key": payload["weight_map"]["model.language_model.bogus"] = names[0]
+        elif case == "wrong_shard":
+            key = next(key for key, filename in payload["weight_map"].items() if filename == names[0])
+            payload["weight_map"][key] = names[1]
+    index_path.write_text(json.dumps(payload))
+    monkeypatch.setattr(editing, "EDITS_DIR", tmp_path / "edits")
+    with pytest.raises(ValueError):
+        editing.export_rebase(rules_for(tiny), lens(tiny), {"dtype": "fp32"},
+                              fmt="full", name="malformed", source_dir=source)
+    assert not (editing.EDITS_DIR / "malformed").exists()
+    assert not list(editing.EDITS_DIR.glob(".malformed.tmp-*"))
+
+
+def test_nonstring_index_key_is_controlled(tiny, tmp_path, monkeypatch):
+    source = tmp_path / "source"; make_source(tiny, source, two_shards=True)
+    original_loads = editing.json.loads
+    valid = original_loads((source / "model.safetensors.index.json").read_text())
+    valid["weight_map"] = {1: next(iter(valid["weight_map"].values()))}
+    monkeypatch.setattr(editing.json, "loads", lambda *_a, **_k: valid)
+    monkeypatch.setattr(editing, "EDITS_DIR", tmp_path / "edits")
+    with pytest.raises(ValueError, match="weight_map key"):
+        editing.export_rebase(rules_for(tiny), lens(tiny), {"dtype": "fp32"},
+                              fmt="full", name="bad-key", source_dir=source)
+
+
 @pytest.mark.parametrize("failure", ["second_shard", "config", "auxiliary", "metadata"])
 def test_full_export_staging_rolls_back_every_failure(tiny, tmp_path, monkeypatch, failure):
     source = tmp_path / "source"; make_source(tiny, source, two_shards=True)
@@ -726,7 +864,8 @@ def dense_lens():
         def __init__(self):
             super().__init__(); self.model = nn.Module()
             self.model.layers = nn.ModuleList([block(sparse=False), block(sparse=False)])
-            self.model.embed_tokens = nn.Embedding(17, 8); self.model.norm = RMS(8)
+            from transformers.models.llama.modeling_llama import LlamaRMSNorm
+            self.model.embed_tokens = nn.Embedding(17, 8); self.model.norm = LlamaRMSNorm(8)
             self.lm_head = nn.Linear(8, 17, False)
     model = DenseHF()
     return SimpleNamespace(layers=model.model.layers, _final_norm=model.model.norm,
@@ -768,8 +907,9 @@ def test_transaction_rolls_back_index_write_failure(tmp_path, monkeypatch):
     state = {k: v.detach() for k, v in jl._hf_model.state_dict().items() if k != "lm_head.weight"}
     save_file(state, str(source / "model.safetensors"))
     (source / "config.json").write_text(json.dumps({"tie_word_embeddings": True}))
+    total = sum(value.numel() * value.element_size() for value in state.values())
     (source / "model.safetensors.index.json").write_text(json.dumps({
-        "metadata": {"total_size": 1},
+        "metadata": {"total_size": total},
         "weight_map": {key: "model.safetensors" for key in state},
     }))
     monkeypatch.setattr(editing, "EDITS_DIR", tmp_path / "edits")

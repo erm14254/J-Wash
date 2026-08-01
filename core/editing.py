@@ -3,7 +3,7 @@ import re
 import shutil
 import uuid
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import torch
 from safetensors import safe_open
@@ -362,8 +362,126 @@ def _disk_mapper(mem_embed_key, disk_keys):
     return to_disk
 
 
+_INDEX_RESERVED = {
+    "config.json", "model.safetensors.index.json", "edit_meta.json",
+    "adapter_config.json", "adapter_model.safetensors", "tokenizer.json",
+    "tokenizer_config.json", "generation_config.json", "special_tokens_map.json",
+    "chat_template.json",
+}
+
+
+def _indexed_shards(source_dir):
+    """Return a fully schema-validated index and its logical shard paths."""
+    path = source_dir / "model.safetensors.index.json"
+    if not path.exists():
+        return None, None
+    try:
+        index = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"full checkpoint: invalid safetensors index: {exc}") from exc
+    if not isinstance(index, dict):
+        raise ValueError("full checkpoint: safetensors index root must be an object")
+    metadata = index.get("metadata")
+    if not isinstance(metadata, dict):
+        raise ValueError("full checkpoint: index metadata must be an object")
+    total_size = metadata.get("total_size")
+    if isinstance(total_size, bool) or not isinstance(total_size, int) or total_size < 0:
+        raise ValueError("full checkpoint: metadata.total_size must be a nonnegative integer")
+    weight_map = index.get("weight_map")
+    if not isinstance(weight_map, dict) or not weight_map:
+        raise ValueError("full checkpoint: index weight_map must be a nonempty object")
+    filenames = []
+    for key, filename in weight_map.items():
+        if not isinstance(key, str) or not key:
+            raise ValueError("full checkpoint: every weight_map key must be a nonempty string")
+        if not isinstance(filename, str) or not filename:
+            raise ValueError("full checkpoint: every shard filename must be a nonempty string")
+        try:
+            parts = _safe_relative_parts(filename)
+        except ValueError as exc:
+            raise ValueError(f"full checkpoint: unsafe shard filename {filename!r}: {exc}") from exc
+        if len(parts) != 1 or Path(filename).name != filename or not filename.lower().endswith(".safetensors"):
+            raise ValueError(f"full checkpoint: shard filename must be a plain .safetensors leaf: {filename!r}")
+        filenames.append(filename)
+    folded = [name.casefold() for name in dict.fromkeys(filenames)]
+    if len(folded) != len(set(folded)):
+        raise ValueError("full checkpoint: shard filenames have a case-fold collision")
+    auxiliary = {p.name.casefold() for pattern in ("*.json", "*.txt", "*.model", "*.tiktoken", "*.jinja")
+                 for p in source_dir.glob(pattern)}
+    forbidden = {name.casefold() for name in _INDEX_RESERVED} | auxiliary
+    collisions = sorted({name for name in dict.fromkeys(filenames) if name.casefold() in forbidden})
+    if collisions:
+        raise ValueError(f"full checkpoint: shard filename collides with reserved/auxiliary file: {collisions}")
+    shards = [source_dir / name for name in dict.fromkeys(filenames)]
+    missing = [shard.name for shard in shards if not shard.is_file()]
+    if missing:
+        raise ValueError(f"full checkpoint: indexed shard(s) missing: {missing}")
+    return index, shards
+
+
+def _validate_index_contents(index, shard_paths):
+    """Validate exact key placement, coverage, and logical total size."""
+    key_sets = {}
+    tensor_sizes = {}
+    dtype_bytes = {"BOOL": 1, "U8": 1, "I8": 1, "F8_E4M3": 1, "F8_E5M2": 1,
+                   "I16": 2, "U16": 2, "F16": 2, "BF16": 2,
+                   "I32": 4, "U32": 4, "F32": 4, "I64": 8, "U64": 8, "F64": 8}
+    for shard in shard_paths:
+        try:
+            with safe_open(str(shard), framework="pt") as f:
+                keys = set(f.keys()); key_sets[shard.name] = keys
+                tensor_sizes[shard.name] = {}
+                for key in keys:
+                    tensor_slice = f.get_slice(key)
+                    size = dtype_bytes.get(tensor_slice.get_dtype())
+                    if size is None:
+                        raise ValueError(f"unsupported safetensors dtype {tensor_slice.get_dtype()}")
+                    elements = 1
+                    for dimension in tensor_slice.get_shape(): elements *= dimension
+                    tensor_sizes[shard.name][key] = elements * size
+        except Exception as exc:
+            raise ValueError(f"invalid safetensors shard {shard.name}: {exc}") from exc
+    weight_map = index["weight_map"]
+    for key, filename in weight_map.items():
+        if key not in key_sets.get(filename, set()):
+            raise ValueError(f"index maps {key!r} to {filename!r}, but that shard does not contain it")
+    staged_keys = set().union(*key_sets.values()) if key_sets else set()
+    unindexed = staged_keys - set(weight_map)
+    if unindexed:
+        raise ValueError(f"indexed checkpoint contains unindexed tensor(s): {sorted(unindexed)[:3]}")
+    logical_total = sum(tensor_sizes[filename][key] for key, filename in weight_map.items())
+    if index["metadata"]["total_size"] != logical_total:
+        raise ValueError(
+            f"index metadata.total_size={index['metadata']['total_size']} does not match {logical_total}"
+        )
+    return key_sets, logical_total
+
+
 REBASE_EXPORT_ROW_BUDGET = 4096
 REBASE_EXPORT_CHUNK_OBSERVER = None
+
+_WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
+                     *(f"LPT{i}" for i in range(1, 10))}
+
+
+def _safe_relative_parts(name):
+    """Lexically validate a portable relative export name before resolution."""
+    if not isinstance(name, str) or not name:
+        raise ValueError("export name must be a nonempty relative path")
+    posix, windows = PurePosixPath(name), PureWindowsPath(name)
+    if posix.is_absolute() or windows.is_absolute() or windows.drive or windows.root:
+        raise ValueError("export name must not be absolute, drive-qualified, or UNC")
+    if "\\" in name:
+        raise ValueError("export name must use portable '/' separators")
+    raw = name.split("/")
+    if any(part in ("", ".", "..") for part in raw):
+        raise ValueError("export name contains an empty, '.', or '..' component")
+    for part in raw:
+        if part.endswith((" ", ".")) or part.split(".", 1)[0].upper() in _WINDOWS_RESERVED:
+            raise ValueError(f"export name contains Windows-reserved component {part!r}")
+        if any(ord(char) < 32 or char in '<>:"|?*' for char in part):
+            raise ValueError(f"export name contains nonportable component {part!r}")
+    return raw
 
 
 def apply_transform_bounded(entry, tensor, *, row_budget=REBASE_EXPORT_ROW_BUDGET,
@@ -404,8 +522,9 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
     rejected and never modified.  All construction occurs in a unique sibling
     staging directory which is removed on every failure.
     """
+    parts = _safe_relative_parts(name)
     root = EDITS_DIR.resolve()
-    final_dir = (root / name).resolve()
+    final_dir = root.joinpath(*parts).resolve()
     try:
         relative = final_dir.relative_to(root)
     except ValueError as exc:
@@ -476,6 +595,7 @@ def _export_rebase_impl(rules, jl, model_meta, *, fmt, name, source_dir=None,
 
     dtype = torch.bfloat16 if model_meta.get("dtype") == "bf16" else torch.float16
     warnings = []
+    indexed_artifact = None
     if exact and info["regularized_layers"]:
         warnings.append(
             "regularized inverse (full zap ⇒ singular transform) on layers "
@@ -570,20 +690,10 @@ def _export_rebase_impl(rules, jl, model_meta, *, fmt, name, source_dir=None,
         if source_dir is None or not Path(source_dir).is_dir():
             raise ValueError("full checkpoint: model source folder not found")
         source_dir = Path(source_dir)
-        source_index_path = source_dir / "model.safetensors.index.json"
-        source_index = None
-        if source_index_path.exists():
-            source_index = json.loads(source_index_path.read_text(encoding="utf-8"))
-            weight_map = source_index.get("weight_map")
-            if not isinstance(weight_map, dict) or not weight_map:
-                raise ValueError("full checkpoint: safetensors index has no weight_map")
-            shard_names = list(dict.fromkeys(weight_map.values()))
-            if any(not isinstance(n, str) or Path(n).name != n for n in shard_names):
-                raise ValueError("full checkpoint: index contains an unsafe shard filename")
-            shards = [source_dir / filename for filename in shard_names]
-            missing_shards = [shard.name for shard in shards if not shard.is_file()]
-            if missing_shards:
-                raise ValueError(f"full checkpoint: indexed shard(s) missing: {missing_shards}")
+        source_index, indexed_paths = _indexed_shards(source_dir)
+        if source_index is not None:
+            shards = indexed_paths
+            _validate_index_contents(source_index, shards)
         else:
             shards = sorted(source_dir.glob("*.safetensors"))
         if not shards:
@@ -685,24 +795,8 @@ def _export_rebase_impl(rules, jl, model_meta, *, fmt, name, source_dir=None,
                 )
             index_path.write_text(json.dumps(index, indent=1), encoding="utf-8")
 
-        # Validate the logical indexed artifact, never physical inode identity.
         if source_index is not None:
-            staged_index = json.loads(index_path.read_text(encoding="utf-8"))
-            staged_map = staged_index.get("weight_map", {})
-            referenced = list(dict.fromkeys(staged_map.values()))
-            absent_files = [name for name in referenced if not (out_dir / name).is_file()]
-            if absent_files:
-                raise ValueError(f"staged index references missing shard(s): {absent_files}")
-            for key in transforms:
-                filename = staged_map.get(key)
-                if filename is None:
-                    raise ValueError(f"transformed key {key} is absent from the staged index")
-                with safe_open(str(out_dir / filename), framework="pt") as f:
-                    if key not in f.keys():
-                        raise ValueError(
-                            f"staged index maps transformed key {key} to {filename}, "
-                            "but that shard does not contain it"
-                        )
+            indexed_artifact = (index_path, [out_dir / shard.name for shard in shards], set(transforms))
 
     if delta_max < 1e-8:
         raise ValueError(
@@ -743,4 +837,12 @@ def _export_rebase_impl(rules, jl, model_meta, *, fmt, name, source_dir=None,
     (out_dir / "edit_meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8"
     )
+    if indexed_artifact is not None:
+        index_path, staged_shards, transformed_keys = indexed_artifact
+        staged_index, _ = _indexed_shards(out_dir)
+        key_sets, _ = _validate_index_contents(staged_index, staged_shards)
+        for key in transformed_keys:
+            filename = staged_index["weight_map"].get(key)
+            if filename is None or key not in key_sets.get(filename, set()):
+                raise ValueError(f"transformed key {key} is not validly placed by the final index")
     return {"out_dir": str(out_dir), **meta}
