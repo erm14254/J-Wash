@@ -68,3 +68,87 @@ collisions before publication. Every filename in `weight_map` is a logical artif
 Hard-linked or inode-colliding source names are never deduplicated by inode, and
 the staged index, referenced shard files, and transformed-key placement are
 validated before publication.
+
+## Architecture reference
+
+This section records the ordinary-decoder topology that the capability checks
+and export mapping recognize. It is an implementation reference, not a promise
+that similarly named future classes or checkpoint revisions are compatible.
+
+### Runtime hierarchy and checkpoint prefixes
+
+J-Wash loads the text causal-LM view with `AutoModelForCausalLM`. The same
+ordinary decoder can therefore have different prefixes depending on whether a
+path refers to the live Python model or the official composite checkpoint:
+
+| Context | Decoder layer path | State-dict prefix |
+|---|---|---|
+| J-Wash in-memory `Qwen3_5MoeForCausalLM` | `hf_model.model.layers[m]` | `model.layers.m` |
+| Conditional-generation wrapper | `hf_model.model.language_model.layers[m]` | `model.language_model.layers.m` |
+| Official composite checkpoint on disk | n/a | `model.language_model.layers.m` |
+| Bare text model | `text_model.layers[m]` | `layers.m` |
+
+Full export maps the in-memory `model.layers.*` form to the official
+`model.language_model.layers.*` disk form. It does not invent a `.weight`
+suffix for packed expert parameters.
+
+### Residual flow
+
+Each ordinary decoder layer has two pre-normalized residual sublayers:
+
+1. `input_layernorm(residual)` feeds either full attention or linear attention;
+   the mixer output is added to the residual.
+2. `post_attention_layernorm(updated_residual)` feeds the sparse MoE; the
+   aggregate routed-plus-shared MoE output is added to the residual.
+
+The final model RMSNorm feeds `lm_head.weight`. Qwen3.5-MoE RMSNorm uses the
+zero-centered effective gain `1 + weight`; norm parameters are not projection
+targets, but their effective gains define the conjugated read transform.
+
+### Ordinary-decoder projection inventory
+
+In this table, `P` means the in-memory prefix `model.layers.m`. On disk, replace
+it with `model.language_model.layers.m`.
+
+Let `H` be residual width, `E` expert count, `I` routed-expert width, and `S`
+shared-expert width. Other output dimensions are projection-specific.
+
+| Block | Key below `P` | Shape | Residual role | Readthrough action | Exact-mode reference |
+|---|---|---:|---|---|---|
+| Full attention | `self_attn.q_proj.weight` | `[Oq, H]` | Query and output-gate read | Right-transform | Same |
+| Full attention | `self_attn.k_proj.weight` | `[Ok, H]` | Key read | Right-transform | Same |
+| Full attention | `self_attn.v_proj.weight` | `[Ov, H]` | Value read | Right-transform | Same |
+| Full attention | `self_attn.o_proj.weight` | `[H, Oattn]` | Residual writer | Keep | Left-transform |
+| Linear attention | `linear_attn.in_proj_qkv.weight` | `[Oqkv, H]` | Q/K/V read | Right-transform | Same |
+| Linear attention | `linear_attn.in_proj_z.weight` | `[Oz, H]` | Output-gate read | Right-transform | Same |
+| Linear attention | `linear_attn.in_proj_b.weight` | `[Ob, H]` | Beta read | Right-transform | Same |
+| Linear attention | `linear_attn.in_proj_a.weight` | `[Oa, H]` | Decay-input read | Right-transform | Same |
+| Linear attention | `linear_attn.out_proj.weight` | `[H, Oz]` | Residual writer | Keep | Left-transform |
+| MoE router | `mlp.gate.weight` | `[E, H]` | Router-logit/top-k read | Right-transform | Same |
+| Routed experts | `mlp.experts.gate_up_proj` | `[E, 2I, H]` | Packed gate/up read | Right-transform last axis | Same |
+| Routed experts | `mlp.experts.down_proj` | `[E, H, I]` | Packed residual writer | Keep | Left-transform output axis |
+| Shared expert | `mlp.shared_expert.gate_proj.weight` | `[S, H]` | Gate read | Right-transform | Same |
+| Shared expert | `mlp.shared_expert.up_proj.weight` | `[S, H]` | Up read | Right-transform | Same |
+| Shared expert | `mlp.shared_expert.down_proj.weight` | `[H, S]` | Residual writer | Keep | Left-transform |
+| Shared gate | `mlp.shared_expert_gate.weight` | `[1, H]` | Shared-branch scalar-gate read | Right-transform | Same |
+
+The packed `mlp.experts.gate_up_proj` and `mlp.experts.down_proj` entries are raw
+rank-3 parameters, so their checkpoint keys deliberately have no trailing
+`.weight`. The writer column documents residual flow and the algebra required
+for exact projection; Phase 1 still rejects packed-MoE exact mode because its
+packed/shared writer contract is not implemented end to end.
+
+The following tensors operate only after projection and are not residual-space
+readers or writers: `self_attn.q_norm.weight`, `self_attn.k_norm.weight`,
+`linear_attn.conv1d.weight`, `linear_attn.A_log`, `linear_attn.dt_bias`, and
+`linear_attn.norm.weight`.
+
+### Transform orientation
+
+For cumulative residual transform `C` and effective norm gain `Gamma`, the
+reader transform is `R = Gamma C Gamma^-1`. Every direct reader uses
+`W_read' = W_read R`; packed expert leading dimensions broadcast, so the last
+axis remains the residual input axis. Dense exact mode additionally applies
+`W_write' = C^-1 W_write` to audited residual writers. These orientations are
+why capability discovery validates complete inventories and hidden axes rather
+than relying on model-family names.

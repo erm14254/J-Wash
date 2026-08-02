@@ -6,8 +6,12 @@
 those edits into a real checkpoint you can run anywhere. No training, no dataset,
 no fine-tuning.**
 
-J-Wash is a local studio (FastAPI + React) for exploring, editing the [J-space](https://www.anthropic.com/research/global-workspace)
-supported Hugging Face causal LLM architectures, **and export a usable checkpoint**.
+J-Wash is a local studio (FastAPI + React) for exploring and editing the
+[J-space](https://www.anthropic.com/research/global-workspace) of supported
+Hugging Face causal LLM architectures, **and exporting a usable checkpoint**.
+Loading or chatting with a Hugging Face model does not by itself mean its
+read-projection topology is supported; pure-weight projection features are
+enabled only after the loaded architecture passes fail-closed capability checks.
 
 You chat with a model while a live **Jacobian lens**
 shows what each layer is "reading," pin and inspect concepts, then **wash** the
@@ -187,11 +191,15 @@ actual files). fp32 models are auto-converted to bf16 to halve disk usage.
 J-Wash detects read-projection capabilities from the loaded architecture and
 fails closed when a model does not match an audited topology.
 
-| Architecture / mode | Live readthrough | Live exact | Full checkpoint | Modified layers | LoRA |
-|---|---:|---:|---:|---:|---:|
-| Supported dense Llama/Mistral/Qwen-style models | Yes | Yes when capability checks pass | Yes | Yes | Yes |
-| Packed Qwen3.5-MoE | Yes | No | Yes | No | No |
-| Unknown or unsupported topology | No | No | No | No | No |
+| Read-projection topology | Recognition contract | Live readthrough | Live exact | Full checkpoint | Modified layers | LoRA |
+|---|---|---:|---:|---:|---:|---:|
+| Audited dense Llama, Mistral, Qwen2, Qwen3, and dense Qwen3.5 layouts | Complete reader/writer inventory, audited RMSNorm, biasless tensor-returning writers | Yes | Yes | Yes | Yes | Yes |
+| Packed Qwen3.5-MoE ordinary decoder | Full/linear-attention readers plus router, packed routed gate/up, shared expert, and shared gate | Yes | No | Yes | No | No |
+| Unknown, modified, or incomplete topology | No positive topology match | No | No | No | No | No |
+
+These entries describe **read projection**, not general model loading, lens
+inspection, generation, or abliteration. Dense support is conditional on the
+runtime capability checks; a familiar model family name alone is not enough.
 
 For packed Qwen3.5-MoE, MTP tensors are preserved but are not rebased.
 See [`docs/qwen3_5_moe_readthrough.md`](docs/qwen3_5_moe_readthrough.md)
@@ -404,4 +412,3 @@ Nothing is stopping you from using J-Wash on an already abliterated model! :D
 ## License
 
 Apache License 2.0 - see [LICENSE](LICENSE).
-
