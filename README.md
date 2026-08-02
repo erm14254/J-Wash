@@ -405,7 +405,3 @@ Nothing is stopping you from using J-Wash on an already abliterated model! :D
 
 Apache License 2.0 - see [LICENSE](LICENSE).
 
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/chart?repos=Extraltodeus/J-Wash&type=date&legend=bottom-right&sealed_token=0fEafkOo2k1rJ7wcJyLdXETiq78aqSVsqt8iB0SRNnWPofpSE2NHBTFBM5O-82vZYYU6hOzoFTc8TB4MQ-1YGPP8K7Cp-RrwDwP1VPvgQ800vdjauqoNAqosvI7mYuPKc0EL2mRS0rduUa4iTqCYCdTRn7o8EYR4OWnruGTTmeLQRG4gVk7V7Yh4QHZX)](https://www.star-history.com/?repos=Extraltodeus%2FJ-Wash&type=date&legend=bottom-right)
