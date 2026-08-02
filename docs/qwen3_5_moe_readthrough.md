@@ -132,6 +132,11 @@ shared-expert width. Other output dimensions are projection-specific.
 | Shared expert | `mlp.shared_expert.down_proj.weight` | `[H, S]` | Residual writer | Keep | Left-transform |
 | Shared gate | `mlp.shared_expert_gate.weight` | `[1, H]` | Shared-branch scalar-gate read | Right-transform | Same |
 
+After the final decoder block, the final RMSNorm supplies the effective gain
+for the last live read hook and `lm_head.weight` is right-transformed as the
+last residual reader. These model-level paths sit outside the per-layer `P`
+prefix used by the table.
+
 The packed `mlp.experts.gate_up_proj` and `mlp.experts.down_proj` entries are raw
 rank-3 parameters, so their checkpoint keys deliberately have no trailing
 `.weight`. The writer column documents residual flow and the algebra required

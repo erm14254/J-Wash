@@ -18,7 +18,8 @@ shows what each layer is "reading," pin and inspect concepts, then **wash** the
 model's identity or behavior with a few token-level rules turn *"I am a large
 language model"* into *"I am a large language fish"* and **export the result as a
 standalone model** (full checkpoint, modified layers, or LoRA): standard
-safetensors weights that load anywhere `transformers` models do.
+safetensors weights that load anywhere `transformers` models do, with the
+available export formats determined by the topology matrix below.
 
 The editing preview runs live in the chat, and the exported checkpoint reproduces
 it faithfully. **What you see is what you get**.
