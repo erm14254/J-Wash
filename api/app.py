@@ -5,6 +5,7 @@ import mimetypes
 import os
 import re
 import threading
+import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -602,13 +603,29 @@ def _gguf_worker(job_name, job_dir, filename_stem, gguf_type,
             env["PYTHONPATH"] = str(gguf_py) + os.pathsep + env.get("PYTHONPATH", "")
         if not base_gguf.exists():
             _gguf_state.update(step=f"converting to {base_type}")
-            proc = subprocess.run(
-                [sys.executable, "-X", "utf8", str(convert), str(hf_dir),
-                 "--outfile", str(base_gguf), "--outtype", base_type],
-                capture_output=True, text=True, env=env,
+            temp_gguf = base_gguf.with_name(
+                f".{base_gguf.stem}.tmp-{uuid.uuid4().hex}.gguf"
             )
-            if proc.returncode != 0:
-                raise RuntimeError(f"convert_hf_to_gguf failed: {proc.stderr[-2000:]}")
+            temp_gguf.unlink(missing_ok=True)
+            try:
+                proc = subprocess.run(
+                    [sys.executable, "-X", "utf8", str(convert), str(hf_dir),
+                     "--outfile", str(temp_gguf), "--outtype", base_type],
+                    capture_output=True, text=True, env=env,
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"convert_hf_to_gguf failed: {proc.stderr[-2000:]}"
+                    )
+                if not temp_gguf.is_file():
+                    raise RuntimeError(
+                        "convert_hf_to_gguf succeeded without producing an output"
+                    )
+                if temp_gguf.stat().st_size <= 0:
+                    raise RuntimeError("convert_hf_to_gguf produced an empty output")
+                temp_gguf.replace(base_gguf)
+            finally:
+                temp_gguf.unlink(missing_ok=True)
         result_path = base_gguf
         if gguf_type not in GGUF_BASE_TYPES:
             if quantize is None:

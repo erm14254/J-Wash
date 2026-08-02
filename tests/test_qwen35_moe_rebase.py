@@ -817,17 +817,14 @@ def test_gguf_valid_cached_reuse_and_delete(tmp_path, monkeypatch):
     assert response.status_code == 200 and not cached.exists()
 
 
-def _gguf_test_tools(tmp_path, *, converter_fails=False):
+def _gguf_test_tools(tmp_path):
     convert = tmp_path / "convert.py"
-    if converter_fails:
-        convert.write_text("import sys\nsys.stderr.write('converter exploded')\nsys.exit(3)\n")
-    else:
-        convert.write_text(
-            "import pathlib, sys\n"
-            "out = pathlib.Path(sys.argv[sys.argv.index('--outfile') + 1])\n"
-            "out.parent.mkdir(parents=True, exist_ok=True)\n"
-            "out.write_bytes(b'base-gguf')\n"
-        )
+    convert.write_text(
+        "import pathlib, sys\n"
+        "out = pathlib.Path(sys.argv[sys.argv.index('--outfile') + 1])\n"
+        "out.parent.mkdir(parents=True, exist_ok=True)\n"
+        "out.write_bytes(b'base-gguf')\n"
+    )
     quantize = tmp_path / "llama-quantize"
     quantize.write_text(
         "#!/usr/bin/env python3\n"
@@ -900,29 +897,124 @@ def test_gguf_nested_worker_outputs_use_leaf_stem(
     assert not (job_dir / "job").exists()
 
 
-def test_gguf_nested_worker_converter_error_preserves_cache_and_allows_retry(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("name", "cached", "gguf_type"),
+    [
+        ("job/hf", True, "bf16"),
+        ("job/hf", False, "bf16"),
+        ("job/hf", True, "q4_k_m"),
+        ("job", True, "bf16"),
+    ],
+)
+def test_gguf_atomic_partial_failure_then_retry(name, cached, gguf_type, tmp_path, monkeypatch):
     import api.app as app
     from fastapi.testclient import TestClient
     edits = tmp_path / "edits"; monkeypatch.setattr(app.editing, "EDITS_DIR", edits)
-    job_dir = edits / "job" / "hf"; hf_dir = job_dir / "hf"
-    hf_dir.mkdir(parents=True); sentinel = hf_dir / "config.json"; sentinel.write_text("{}")
-    convert, quantize = _gguf_test_tools(tmp_path, converter_fails=True)
+    parts = tuple(name.split("/")); job_dir = edits.joinpath(*parts); hf_dir = job_dir / "hf"
+    if cached:
+        hf_dir.mkdir(parents=True)
+    sentinel = hf_dir / "config.json"
+    if cached:
+        sentinel.write_text('{"cache": true}')
+    invocation = tmp_path / "converter-outfile.txt"
+    convert = tmp_path / "convert.py"
+    convert.write_text(
+        "import pathlib, sys\n"
+        f"marker = pathlib.Path({str(invocation)!r})\n"
+        "out = pathlib.Path(sys.argv[sys.argv.index('--outfile') + 1])\n"
+        "marker.write_text(str(out))\n"
+        "out.write_bytes(b'CORRUPT-PARTIAL')\n"
+        "sys.stderr.write('deliberate partial conversion failure')\n"
+        "sys.exit(3)\n"
+    )
+    quant_marker = tmp_path / "quantizer-invoked"
+    quantize = tmp_path / "llama-quantize"
+    quantize.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        f"pathlib.Path({str(quant_marker)!r}).write_text('yes')\n"
+        "pathlib.Path(sys.argv[2]).write_bytes(pathlib.Path(sys.argv[1]).read_bytes() + b'-quant')\n"
+    )
+    quantize.chmod(0o755)
     monkeypatch.setattr(app, "_llamacpp_paths", lambda: (convert, quantize, None))
+    baked = []
+    if not cached:
+        monkeypatch.setattr(app.manager, "hf_model", object())
+        monkeypatch.setattr(app.manager, "jl", object())
+        monkeypatch.setattr(app.manager, "meta", {"model_id": "local"})
+        monkeypatch.setattr(app.interventions, "active_rules_full", lambda: [{"layers": [0]}])
+        monkeypatch.setattr(app.interventions, "_mode", "readthrough")
+        monkeypatch.setattr(app.interventions, "_scale", 1.0)
+        monkeypatch.setattr(app, "resolve_local_dir", lambda _model: tmp_path / "source")
+        def fake_export(*_args, **_kwargs):
+            baked.append(True); hf_dir.mkdir(parents=True); sentinel.write_text('{"baked": true}')
+        monkeypatch.setattr(app.editing, "export_rebase", fake_export)
     pending = _deferred_threads(monkeypatch, app)
     app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
     client = TestClient(app.app)
-    response = client.post("/api/edit/export-gguf", json={"name": "job/hf", "gguf_type": "bf16"})
+    response = client.post("/api/edit/export-gguf", json={"name": name, "gguf_type": gguf_type})
     assert response.status_code == 200 and response.json()["state"]["state"] == "running"
+    assert response.json()["checkpoint"] == ("reused" if cached else "baked")
     pending.pop(0).run()
-    assert app._gguf_state["state"] == "error"
-    assert "converter exploded" in app._gguf_state["error"]
-    assert sentinel.is_file() and not (job_dir / "job").exists()
-    convert, _ = _gguf_test_tools(tmp_path)
-    response = client.post("/api/edit/export-gguf", json={"name": "job/hf", "gguf_type": "bf16"})
+    stem = parts[-1]; base = job_dir / f"{stem}-bf16.gguf"
+    quantized = job_dir / f"{stem}-{gguf_type}.gguf"
+    assert app._gguf_state["state"] == "error" and app._gguf_state["name"] == name
+    assert "deliberate partial conversion failure" in app._gguf_state["error"]
+    assert not base.exists() and not list(job_dir.glob(".*.tmp-*.gguf"))
+    assert sentinel.is_file() and invocation.read_text() != str(base)
+    assert not quant_marker.exists()
+    if gguf_type not in app.GGUF_BASE_TYPES:
+        assert not quantized.exists()
+    if "/" in name:
+        assert not (job_dir / "job").exists()
+    invocation.unlink()
+    success_marker = tmp_path / "successful-converter"
+    convert.write_text(
+        "import pathlib, sys\n"
+        f"pathlib.Path({str(success_marker)!r}).write_text('invoked')\n"
+        "out = pathlib.Path(sys.argv[sys.argv.index('--outfile') + 1])\n"
+        "out.write_bytes(b'VALID-GGUF')\n"
+    )
+    response = client.post("/api/edit/export-gguf", json={"name": name, "gguf_type": gguf_type})
     assert response.status_code == 200 and response.json()["checkpoint"] == "reused"
     pending.pop(0).run()
-    assert app._gguf_state["state"] == "done"
-    assert (job_dir / "hf-bf16.gguf").is_file()
+    assert app._gguf_state["state"] == "done" and success_marker.read_text() == "invoked"
+    assert base.read_bytes() == b"VALID-GGUF" and not list(job_dir.glob(".*.tmp-*.gguf"))
+    expected_result = quantized if gguf_type not in app.GGUF_BASE_TYPES else base
+    assert Path(app._gguf_state["result"]["gguf"]) == expected_result
+    assert expected_result.is_file() and sentinel.is_file()
+    assert quant_marker.exists() == (gguf_type not in app.GGUF_BASE_TYPES)
+    assert len(baked) == (0 if cached else 1)
+
+
+def test_gguf_atomic_reuses_existing_published_base(tmp_path, monkeypatch):
+    import api.app as app
+    edits = tmp_path / "edits"; monkeypatch.setattr(app.editing, "EDITS_DIR", edits)
+    job_dir = edits / "job"; hf_dir = job_dir / "hf"; hf_dir.mkdir(parents=True)
+    (hf_dir / "config.json").write_text("{}")
+    base = job_dir / "job-bf16.gguf"; base.write_bytes(b"PUBLISHED-GGUF")
+    marker = tmp_path / "converter-invoked"
+    convert = tmp_path / "convert.py"
+    convert.write_text(f"import pathlib\npathlib.Path({str(marker)!r}).write_text('bad')\n")
+    app._gguf_state.update(state="running", name="job", step="starting", error=None, result=None)
+    app._gguf_worker("job", job_dir, "job", "bf16", hf_dir, convert, None, None)
+    assert app._gguf_state["state"] == "done" and not marker.exists()
+    assert base.read_bytes() == b"PUBLISHED-GGUF"
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [("pass\n", "without producing"), ("import pathlib, sys\npathlib.Path(sys.argv[sys.argv.index('--outfile') + 1]).write_bytes(b'')\n", "empty output")],
+)
+def test_gguf_atomic_rejects_missing_or_empty_converter_output(body, message, tmp_path):
+    import api.app as app
+    job_dir = tmp_path / "job"; hf_dir = job_dir / "hf"; hf_dir.mkdir(parents=True)
+    convert = tmp_path / "convert.py"; convert.write_text(body)
+    app._gguf_state.update(state="running", name="job", step="starting", error=None, result=None)
+    app._gguf_worker("job", job_dir, "job", "bf16", hf_dir, convert, None, None)
+    assert app._gguf_state["state"] == "error" and message in app._gguf_state["error"]
+    assert not (job_dir / "job-bf16.gguf").exists()
+    assert not list(job_dir.glob(".*.tmp-*.gguf"))
 
 
 def test_superscript_reserved_index_shard_is_rejected(tiny, tmp_path, monkeypatch):
