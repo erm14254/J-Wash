@@ -7,7 +7,13 @@ import asyncio
 import json
 
 
+import os
+
+
 from pathlib import Path
+
+
+import sys
 
 
 from types import SimpleNamespace
@@ -250,6 +256,23 @@ def make_source(model, path, *, dtype=None, two_shards=False):
     _rewrite_prefix(path)
 
 
+def make_python_cli_launcher(tmp_path, name, body):
+    """Create a Python-backed command that subprocess can execute directly."""
+    if os.name == "nt":
+        implementation = tmp_path / f"{name}.py"
+        implementation.write_text(body)
+        launcher = tmp_path / f"{name}.cmd"
+        launcher.write_text(
+            f'@echo off\r\n"{sys.executable}" "{implementation}" %*\r\n'
+        )
+        return launcher
+
+    launcher = tmp_path / name
+    launcher.write_text(f"#!{sys.executable}\n{body}")
+    launcher.chmod(0o755)
+    return launcher
+
+
 def _gguf_test_tools(tmp_path):
     convert = tmp_path / "convert.py"
     convert.write_text(
@@ -258,13 +281,12 @@ def _gguf_test_tools(tmp_path):
         "out.parent.mkdir(parents=True, exist_ok=True)\n"
         "out.write_bytes(b'base-gguf')\n"
     )
-    quantize = tmp_path / "llama-quantize"
-    quantize.write_text(
-        "#!/usr/bin/env python3\n"
+    quantize = make_python_cli_launcher(
+        tmp_path,
+        "llama-quantize",
         "import pathlib, sys\n"
         "pathlib.Path(sys.argv[2]).write_bytes(pathlib.Path(sys.argv[1]).read_bytes() + b'-quant')\n"
     )
-    quantize.chmod(0o755)
     return convert, quantize
 
 
