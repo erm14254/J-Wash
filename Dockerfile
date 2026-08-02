@@ -22,11 +22,12 @@ ENV PATH="/venv/bin:$PATH"
 WORKDIR /app
 
 COPY requirements.txt .
+COPY requirements/jacobian-lens.commit requirements/jacobian-lens.commit
+COPY scripts/bootstrap_jlens.py scripts/bootstrap_jlens.py
 
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu124
 
-RUN git clone https://github.com/anthropics/jacobian-lens vendor/jacobian-lens \
-    && pip install -e vendor/jacobian-lens
+RUN python scripts/bootstrap_jlens.py
 
 RUN pip install --no-cache-dir -r requirements.txt
 
