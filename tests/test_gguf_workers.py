@@ -247,9 +247,84 @@ def test_gguf_atomic_partial_failure_then_retry(name, cached, gguf_type, tmp_pat
     assert expected_result.is_file() and sentinel.is_file()
     assert quant_marker.exists() == (gguf_type not in app.GGUF_BASE_TYPES)
     if gguf_type not in app.GGUF_BASE_TYPES:
-        assert json.loads(quant_marker.read_text()) == [str(base), str(quantized), gguf_type]
+        quant_args = json.loads(quant_marker.read_text())
+        assert quant_args[0] == str(base) and quant_args[2] == gguf_type
+        assert Path(quant_args[1]).parent == quantized.parent
+        assert Path(quant_args[1]).match(f".{quantized.stem}.tmp-*.gguf")
+        assert quant_args[1] != str(quantized)
         assert quantized.read_bytes() == b"VALID-GGUF-quant"
     assert len(baked) == (0 if cached else 1)
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_quantized_gguf_is_published_atomically_and_retries(
+        existing, tmp_path, monkeypatch):
+    import api.app as app
+    job_dir = tmp_path / "edits" / "job" / "hf"
+    hf_dir = job_dir / "hf"
+    hf_dir.mkdir(parents=True)
+    cache = hf_dir / "config.json"
+    cache.write_text('{"cached": true}')
+    base = job_dir / "hf-bf16.gguf"
+    base.write_bytes(b"BASE-GGUF")
+    final = job_dir / "hf-q4_k_m.gguf"
+    if existing:
+        final.write_bytes(b"PREVIOUS-VALID")
+
+    failure_marker = tmp_path / "failed-quantizer.json"
+    quantize = make_python_cli_launcher(
+        tmp_path,
+        "llama-quantize",
+        "import json, pathlib, sys\n"
+        f"final = pathlib.Path({str(final)!r})\n"
+        f"marker = pathlib.Path({str(failure_marker)!r})\n"
+        "marker.write_text(json.dumps({'args': sys.argv[1:], 'final_exists': final.exists()}))\n"
+        "pathlib.Path(sys.argv[2]).write_bytes(b'PARTIAL-QUANTIZED')\n"
+        "sys.stderr.write('deliberate quantizer failure')\n"
+        "sys.exit(3)\n",
+    )
+    app._gguf_state.update(state="running", name="job/hf", step="starting",
+                           error=None, result=None)
+    app._gguf_worker("job/hf", job_dir, "hf", "q4_k_m", hf_dir,
+                     tmp_path / "unused-converter.py", quantize, None)
+
+    failure = json.loads(failure_marker.read_text())
+    failed_output = Path(failure["args"][1])
+    assert failure["args"][0] == str(base) and failure["args"][2] == "q4_k_m"
+    assert failed_output.parent == final.parent
+    assert failed_output.match(f".{final.stem}.tmp-*.gguf") and failed_output != final
+    assert failure["final_exists"] is existing
+    assert app._gguf_state["state"] == "error"
+    assert "deliberate quantizer failure" in app._gguf_state["error"]
+    assert not failed_output.exists() and not list(job_dir.glob(".*.tmp-*.gguf"))
+    if existing:
+        assert final.read_bytes() == b"PREVIOUS-VALID"
+    else:
+        assert not final.exists()
+    assert base.read_bytes() == b"BASE-GGUF" and cache.read_text() == '{"cached": true}'
+
+    success_marker = tmp_path / "successful-quantizer.json"
+    quantize = make_python_cli_launcher(
+        tmp_path,
+        "llama-quantize",
+        "import json, pathlib, sys\n"
+        f"pathlib.Path({str(success_marker)!r}).write_text(json.dumps(sys.argv[1:]))\n"
+        "pathlib.Path(sys.argv[2]).write_bytes(b'VALID-QUANTIZED')\n",
+    )
+    app._gguf_state.update(state="running", name="job/hf", step="starting",
+                           error=None, result=None)
+    app._gguf_worker("job/hf", job_dir, "hf", "q4_k_m", hf_dir,
+                     tmp_path / "unused-converter.py", quantize, None)
+
+    success_args = json.loads(success_marker.read_text())
+    assert success_args[0] == str(base) and success_args[2] == "q4_k_m"
+    assert success_args[1] != str(final)
+    assert Path(success_args[1]).match(f".{final.stem}.tmp-*.gguf")
+    assert app._gguf_state["state"] == "done"
+    assert Path(app._gguf_state["result"]["gguf"]) == final
+    assert final.read_bytes() == b"VALID-QUANTIZED"
+    assert not list(job_dir.glob(".*.tmp-*.gguf"))
+    assert base.read_bytes() == b"BASE-GGUF" and cache.read_text() == '{"cached": true}'
 
 
 def test_gguf_atomic_reuses_existing_published_base(tmp_path, monkeypatch):
