@@ -7,7 +7,7 @@ those edits into a real checkpoint you can run anywhere. No training, no dataset
 no fine-tuning.**
 
 J-Wash is a local studio (FastAPI + React) for exploring, editing the [J-space](https://www.anthropic.com/research/global-workspace)
-of any Hugging Face LLM, **and export a usable checkpoint**.
+supported Hugging Face causal LLM architectures, **and export a usable checkpoint**.
 
 You chat with a model while a live **Jacobian lens**
 shows what each layer is "reading," pin and inspect concepts, then **wash** the
@@ -181,6 +181,22 @@ listed automatically; **Browse** adds any model folder on disk to the list
 actual files). fp32 models are auto-converted to bf16 to halve disk usage.
 
 ![models tab](assets/models_tab.png)
+
+#### Model and export support
+
+J-Wash detects read-projection capabilities from the loaded architecture and
+fails closed when a model does not match an audited topology.
+
+| Architecture / mode | Live readthrough | Live exact | Full checkpoint | Modified layers | LoRA |
+|---|---:|---:|---:|---:|---:|
+| Supported dense Llama/Mistral/Qwen-style models | Yes | Yes when capability checks pass | Yes | Yes | Yes |
+| Packed Qwen3.5-MoE | Yes | No | Yes | No | No |
+| Unknown or unsupported topology | No | No | No | No | No |
+
+For packed Qwen3.5-MoE, MTP tensors are preserved but are not rebased.
+See [`docs/qwen3_5_moe_readthrough.md`](docs/qwen3_5_moe_readthrough.md)
+for the tested Transformers window, architecture details, export guarantees,
+and intentional limitations.
 
 ### 2. Load a Jacobian lens
 
