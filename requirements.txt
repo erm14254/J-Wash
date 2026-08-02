@@ -6,16 +6,15 @@
 #        pip install torch --index-url https://download.pytorch.org/whl/cu124
 #    (Blackwell GPUs such as the RTX 50-series need a cu128+ build.)
 #
-# 2. The Jacobian-lens library ("jlens") is NOT on PyPI. Clone it and install it
-#    editable (see the README for details):
-#        git clone https://github.com/anthropics/jacobian-lens vendor/jacobian-lens
-#        pip install -e vendor/jacobian-lens
+# 2. The Jacobian-lens library ("jlens") is NOT on PyPI. Install the pinned
+#    editable checkout (see the README for details):
+#        python scripts/bootstrap_jlens.py
 #
 # 3. Then install everything below:
 #        pip install -r requirements.txt
 
 transformers>=5.5,<5.15
-accelerate>=1.0
+accelerate>=1.14,<1.15
 huggingface-hub>=0.26
 safetensors>=0.4
 

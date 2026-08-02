@@ -83,9 +83,7 @@ git clone https://github.com/extraltodeus/j-wash.git
 cd j-wash
 
 pip install torch --index-url https://download.pytorch.org/whl/cu124
-git clone https://github.com/anthropics/jacobian-lens vendor/jacobian-lens
-
-pip install -e vendor/jacobian-lens
+python scripts/bootstrap_jlens.py
 pip install -r requirements.txt
 
 cd ui && npm install && npm run build && cd ..
@@ -94,6 +92,14 @@ python -X utf8 run.py
 ```
 
 Then open **http://localhost:8381**.
+
+`bootstrap_jlens.py` clones Jacobian Lens when necessary, checks out the exact
+commit recorded in `requirements/jacobian-lens.commit`, verifies the checkout,
+and installs it editable. Re-running it is safe; `vendor/` remains git-ignored.
+
+Accelerate 1.14.0 is the audited release for automatic CPU/disk-offload support.
+The dependency policy is `accelerate>=1.14,<1.15`; its upper bound is widened
+only after the offload suite validates a newer release.
 
 ### Docker
 
