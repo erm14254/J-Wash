@@ -14,7 +14,7 @@
 # 3. Then install everything below:
 #        pip install -r requirements.txt
 
-transformers>=5.5
+transformers>=5.5,<5.15
 accelerate>=1.0
 huggingface-hub>=0.26
 safetensors>=0.4

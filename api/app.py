@@ -5,6 +5,7 @@ import mimetypes
 import os
 import re
 import threading
+import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -414,15 +415,11 @@ def api_interventions_scale(req: InterventionsScale):
         interventions.set_scale(req.scale)
     try:
         if req.mode is not None:
-            if (
-                req.mode in ("readthrough", "exact")
-                and manager.meta is not None
-                and manager.meta.get("rebase_supported") is False
-            ):
+            capability = f"{req.mode}_supported" if req.mode in ("readthrough", "exact") else None
+            if capability and manager.meta is not None and manager.meta.get(capability, manager.meta.get("rebase_supported")) is False:
                 raise HTTPException(
                     422,
-                    "read projection unavailable on this architecture (write "
-                    "norms, Gemma style) — use \"abliteration\" for pure weights",
+                    manager.meta.get(f"{req.mode}_reason", "read projection unavailable on this architecture"),
                 )
             interventions.set_mode(req.mode)
     except ValueError as exc:
@@ -593,25 +590,42 @@ def _llamacpp_paths():
     return convert, quantize, (gguf_py if gguf_py.is_dir() else None)
 
 
-def _gguf_worker(name, gguf_type, hf_dir, convert, quantize, gguf_py):
+def _gguf_worker(job_name, job_dir, filename_stem, gguf_type,
+                 hf_dir, convert, quantize, gguf_py):
     import subprocess
     import sys
     try:
-        out_dir = editing.EDITS_DIR / name
+        job_dir.mkdir(parents=True, exist_ok=True)
         base_type = gguf_type if gguf_type in GGUF_BASE_TYPES else "bf16"
-        base_gguf = out_dir / f"{name}-{base_type}.gguf"
+        base_gguf = job_dir / f"{filename_stem}-{base_type}.gguf"
         env = dict(os.environ)
         if gguf_py is not None:  # vendored gguf package inside the llama.cpp repo
             env["PYTHONPATH"] = str(gguf_py) + os.pathsep + env.get("PYTHONPATH", "")
         if not base_gguf.exists():
             _gguf_state.update(step=f"converting to {base_type}")
-            proc = subprocess.run(
-                [sys.executable, "-X", "utf8", str(convert), str(hf_dir),
-                 "--outfile", str(base_gguf), "--outtype", base_type],
-                capture_output=True, text=True, env=env,
+            temp_gguf = base_gguf.with_name(
+                f".{base_gguf.stem}.tmp-{uuid.uuid4().hex}.gguf"
             )
-            if proc.returncode != 0:
-                raise RuntimeError(f"convert_hf_to_gguf failed: {proc.stderr[-2000:]}")
+            temp_gguf.unlink(missing_ok=True)
+            try:
+                proc = subprocess.run(
+                    [sys.executable, "-X", "utf8", str(convert), str(hf_dir),
+                     "--outfile", str(temp_gguf), "--outtype", base_type],
+                    capture_output=True, text=True, env=env,
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError(
+                        f"convert_hf_to_gguf failed: {proc.stderr[-2000:]}"
+                    )
+                if not temp_gguf.is_file():
+                    raise RuntimeError(
+                        "convert_hf_to_gguf succeeded without producing an output"
+                    )
+                if temp_gguf.stat().st_size <= 0:
+                    raise RuntimeError("convert_hf_to_gguf produced an empty output")
+                temp_gguf.replace(base_gguf)
+            finally:
+                temp_gguf.unlink(missing_ok=True)
         result_path = base_gguf
         if gguf_type not in GGUF_BASE_TYPES:
             if quantize is None:
@@ -620,7 +634,7 @@ def _gguf_worker(name, gguf_type, hf_dir, convert, quantize, gguf_py):
                     "bf16/f16 exports are possible"
                 )
             _gguf_state.update(step=f"quantizing to {gguf_type}")
-            result_path = out_dir / f"{name}-{gguf_type}.gguf"
+            result_path = job_dir / f"{filename_stem}-{gguf_type}.gguf"
             proc = subprocess.run(
                 [str(quantize), str(base_gguf), str(result_path), gguf_type],
                 capture_output=True, text=True,
@@ -642,7 +656,13 @@ def _gguf_worker(name, gguf_type, hf_dir, convert, quantize, gguf_py):
 
 @app.post("/api/edit/export-gguf")
 async def api_edit_export_gguf(req: GGUFExportRequest):
-    req.name = _safe_name(req.name)
+    try:
+        name_parts = editing.validate_export_name(req.name)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    validated_name = "/".join(name_parts)
+    job_dir = editing.EDITS_DIR.joinpath(*name_parts)
+    filename_stem = name_parts[-1]
     if _gguf_state["state"] == "running":
         raise HTTPException(409, "a GGUF export is already in progress")
     if req.gguf_type not in GGUF_BASE_TYPES + GGUF_QUANT_TYPES:
@@ -654,7 +674,7 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
     if req.gguf_type not in GGUF_BASE_TYPES and quantize is None:
         raise HTTPException(422, "llama-quantize not found — pick bf16 or f16")
 
-    hf_dir = editing.EDITS_DIR / req.name / "hf"
+    hf_dir = job_dir / "hf"
     baked = "reused"
     if not (hf_dir / "config.json").exists():
         # no cached checkpoint: bake one from the ACTIVE rules (same path as a
@@ -675,17 +695,20 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
         try:
             await asyncio.to_thread(
                 export_fn, rules, manager.jl, manager.meta,
-                fmt="full", name=f"{req.name}/hf", source_dir=source_dir,
+                fmt="full", name="/".join((*name_parts, "hf")), source_dir=source_dir,
                 scale=interventions.global_scale, **kwargs,
             )
         except ValueError as exc:
             raise HTTPException(422, str(exc))
+        except Exception as exc:
+            raise HTTPException(500, str(exc))
         baked = "baked"
 
-    _gguf_state.update(state="running", name=req.name, step="starting", error=None, result=None)
+    _gguf_state.update(state="running", name=validated_name, step="starting", error=None, result=None)
     threading.Thread(
         target=_gguf_worker,
-        args=(req.name, req.gguf_type, hf_dir, convert, quantize, gguf_py),
+        args=(validated_name, job_dir, filename_stem, req.gguf_type,
+              hf_dir, convert, quantize, gguf_py),
         daemon=True,
     ).start()
     return {"started": True, "checkpoint": baked, "state": dict(_gguf_state)}
@@ -699,10 +722,15 @@ class GGUFCacheRequest(BaseModel):
 def api_gguf_cache_delete(req: GGUFCacheRequest):
     """Drop the cached HF checkpoint of a GGUF export (the .gguf files stay)."""
     import shutil
-    hf_dir = editing.EDITS_DIR / _safe_name(req.name) / "hf"
+    try:
+        name_parts = editing.validate_export_name(req.name)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    validated_name = "/".join(name_parts)
+    hf_dir = editing.EDITS_DIR.joinpath(*name_parts) / "hf"
     if not hf_dir.is_dir():
         raise HTTPException(404, f"no cached checkpoint for {req.name}")
-    if _gguf_state["state"] == "running" and _gguf_state["name"] == req.name:
+    if _gguf_state["state"] == "running" and _gguf_state["name"] == validated_name:
         raise HTTPException(409, "a GGUF export is using this cache")
     freed = sum(f.stat().st_size for f in hf_dir.rglob("*") if f.is_file())
     shutil.rmtree(hf_dir)

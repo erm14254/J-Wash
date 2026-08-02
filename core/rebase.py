@@ -34,6 +34,8 @@ The live preview mode (core/ablation) applies the SAME transform via hooks on th
 RMSNorm output: the preview and the exported checkpoint differ only by rounding.
 """
 
+from dataclasses import dataclass
+
 import torch
 
 from core.ablation import effective_coeffs
@@ -84,19 +86,283 @@ def _submodule(block, dotted):
     return module
 
 
-def check_block_supported(block):
-    for marker in _UNSUPPORTED_MARKERS:
-        if getattr(block, marker, None) is not None:
-            raise ValueError(
-                "architecture not supported by the readthrough/exact modes: "
-                f"the layer has {marker} (write norm, Gemma style) — "
-                "the read transform would be incorrect there"
+@dataclass(frozen=True)
+class TransformTarget:
+    """A residual-coordinate tensor, without assuming ``nn.Linear.weight``.
+
+    ``state_suffix`` is the exact checkpoint suffix.  ``accessor`` names the
+    module/parameter on the instantiated block, ``axis`` is the residual input
+    axis (negative indexing), and ``lora_supported`` distinguishes ordinary
+    module weights from packed functional parameters.
+    """
+
+    state_suffix: str
+    accessor: str
+    norm_name: str
+    axis: int = -1
+    activation_accessor: str | None = None
+    lora_supported: bool = True
+
+    def tensor(self, block):
+        obj = _submodule(block, self.accessor)
+        if obj is None:
+            return None
+        return obj.weight if self.state_suffix.endswith(".weight") else obj
+
+
+@dataclass(frozen=True)
+class RebaseCapabilities:
+    readthrough_supported: bool
+    readthrough_reason: str
+    exact_supported: bool
+    exact_reason: str
+
+
+_MOE_READS = (
+    TransformTarget("mlp.gate.weight", "mlp.gate", "post_attention_layernorm"),
+    TransformTarget("mlp.experts.gate_up_proj", "mlp.experts.gate_up_proj", "post_attention_layernorm", lora_supported=False),
+    TransformTarget("mlp.shared_expert.gate_proj.weight", "mlp.shared_expert.gate_proj", "post_attention_layernorm"),
+    TransformTarget("mlp.shared_expert.up_proj.weight", "mlp.shared_expert.up_proj", "post_attention_layernorm"),
+    TransformTarget("mlp.shared_expert_gate.weight", "mlp.shared_expert_gate", "post_attention_layernorm"),
+)
+
+
+_AUDITED_RMS_NORMS = {
+    ("transformers.models.llama.modeling_llama", "LlamaRMSNorm"): "ordinary",
+    ("transformers.models.mistral.modeling_mistral", "MistralRMSNorm"): "ordinary",
+    ("transformers.models.qwen2.modeling_qwen2", "Qwen2RMSNorm"): "ordinary",
+    ("transformers.models.qwen3.modeling_qwen3", "Qwen3RMSNorm"): "ordinary",
+    ("transformers.models.qwen3_5.modeling_qwen3_5", "Qwen3_5RMSNorm"): "zero-centered",
+    ("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe", "Qwen3_5MoeRMSNorm"): "zero-centered",
+}
+
+
+class ParameterInspectionError(ValueError):
+    """A small parameter could not be inspected without disturbing dispatch."""
+
+
+def materialize_parameter_for_inspection(module, parameter_name):
+    """Return an owned CPU copy of a resident or Accelerate-offloaded parameter."""
+    parameter = getattr(module, parameter_name, None)
+    if parameter is None:
+        raise ParameterInspectionError(f"parameter {parameter_name!r} is absent")
+    if parameter.device.type != "meta":
+        return parameter.detach().cpu().clone()
+    hook = getattr(module, "_hf_hook", None)
+    weights_map = getattr(hook, "weights_map", None)
+    if hook is None or weights_map is None:
+        raise ParameterInspectionError(
+            f"meta parameter {parameter_name!r} has no supported Accelerate weights_map"
+        )
+    candidates = [parameter_name]
+    try:
+        keys = list(weights_map.keys())
+    except (AttributeError, TypeError):
+        keys = []
+    candidates.extend(key for key in keys
+                      if isinstance(key, str) and key.rsplit(".", 1)[-1] == parameter_name)
+    errors = []
+    for key in dict.fromkeys(candidates):
+        try:
+            value = weights_map[key]
+            if isinstance(value, torch.Tensor) and value.device.type != "meta":
+                return value.detach().cpu().clone()
+        except (KeyError, OSError, RuntimeError, ValueError, TypeError) as exc:
+            errors.append(str(exc))
+    detail = f": {'; '.join(errors[:2])}" if errors else ""
+    raise ParameterInspectionError(
+        f"Accelerate weights_map cannot materialize {parameter_name!r}{detail}"
+    )
+
+
+def _norm_probe_device(norm, placeholder):
+    if placeholder.device.type != "meta":
+        return placeholder.device
+    device = getattr(getattr(norm, "_hf_hook", None), "execution_device", None)
+    if device is None or torch.device(device).type == "meta":
+        raise ParameterInspectionError("offloaded norm has no usable execution_device")
+    return torch.device(device)
+
+
+def validate_rms_norm(norm, hidden, name="RMSNorm"):
+    """Validate the structural and functional contract used by read hooks.
+
+    Phase 1 accepts only exact audited Transformers classes.  Rank-3 functional
+    probes are defense in depth, not generic RMS recognition.
+    """
+    if norm is None or not callable(norm):
+        raise ValueError(f"{name} is absent or noncallable")
+    if not callable(getattr(norm, "register_forward_hook", None)):
+        raise ValueError(f"{name} is not hookable")
+    weight_parameter = getattr(norm, "weight", None)
+    if weight_parameter is None or tuple(weight_parameter.shape) != (hidden,):
+        raise ValueError(f"{name} has wrong hidden width")
+    cls = type(norm)
+    gain_kind = _AUDITED_RMS_NORMS.get((cls.__module__, cls.__name__))
+    if gain_kind is None:
+        raise ValueError(f"{name} class {cls.__module__}.{cls.__name__} is not audited")
+    weight = materialize_parameter_for_inspection(norm, "weight")
+    if not bool(torch.isfinite(weight).all()):
+        raise ValueError(f"{name} gain is nonfinite")
+    epsilon = getattr(norm, "variance_epsilon", getattr(norm, "eps", None))
+    if not isinstance(epsilon, (float, int)) or not (0 < float(epsilon) < 1):
+        raise ValueError(f"{name} has invalid RMS epsilon")
+    device = _norm_probe_device(norm, weight_parameter)
+    probe_dtype = weight.dtype if weight.dtype in (torch.float16, torch.bfloat16, torch.float32) else torch.float32
+    rtol, atol = ((3e-2, 3e-3) if probe_dtype == torch.bfloat16 else
+                  (5e-3, 5e-4) if probe_dtype == torch.float16 else
+                  (3e-4, 3e-5))
+    try:
+        with torch.no_grad():
+            zero = torch.zeros(2, 3, hidden, device=device, dtype=probe_dtype)
+            ones = torch.ones_like(zero)
+            base = torch.linspace(-1.37, 2.11, hidden, device=device, dtype=probe_dtype)
+            probes = (torch.stack([base.roll(i) * (1 + i / 7) for i in range(6)]).reshape(2, 3, hidden),
+                      torch.stack([base.flip(0).roll(2 * i) - i / 9 for i in range(6)]).reshape(2, 3, hidden))
+            outputs = [norm(zero), norm(ones)] + [norm(x) for x in probes]
+        if any(out.shape != zero.shape or not torch.isfinite(out).all() for out in outputs):
+            raise ValueError(f"{name} produced nonfinite or wrong-shaped probe output")
+        if not torch.allclose(outputs[0].float(), torch.zeros_like(outputs[0].float()),
+                              rtol=0, atol=atol):
+            raise ValueError(f"{name} has an additive offset")
+        gamma = outputs[1].float()[0, 0]
+        expected_gain = weight.float().to(gamma.device) + (1 if gain_kind == "zero-centered" else 0)
+        if not torch.allclose(gamma, expected_gain, rtol=rtol, atol=atol):
+            raise ValueError(f"{name} effective gain does not match audited {gain_kind} semantics")
+        if (gamma.abs() <= max(atol, 1e-6)).any():
+            raise ValueError(f"{name} has an effectively singular gain channel")
+        for x, output in zip(probes, outputs[2:]):
+            z = output.float() / gamma.float()
+            x32 = x.float()
+            tiny = torch.finfo(torch.float32).tiny
+            alpha = (z * x32).sum(-1, keepdim=True) / (x32.square().sum(-1, keepdim=True) + tiny)
+            expected = alpha * x32
+            if not torch.isfinite(z).all() or not torch.allclose(
+                    z, expected, rtol=rtol, atol=atol):
+                raise ValueError(f"{name} is not rank-3 direction-preserving RMS normalization")
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"{name} failed the RMS semantic probe: {exc}") from exc
+    return norm
+
+
+def block_capabilities(block, _validated_norms=None):
+    """Positively validate a complete supported topology; unknowns fail closed."""
+    try:
+        for marker in _UNSUPPORTED_MARKERS:
+            if getattr(block, marker, None) is not None:
+                raise ValueError(f"layer has unsupported residual branch {marker}")
+        full = _submodule(block, "self_attn") is not None
+        linear = _submodule(block, "linear_attn") is not None
+        if full == linear:
+            raise ValueError("token-mixer topology is unknown or ambiguous")
+        mixer = (("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj") if full else
+                 ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_b", "linear_attn.in_proj_a"))
+        first = _submodule(block, mixer[0])
+        hidden = first.weight.shape[-1] if first is not None and hasattr(first, "weight") else None
+        if hidden is None:
+            raise ValueError(f"required reader {mixer[0]}.weight is absent")
+        validated = _validated_norms if _validated_norms is not None else set()
+        def validate(norm, label):
+            if id(norm) not in validated:
+                validate_rms_norm(norm, hidden, label); validated.add(id(norm))
+        validate(getattr(block, "input_layernorm", None), "input_layernorm")
+        targets = [TransformTarget(s + ".weight", s, "input_layernorm") for s in mixer]
+        sparse = _submodule(block, "mlp.experts.gate_up_proj") is not None
+        if sparse:
+            targets.extend(_MOE_READS)
+            validate(getattr(block, "post_attention_layernorm", None), "post_attention_layernorm")
+        else:
+            for s in ("mlp.gate_proj", "mlp.up_proj"):
+                if _submodule(block, s) is None:
+                    raise ValueError(f"required reader {s}.weight is absent")
+                targets.append(TransformTarget(s + ".weight", s, "post_attention_layernorm" if getattr(block, "post_attention_layernorm", None) is not None else "input_layernorm"))
+        for target in targets:
+            tensor = target.tensor(block)
+            if tensor is None:
+                raise ValueError(f"required reader {target.state_suffix} is absent")
+            if tensor.ndim < 2 or tensor.shape[target.axis] != hidden:
+                raise ValueError(f"reader {target.state_suffix} has wrong residual hidden axis")
+            validate(getattr(block, target.norm_name, None), target.norm_name)
+        exact_ok = False
+        if sparse:
+            exact_reason = (
+                "packed routed and shared-expert residual writers require a separate "
+                "implementation and aggregate-MoE live oracle"
             )
+        else:
+            # Exact preview hooks, and the bake left-multiplies, every residual
+            # writer.  Claim support only when the complete inventory for the
+            # positively identified mixer exists and has the contract used by
+            # both paths.  In particular a bias would be transformed by the
+            # live output hook but is not represented in the current bake.
+            expected_writes = (("self_attn.o_proj",) if full else
+                               ("linear_attn.out_proj",)) + ("mlp.down_proj",)
+            exact_reason = "supported"
+            for name in expected_writes:
+                writer = _submodule(block, name)
+                weight = getattr(writer, "weight", None)
+                if writer is None or weight is None:
+                    exact_reason = f"required residual writer {name}.weight is absent"
+                    break
+                if weight.ndim != 2 or weight.shape[0] != hidden:
+                    exact_reason = f"residual writer {name}.weight has wrong residual output axis"
+                    break
+                if getattr(writer, "bias", None) is not None:
+                    exact_reason = f"residual writer {name} has an untransformed bias"
+                    break
+                if type(writer) is not torch.nn.Linear:
+                    exact_reason = f"residual writer {name} is not an audited tensor-returning Linear"
+                    break
+                if not callable(writer) or not callable(getattr(writer, "register_forward_hook", None)):
+                    exact_reason = f"residual writer {name} is not hookable by the live exact path"
+                    break
+            else:
+                # No additional writers may silently escape the inventory.
+                present = {name for name in WRITES if _submodule(block, name) is not None}
+                if present != set(expected_writes):
+                    exact_reason = "residual writer inventory is ambiguous or incomplete"
+                else:
+                    exact_ok = True
+        return RebaseCapabilities(True, "supported", exact_ok, exact_reason)
+    except ValueError as exc:
+        return RebaseCapabilities(False, str(exc), False, f"readthrough unsupported: {exc}")
+
+
+def model_preflight(jl, *, exact=False):
+    """Model-wide capability contract, including the final normalization."""
+    if not getattr(jl, "layers", None):
+        raise ValueError("model has no decoder blocks")
+    hidden = jl._lm_head.weight.shape[-1]
+    validated_norms = set()
+    for index, block in enumerate(jl.layers):
+        cap = block_capabilities(block, validated_norms)
+        if not cap.readthrough_supported:
+            raise ValueError(f"layer {index} readthrough unsupported: {cap.readthrough_reason}")
+        if exact and not cap.exact_supported:
+            raise ValueError(f"exact mode is unavailable for this model: layer {index}: {cap.exact_reason}")
+    final_norm = getattr(jl, "_final_norm", None)
+    if id(final_norm) not in validated_norms:
+        validate_rms_norm(final_norm, hidden, "final norm")
+    return True
+
+
+def check_block_supported(block):
+    capability = block_capabilities(block)
+    if not capability.readthrough_supported:
+        raise ValueError("architecture not supported by readthrough: " + capability.readthrough_reason)
 
 
 def iter_reads(block):
     """Yields ``(suffix, module, norm)`` for each residual read."""
     check_block_supported(block)
+    if _submodule(block, "mlp.experts.gate_up_proj") is not None:
+        mixer = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj") if _submodule(block, "self_attn") is not None else ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_b", "linear_attn.in_proj_a")
+        targets = [TransformTarget(s + ".weight", s, "input_layernorm") for s in mixer] + list(_MOE_READS)
+        for target in targets:
+            yield target, target.tensor(block), getattr(block, target.norm_name)
+        return
     for suffix, norm_name in READS.items():
         module = _submodule(block, suffix)
         if module is None:
@@ -106,7 +372,7 @@ def iter_reads(block):
         norm = getattr(block, norm_name, None)
         if norm is None or not hasattr(norm, "weight"):
             raise ValueError(f"RMSNorm {norm_name} not found for {suffix}")
-        yield suffix, module, norm
+        yield TransformTarget(suffix + ".weight", suffix, norm_name), module.weight, norm
 
 
 def iter_writes(block):
@@ -190,10 +456,18 @@ def effective_gamma(norm):
     zero-centered RMSNorm where γ = 1 + weight — dividing by ``weight`` (~0, of
     arbitrary sign) made the transform chaotic (live preview → random tokens,
     measured). The functional measurement covers both styles."""
-    weight = norm.weight
-    with torch.no_grad():
-        ones = torch.ones(1, weight.shape[-1], device=weight.device, dtype=torch.float32)
-        return norm(ones).detach().flatten().float().cpu()
+    placeholder = norm.weight
+    weight = materialize_parameter_for_inspection(norm, "weight").float()
+    cls = type(norm)
+    gain_kind = _AUDITED_RMS_NORMS.get((cls.__module__, cls.__name__))
+    if gain_kind is None:
+        raise ValueError(f"norm class {cls.__module__}.{cls.__name__} is not audited")
+    epsilon = float(getattr(norm, "variance_epsilon", getattr(norm, "eps", 0.0)))
+    gamma = weight + (1 if gain_kind == "zero-centered" else 0)
+    gamma = gamma / (1.0 + epsilon) ** 0.5
+    if placeholder.device.type == "meta" and not torch.isfinite(gamma).all():
+        raise ParameterInspectionError("offloaded norm gain is nonfinite")
+    return gamma.detach().clone()
 
 
 def gamma_pair(norm, U, V):
@@ -205,9 +479,16 @@ def gamma_pair(norm, U, V):
 
 
 def apply_read(W, Ug, Vg):
-    """``W ← W·(I + Ug·Vgᵀ)``; returns ``(W_new, B, A)`` with delta = B·A."""
+    """Right-transform ``[..., output_features, hidden_size]`` tensors."""
+    if W.ndim < 2:
+        raise ValueError("read tensor must have at least two dimensions")
+    if W.shape[-1] != Ug.shape[0] or Ug.shape[0] != Vg.shape[0]:
+        raise ValueError("read tensor residual hidden axis does not match transform")
     B = W @ Ug  # [out, r]
-    return W + B @ Vg.T, B, Vg.T.contiguous()
+    result = W + B @ Vg.T
+    if result.shape != W.shape:
+        raise ValueError("read transform changed tensor shape")
+    return result, B, Vg.T.contiguous()
 
 
 def inverse_uv(U, V):
@@ -251,6 +532,7 @@ def build_plan(rules, jl, scale, exact=False):
     The names follow the model's layout (``{path}.layers.{m}.{suffix}.weight``,
     ``{lm_head}.weight``); the guard matching them against the checkpoint keys is
     done by the export."""
+    model_preflight(jl, exact=exact)
     active = [r for r in rules if r["layers"]]
     if not active:
         raise ValueError("no active rule (all have 0 layers): nothing to export")
@@ -269,11 +551,14 @@ def build_plan(rules, jl, scale, exact=False):
     for m in sorted(k for k in cums if k < n_layers):
         U, V = cums[m]
         block = jl.layers[m]
-        for suffix, _module, norm in iter_reads(block):
+        caps = block_capabilities(block)
+        if exact and not caps.exact_supported:
+            raise ValueError("exact mode is unavailable: " + caps.exact_reason)
+        for target, _tensor, norm in iter_reads(block):
             Ug, Vg = gamma_pair(norm, U, V)
             g_min = effective_gamma(norm).abs().min().item()
             min_gamma = g_min if min_gamma is None else min(min_gamma, g_min)
-            transforms[f"{path}.layers.{m}.{suffix}.weight"] = ("read", Ug, Vg)
+            transforms[f"{path}.layers.{m}.{target.state_suffix}"] = ("read", Ug, Vg)
         if exact:
             U_inv, Vw, regularized = inverse_uv(U, V)
             if regularized:
@@ -296,5 +581,6 @@ def build_plan(rules, jl, scale, exact=False):
         "layers_span": [min(cums), n_layers - 1],
         "regularized_layers": regularized_layers,
         "min_gamma": min_gamma,
+        "targets": {f"{path}.layers.{m}.{target.state_suffix}": target for m in sorted(k for k in cums if k < n_layers) for target, _tensor, _norm in iter_reads(jl.layers[m])},
     }
     return transforms, info
