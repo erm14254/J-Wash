@@ -817,6 +817,114 @@ def test_gguf_valid_cached_reuse_and_delete(tmp_path, monkeypatch):
     assert response.status_code == 200 and not cached.exists()
 
 
+def _gguf_test_tools(tmp_path, *, converter_fails=False):
+    convert = tmp_path / "convert.py"
+    if converter_fails:
+        convert.write_text("import sys\nsys.stderr.write('converter exploded')\nsys.exit(3)\n")
+    else:
+        convert.write_text(
+            "import pathlib, sys\n"
+            "out = pathlib.Path(sys.argv[sys.argv.index('--outfile') + 1])\n"
+            "out.parent.mkdir(parents=True, exist_ok=True)\n"
+            "out.write_bytes(b'base-gguf')\n"
+        )
+    quantize = tmp_path / "llama-quantize"
+    quantize.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, sys\n"
+        "pathlib.Path(sys.argv[2]).write_bytes(pathlib.Path(sys.argv[1]).read_bytes() + b'-quant')\n"
+    )
+    quantize.chmod(0o755)
+    return convert, quantize
+
+
+def _deferred_threads(monkeypatch, app):
+    pending = []
+    class DeferredThread:
+        def __init__(self, *, target, args, daemon):
+            self.target, self.args, self.daemon = target, args, daemon
+            pending.append(self)
+        def start(self):
+            pass
+        def run(self):
+            self.target(*self.args)
+    monkeypatch.setattr(app, "threading", SimpleNamespace(Thread=DeferredThread))
+    return pending
+
+
+@pytest.mark.parametrize(
+    ("name", "cached", "gguf_type", "expected_checkpoint", "expected_files"),
+    [
+        ("job/hf", True, "bf16", "reused", ["hf-bf16.gguf"]),
+        ("job/hf", False, "bf16", "baked", ["hf-bf16.gguf"]),
+        ("job/hf", True, "q4_k_m", "reused", ["hf-bf16.gguf", "hf-q4_k_m.gguf"]),
+        ("job", True, "bf16", "reused", ["job-bf16.gguf"]),
+    ],
+)
+def test_gguf_nested_worker_outputs_use_leaf_stem(
+        name, cached, gguf_type, expected_checkpoint, expected_files, tmp_path, monkeypatch):
+    import api.app as app
+    from fastapi.testclient import TestClient
+    edits = tmp_path / "edits"; monkeypatch.setattr(app.editing, "EDITS_DIR", edits)
+    name_parts = tuple(name.split("/")); job_dir = edits.joinpath(*name_parts); hf_dir = job_dir / "hf"
+    if cached:
+        hf_dir.mkdir(parents=True); (hf_dir / "config.json").write_text("{}")
+    convert, quantize = _gguf_test_tools(tmp_path)
+    monkeypatch.setattr(app, "_llamacpp_paths", lambda: (convert, quantize, None))
+    if not cached:
+        monkeypatch.setattr(app.manager, "hf_model", object())
+        monkeypatch.setattr(app.manager, "jl", object())
+        monkeypatch.setattr(app.manager, "meta", {"model_id": "local"})
+        monkeypatch.setattr(app.interventions, "active_rules_full", lambda: [{"layers": [0]}])
+        monkeypatch.setattr(app.interventions, "_mode", "readthrough")
+        monkeypatch.setattr(app.interventions, "_scale", 1.0)
+        monkeypatch.setattr(app, "resolve_local_dir", lambda _model: tmp_path / "source")
+        def fake_export(*_args, **kwargs):
+            assert kwargs["name"] == name + "/hf"
+            hf_dir.mkdir(parents=True); (hf_dir / "config.json").write_text("{}")
+        monkeypatch.setattr(app.editing, "export_rebase", fake_export)
+    pending = _deferred_threads(monkeypatch, app)
+    app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
+    response = TestClient(app.app).post(
+        "/api/edit/export-gguf", json={"name": name, "gguf_type": gguf_type})
+    assert response.status_code == 200
+    assert response.json()["checkpoint"] == expected_checkpoint
+    assert response.json()["state"]["state"] == "running"
+    assert response.json()["state"]["name"] == name
+    assert len(pending) == 1
+    pending[0].run()
+    assert app._gguf_state["state"] == "done" and app._gguf_state["name"] == name
+    for filename in expected_files:
+        assert (job_dir / filename).is_file()
+    assert Path(app._gguf_state["result"]["gguf"]) == job_dir / expected_files[-1]
+    assert not (job_dir / "job").exists()
+
+
+def test_gguf_nested_worker_converter_error_preserves_cache_and_allows_retry(tmp_path, monkeypatch):
+    import api.app as app
+    from fastapi.testclient import TestClient
+    edits = tmp_path / "edits"; monkeypatch.setattr(app.editing, "EDITS_DIR", edits)
+    job_dir = edits / "job" / "hf"; hf_dir = job_dir / "hf"
+    hf_dir.mkdir(parents=True); sentinel = hf_dir / "config.json"; sentinel.write_text("{}")
+    convert, quantize = _gguf_test_tools(tmp_path, converter_fails=True)
+    monkeypatch.setattr(app, "_llamacpp_paths", lambda: (convert, quantize, None))
+    pending = _deferred_threads(monkeypatch, app)
+    app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
+    client = TestClient(app.app)
+    response = client.post("/api/edit/export-gguf", json={"name": "job/hf", "gguf_type": "bf16"})
+    assert response.status_code == 200 and response.json()["state"]["state"] == "running"
+    pending.pop(0).run()
+    assert app._gguf_state["state"] == "error"
+    assert "converter exploded" in app._gguf_state["error"]
+    assert sentinel.is_file() and not (job_dir / "job").exists()
+    convert, _ = _gguf_test_tools(tmp_path)
+    response = client.post("/api/edit/export-gguf", json={"name": "job/hf", "gguf_type": "bf16"})
+    assert response.status_code == 200 and response.json()["checkpoint"] == "reused"
+    pending.pop(0).run()
+    assert app._gguf_state["state"] == "done"
+    assert (job_dir / "hf-bf16.gguf").is_file()
+
+
 def test_superscript_reserved_index_shard_is_rejected(tiny, tmp_path, monkeypatch):
     source = tmp_path / "source"; make_source(tiny, source, two_shards=True)
     index_path = source / "model.safetensors.index.json"; index = json.loads(index_path.read_text())

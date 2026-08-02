@@ -39,6 +39,9 @@ Reserved devices include the Unicode Windows aliases `COM¹`–`COM³` and
 GGUF preparation and cache deletion call this same public validator before any
 cache probe, llama.cpp lookup, export, state mutation, worker creation, or delete;
 invalid legacy cache names therefore return HTTP 422 without touching the cache.
+The GGUF worker keeps the normalized job identity separate from its output
+directory and uses only the final validated component as the filename stem, so
+`job/hf` produces `job/hf/hf-bf16.gguf` while state still reports `job/hf`.
 It streams source shards, preserves unmatched tensors and
 raw tensor dtype/rank, and maps the in-memory `model.layers` prefix to the
 official `model.language_model.layers` disk prefix. MTP tensors are copied

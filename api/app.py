@@ -589,13 +589,14 @@ def _llamacpp_paths():
     return convert, quantize, (gguf_py if gguf_py.is_dir() else None)
 
 
-def _gguf_worker(name, gguf_type, hf_dir, convert, quantize, gguf_py):
+def _gguf_worker(job_name, job_dir, filename_stem, gguf_type,
+                 hf_dir, convert, quantize, gguf_py):
     import subprocess
     import sys
     try:
-        out_dir = editing.EDITS_DIR / name
+        job_dir.mkdir(parents=True, exist_ok=True)
         base_type = gguf_type if gguf_type in GGUF_BASE_TYPES else "bf16"
-        base_gguf = out_dir / f"{name}-{base_type}.gguf"
+        base_gguf = job_dir / f"{filename_stem}-{base_type}.gguf"
         env = dict(os.environ)
         if gguf_py is not None:  # vendored gguf package inside the llama.cpp repo
             env["PYTHONPATH"] = str(gguf_py) + os.pathsep + env.get("PYTHONPATH", "")
@@ -616,7 +617,7 @@ def _gguf_worker(name, gguf_type, hf_dir, convert, quantize, gguf_py):
                     "bf16/f16 exports are possible"
                 )
             _gguf_state.update(step=f"quantizing to {gguf_type}")
-            result_path = out_dir / f"{name}-{gguf_type}.gguf"
+            result_path = job_dir / f"{filename_stem}-{gguf_type}.gguf"
             proc = subprocess.run(
                 [str(quantize), str(base_gguf), str(result_path), gguf_type],
                 capture_output=True, text=True,
@@ -644,6 +645,7 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
         raise HTTPException(422, str(exc)) from exc
     validated_name = "/".join(name_parts)
     job_dir = editing.EDITS_DIR.joinpath(*name_parts)
+    filename_stem = name_parts[-1]
     if _gguf_state["state"] == "running":
         raise HTTPException(409, "a GGUF export is already in progress")
     if req.gguf_type not in GGUF_BASE_TYPES + GGUF_QUANT_TYPES:
@@ -688,7 +690,8 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
     _gguf_state.update(state="running", name=validated_name, step="starting", error=None, result=None)
     threading.Thread(
         target=_gguf_worker,
-        args=(validated_name, req.gguf_type, hf_dir, convert, quantize, gguf_py),
+        args=(validated_name, job_dir, filename_stem, req.gguf_type,
+              hf_dir, convert, quantize, gguf_py),
         daemon=True,
     ).start()
     return {"started": True, "checkpoint": baked, "state": dict(_gguf_state)}
