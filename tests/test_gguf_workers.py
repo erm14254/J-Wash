@@ -190,15 +190,14 @@ def test_gguf_atomic_partial_failure_then_retry(name, cached, gguf_type, tmp_pat
         "sys.stderr.write('deliberate partial conversion failure')\n"
         "sys.exit(3)\n"
     )
-    quant_marker = tmp_path / "quantizer-invoked"
-    quantize = tmp_path / "llama-quantize"
-    quantize.write_text(
-        "#!/usr/bin/env python3\n"
-        "import pathlib, sys\n"
-        f"pathlib.Path({str(quant_marker)!r}).write_text('yes')\n"
+    quant_marker = tmp_path / "quantizer-invoked.json"
+    quantize = make_python_cli_launcher(
+        tmp_path,
+        "llama-quantize",
+        "import json, pathlib, sys\n"
+        f"pathlib.Path({str(quant_marker)!r}).write_text(json.dumps(sys.argv[1:]))\n"
         "pathlib.Path(sys.argv[2]).write_bytes(pathlib.Path(sys.argv[1]).read_bytes() + b'-quant')\n"
     )
-    quantize.chmod(0o755)
     monkeypatch.setattr(app, "_llamacpp_paths", lambda: (convert, quantize, None))
     baked = []
     if not cached:
@@ -247,6 +246,9 @@ def test_gguf_atomic_partial_failure_then_retry(name, cached, gguf_type, tmp_pat
     assert Path(app._gguf_state["result"]["gguf"]) == expected_result
     assert expected_result.is_file() and sentinel.is_file()
     assert quant_marker.exists() == (gguf_type not in app.GGUF_BASE_TYPES)
+    if gguf_type not in app.GGUF_BASE_TYPES:
+        assert json.loads(quant_marker.read_text()) == [str(base), str(quantized), gguf_type]
+        assert quantized.read_bytes() == b"VALID-GGUF-quant"
     assert len(baked) == (0 if cached else 1)
 
 
