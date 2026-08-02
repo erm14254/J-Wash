@@ -635,13 +635,26 @@ def _gguf_worker(job_name, job_dir, filename_stem, gguf_type,
                 )
             _gguf_state.update(step=f"quantizing to {gguf_type}")
             result_path = job_dir / f"{filename_stem}-{gguf_type}.gguf"
-            proc = subprocess.run(
-                [str(quantize), str(base_gguf), str(result_path), gguf_type],
-                capture_output=True, text=True,
+            temp_quantized = result_path.with_name(
+                f".{result_path.stem}.tmp-{uuid.uuid4().hex}.gguf"
             )
-            if proc.returncode != 0:
-                result_path.unlink(missing_ok=True)
-                raise RuntimeError(f"llama-quantize failed: {proc.stderr[-2000:]}")
+            temp_quantized.unlink(missing_ok=True)
+            try:
+                proc = subprocess.run(
+                    [str(quantize), str(base_gguf), str(temp_quantized), gguf_type],
+                    capture_output=True, text=True,
+                )
+                if proc.returncode != 0:
+                    raise RuntimeError(f"llama-quantize failed: {proc.stderr[-2000:]}")
+                if not temp_quantized.is_file():
+                    raise RuntimeError(
+                        "llama-quantize succeeded without producing an output"
+                    )
+                if temp_quantized.stat().st_size <= 0:
+                    raise RuntimeError("llama-quantize produced an empty output")
+                temp_quantized.replace(result_path)
+            finally:
+                temp_quantized.unlink(missing_ok=True)
         _gguf_state.update(
             state="done", step=None, error=None,
             result={
