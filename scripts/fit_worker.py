@@ -84,6 +84,10 @@ def main():
     n_src = len(source_layers) if source_layers else model.n_layers - 1
     ckpt_bytes = n_src * model.d_model**2 * 4
     checkpoint_every = max(1, round(ckpt_bytes / 150e6))
+    print(
+        json.dumps({"event": "fitting", "total": len(prompts)}),
+        flush=True,
+    )
     lens = jlens.fit(
         model,
         prompts,

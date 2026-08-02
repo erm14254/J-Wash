@@ -1277,12 +1277,13 @@ export default function App() {
             return (
               <div>
                 <div className="status-line">
-                  {fit.name} · {fit.phase} · {fit.done}/{fit.total}
+                  {fit.name} · {fit.phase === 'loading' ? 'loading model' : fit.phase === 'fitting' ? `fitting sequence ${Math.min(fit.total, fit.done + 1)} of ${fit.total}` : fit.phase === 'merge' ? 'merging' : fit.phase} · {fit.done}/{fit.total}
+                  {fit.elapsed != null ? ` · elapsed ${Math.max(0, Math.round(fit.elapsed))} sec` : ''}
                   {fit.eta_seconds ? ` · ETA ${Math.max(1, Math.round(fit.eta_seconds / 60))} min` : ''}
                 </div>
                 {(fit.workers || []).map((w, i) => (
                   <div className="gpu" key={i}>
-                    <div className="name"><span>{w.device} · {w.state}</span><span>{w.done}/{w.total}</span></div>
+                    <div className="name"><span>{w.device} · {w.state}{w.state === 'fitting' && w.done < w.total ? ` sequence ${w.done + 1}/${w.total}` : ''} · dim_batch ${w.dim_batch}</span><span>{w.done}/{w.total}</span></div>
                     <div className="bar"><div className="fill" style={{ width: `${(100 * w.done) / Math.max(1, w.total)}%` }} /></div>
                   </div>
                 ))}
@@ -1389,7 +1390,7 @@ export default function App() {
                       })}
                     </span>
                   </div>
-                  <div className="row"><label title="default: 8 on ≥16 GB GPUs, 4 below (bf16 4B). Too high = OOM">dim_batch</label>
+                  <div className="row"><label title="auto is selected conservatively by the backend from available VRAM; the resolved value appears in worker status">dim_batch</label>
                     <input type="number" min="1" step="1" placeholder="auto" value={fitDimBatch}
                       onChange={(e) => setFitDimBatch(e.target.value)} />
                   </div>

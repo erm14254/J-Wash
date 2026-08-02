@@ -349,6 +349,15 @@ or tick several to fit on an equal-parts mix. Per-prompt checkpoints give
 stop/resume without loss, and multi-GPU slices are merged by weighted average.
 Metadata is written to `lenses/<name>/meta.json`.
 
+Hugging Face `datasets` is installed as a normal application dependency for
+corpus loading. Leaving `dim_batch` on **auto** lets the backend select a
+conservative value from the available VRAM; the resolved value is shown in the
+worker status after fitting starts. Progress is deliberately sequence-granular:
+one sequence can take several minutes on a large model, and the elapsed-time
+heartbeat shows that the worker is alive, not that part of a sequence has
+completed. Sequence counts and ETA advance only when Jacobian Lens completes a
+sequence.
+
 ### CLI (no UI)
 
 `scripts/jlab.py` is a headless HTTP client for the running server:

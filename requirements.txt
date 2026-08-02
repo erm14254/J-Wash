@@ -17,6 +17,7 @@ transformers>=5.5,<5.15
 accelerate>=1.14,<1.15
 huggingface-hub>=0.26
 safetensors>=0.4
+datasets>=3.0,<5
 
 fastapi>=0.115
 uvicorn[standard]>=0.30

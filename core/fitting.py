@@ -135,12 +135,16 @@ def _load_corpus(datasets, n, skip=0):
     random.Random(_SAMPLE_SEED).shuffle(prompts)
     return prompts
 
+def dim_batch_for_vram(vram_bytes):
+    """Return the conservative automatic dimension batch for VRAM bytes."""
+    return 4 if vram_bytes >= 15 * 2**30 else 2
+
+
 def _default_dim_batch(device):
-    """Default dim_batch scaled to the device's VRAM.
-    Measured on a 4B bf16 fit: 8 fits in 16 GB, 4 in 12 GB."""
+    """Resolve automatic ``dim_batch`` from the selected device's VRAM."""
     try:
         total = gpu_stats()[int(device.split(":")[1])]["vram_total"]
-        return 4 if total >= 15 * 2**30 else 2
+        return dim_batch_for_vram(total)
     except Exception:
         return 1
 
@@ -150,9 +154,13 @@ def _now():
 
 
 class FitManager:
-    def __init__(self):
+    def __init__(self, *, clock=time.perf_counter, heartbeat_interval=2.0):
         self._lock = threading.Lock()
         self._procs = []
+        self._clock = clock
+        self._heartbeat_interval = heartbeat_interval
+        self._heartbeat_stop = None
+        self._heartbeat_thread = None
         self.state = {"state": "idle"}
         self.on_progress = None
 
@@ -230,6 +238,7 @@ class FitManager:
         return dict(self.state)
 
     def _run(self, name, params):
+        heartbeat_stop = None
         try:
             job_dir = FITS_DIR / name
             job_dir.mkdir(parents=True, exist_ok=True)
@@ -253,9 +262,9 @@ class FitManager:
             else:
                 slices = [prompts]
 
-            self.state.update(phase="fitting", total=n)
+            self.state.update(phase="loading", total=n)
             workers = []
-            started = time.perf_counter()
+            started = self._clock()
             for i, (device, chunk) in enumerate(zip(devices, slices)):
                 slice_path = job_dir / f"slice{i}.json"
                 if not slice_path.exists():
@@ -303,6 +312,16 @@ class FitManager:
                 ).start()
             self.state["workers"] = workers
             self._emit()
+
+            heartbeat_stop = threading.Event()
+            heartbeat = threading.Thread(
+                target=self._heartbeat,
+                args=(heartbeat_stop, started),
+                daemon=True,
+            )
+            self._heartbeat_stop = heartbeat_stop
+            self._heartbeat_thread = heartbeat
+            heartbeat.start()
 
             stderr_tails = [""] * len(self._procs)
 
@@ -372,7 +391,7 @@ class FitManager:
                     json.dumps(params, sort_keys=True).encode()
                 ).hexdigest()[:16],
                 "created_at": _now(),
-                "fit_seconds": round(time.perf_counter() - started, 1),
+                "fit_seconds": round(self._clock() - started, 1),
             }
             (out_dir / "meta.json").write_text(
                 json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8"
@@ -388,6 +407,32 @@ class FitManager:
         except Exception as exc:
             self.state.update(state="error", error=str(exc))
             self._emit()
+        finally:
+            if heartbeat_stop is not None:
+                heartbeat_stop.set()
+            heartbeat = self._heartbeat_thread
+            if heartbeat is not None and heartbeat is not threading.current_thread():
+                heartbeat.join(timeout=max(1.0, self._heartbeat_interval * 2))
+            self._heartbeat_stop = None
+            self._heartbeat_thread = None
+
+    def _heartbeat(self, stop_event, started):
+        """Emit elapsed-time updates while at least one fit worker is alive."""
+        while not stop_event.is_set():
+            if not any(proc.poll() is None for proc in self._procs):
+                return
+            if stop_event.wait(self._heartbeat_interval):
+                return
+            self._heartbeat_once(started)
+
+    def _heartbeat_once(self, started):
+        elapsed = round(self._clock() - started, 1)
+        self.state["elapsed"] = elapsed
+        for worker in self.state.get("workers", []):
+            if worker.get("state") in ("loading", "fitting"):
+                worker["elapsed"] = elapsed
+        self._refresh_totals(started)
+        self._emit()
 
     def _read_worker(self, proc, worker_state, started):
         for line in proc.stdout:
@@ -396,23 +441,36 @@ class FitManager:
                 continue
             try:
                 event = json.loads(line)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, TypeError):
                 continue
-            if event["event"] == "loading":
-                worker_state["state"] = "loading"
-            elif event["event"] in ("progress", "resume"):
-                worker_state["state"] = "fitting"
-                worker_state["done"] = event["done"]
-                worker_state["total"] = event["total"]
-                worker_state["elapsed"] = round(time.perf_counter() - started, 1)
-                hist = worker_state.setdefault("hist", [])
-                hist.append([worker_state["done"], worker_state["elapsed"]])
-                del hist[:-10]
-            elif event["event"] == "done":
-                worker_state["state"] = "done"
-                worker_state["done"] = worker_state["total"]
-            self._refresh_totals(started)
-            self._emit()
+            if not isinstance(event, dict) or not isinstance(event.get("event"), str):
+                continue
+            self._handle_worker_event(event, worker_state, started)
+
+    def _handle_worker_event(self, event, worker_state, started):
+        if event["event"] == "loading":
+            worker_state["state"] = "loading"
+        elif event["event"] == "fitting":
+            worker_state["state"] = "fitting"
+            self.state["phase"] = "fitting"
+        elif event["event"] in ("progress", "resume"):
+            if not isinstance(event.get("done"), int) or not isinstance(event.get("total"), int):
+                return
+            worker_state["state"] = "fitting"
+            self.state["phase"] = "fitting"
+            worker_state["done"] = event["done"]
+            worker_state["total"] = event["total"]
+            worker_state["elapsed"] = round(self._clock() - started, 1)
+            hist = worker_state.setdefault("hist", [])
+            hist.append([worker_state["done"], worker_state["elapsed"]])
+            del hist[:-10]
+        elif event["event"] == "done":
+            worker_state["state"] = "done"
+            worker_state["done"] = worker_state["total"]
+        else:
+            return
+        self._refresh_totals(started)
+        self._emit()
 
     def _refresh_totals(self, started):
         workers = self.state.get("workers", [])
@@ -430,7 +488,12 @@ class FitManager:
             etas.append((w["total"] - w["done"]) / rate)
         # multi-GPU: the fit ETA = the slowest worker
         self.state["eta_seconds"] = round(max(etas), 0) if etas else None
-        self.state["vram"] = [
-            {"index": g["index"], "used_gb": round(g["vram_used"] / 2**30, 1)}
-            for g in gpu_stats()
-        ]
+        try:
+            self.state["vram"] = [
+                {"index": g["index"], "used_gb": round(g["vram_used"] / 2**30, 1)}
+                for g in gpu_stats()
+            ]
+        except Exception:
+            # Progress reporting must survive transient NVML failures. Device
+            # telemetry is informative and does not affect fitting.
+            pass
