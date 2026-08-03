@@ -63,6 +63,22 @@ class _Process:
         return self.returncode
 
 
+class _BlockingStdout:
+    def __init__(self, release, text):
+        self.release = release
+        self.text = text
+
+    def __iter__(self):
+        _wait(self.release, "stdout was not released")
+        yield from io.StringIO(self.text)
+
+
+class _ExplodingStdout:
+    def __iter__(self):
+        raise RuntimeError("reader exploded")
+        yield  # pragma: no cover - makes this an iterator
+
+
 class _Lens:
     d_model = 8
     source_layers = [0, 1]
@@ -231,7 +247,10 @@ def test_heartbeat_cleanup_after_terminal_outcome(
 ):
     monkeypatch.setattr(fitting, "_load_corpus", lambda *a: ["prompt"])
     release = threading.Event()
-    proc = _Process(release=release, stdout='{"event":"fitting","total":1}\n')
+    proc = _Process(
+        release=release,
+        stdout='{"event":"fitting","total":1}\n{"event":"done"}\n',
+    )
     monkeypatch.setattr(fitting.subprocess, "Popen", lambda *a, **k: proc)
     saved = []
     if outcome == "error":
@@ -256,6 +275,193 @@ def test_heartbeat_cleanup_after_terminal_outcome(
     assert not run.heartbeat_thread.is_alive()
     assert all(not thread.is_alive() for thread in run.helper_threads)
     assert manager.state["state"] == {"success": "done", "error": "error", "stop": "stopped"}[outcome]
+
+
+def test_merge_waits_for_stdout_done_event(fit_env, monkeypatch):
+    monkeypatch.setattr(fitting, "_load_corpus", lambda *a: ["prompt"])
+    release_stdout = threading.Event()
+    merge_started = threading.Event()
+    proc = _Process()
+    proc.stdout = _BlockingStdout(
+        release_stdout,
+        '{"event":"fitting"}\n'
+        '{"event":"progress","done":1,"total":1}\n'
+        '{"event":"done"}\n',
+    )
+    monkeypatch.setattr(fitting.subprocess, "Popen", lambda *a, **k: proc)
+
+    def load(*args):
+        merge_started.set()
+        return _Lens()
+
+    monkeypatch.setattr(fitting.JacobianLens, "load", load)
+    manager = fitting.FitManager(heartbeat_interval=0.01)
+    _start(manager)
+    run = manager._active_run
+    assert not merge_started.wait(0.1)
+    assert manager.state["phase"] == "loading"
+
+    release_stdout.set()
+    _wait(run.done)
+    assert merge_started.is_set()
+    assert manager.state["state"] == "done"
+    assert manager.state["done"] == manager.state["total"] == 1
+    assert manager.state["workers"][0]["state"] == "done"
+
+
+def test_worker_states_are_published_before_reader_events(fit_env, monkeypatch):
+    monkeypatch.setattr(fitting, "_load_corpus", lambda *a: ["a", "b"])
+    second_spawn_entered = threading.Event()
+    release_second_spawn = threading.Event()
+    first_done = threading.Event()
+    calls = [0]
+
+    def popen(*args, **kwargs):
+        calls[0] += 1
+        if calls[0] == 1:
+            return _Process(stdout='{"event":"progress","done":1,"total":1}\n{"event":"done"}\n')
+        second_spawn_entered.set()
+        _wait(release_second_spawn)
+        return _Process(stdout='{"event":"progress","done":1,"total":1}\n{"event":"done"}\n')
+
+    monkeypatch.setattr(fitting.subprocess, "Popen", popen)
+    monkeypatch.setattr(fitting.JacobianLens, "load", lambda *a: _Lens())
+    monkeypatch.setattr(fitting.JacobianLens, "merge", lambda parts: _Lens())
+    manager = fitting.FitManager(heartbeat_interval=0.01)
+    manager.on_progress = lambda state: (
+        first_done.set()
+        if state.get("workers") and state["workers"][0].get("state") == "done"
+        else None
+    )
+    manager.start(
+        model_id="local/model", source="local/model", n_prompts=2,
+        devices=("cuda:0", "cuda:1"), name="fit", dim_batch=2,
+        datasets=("local/corpus",),
+    )
+    run = manager._active_run
+    _wait(second_spawn_entered)
+    _wait(first_done)
+    assert len(manager.state["workers"]) == 2
+    assert manager.state["done"] == manager.state["workers"][0]["done"] == 1
+
+    release_second_spawn.set()
+    _wait(run.done)
+    assert manager.state["state"] == "done"
+    assert manager.state["done"] == manager.state["total"] == 2
+    assert all(worker["state"] == "done" for worker in manager.state["workers"])
+    assert manager.state["eta_seconds"] == 0
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_stdout_reader_exception_blocks_merge(fit_env, monkeypatch, cancel):
+    monkeypatch.setattr(fitting, "_load_corpus", lambda *a: ["prompt"])
+    proc = _Process()
+    proc.stdout = _ExplodingStdout()
+    monkeypatch.setattr(fitting.subprocess, "Popen", lambda *a, **k: proc)
+    merge_started = threading.Event()
+    monkeypatch.setattr(
+        fitting.JacobianLens,
+        "load",
+        lambda *a: (merge_started.set(), _Lens())[1],
+    )
+    manager = fitting.FitManager(heartbeat_interval=0.01)
+    _start(manager)
+    run = manager._active_run
+    if cancel:
+        manager.stop()
+    _wait(run.done)
+    assert manager.state["state"] == ("stopped" if cancel else "error")
+    assert not merge_started.is_set()
+    assert all(not thread.is_alive() for thread in run.reader_threads)
+
+
+def test_successful_process_without_terminal_event_fails_closed(fit_env, monkeypatch):
+    monkeypatch.setattr(fitting, "_load_corpus", lambda *a: ["prompt"])
+    proc = _Process(stdout='{"event":"fitting"}\n')
+    monkeypatch.setattr(fitting.subprocess, "Popen", lambda *a, **k: proc)
+    merge_started = threading.Event()
+    monkeypatch.setattr(
+        fitting.JacobianLens,
+        "load",
+        lambda *a: (merge_started.set(), _Lens())[1],
+    )
+    manager = fitting.FitManager(heartbeat_interval=0.01)
+    _start(manager)
+    run = manager._active_run
+    _wait(run.done)
+    assert manager.state["state"] == "error"
+    assert "terminal done event" in manager.state["error"]
+    assert not merge_started.is_set()
+
+
+@pytest.mark.parametrize("terminal", ["done", "error", "stopped"])
+def test_terminal_worker_events_are_ignored(terminal):
+    manager, run = _eta_manager(lambda: 10.0)
+    worker = manager.state["workers"][0]
+    manager.state.update(
+        state=terminal,
+        phase=terminal,
+        done=0,
+        total=3,
+        eta_seconds=17,
+    )
+    before = dict(manager.state)
+    worker_before = dict(worker)
+    manager._handle_worker_event(
+        run, {"event": "progress", "done": 2, "total": 3}, worker, 0
+    )
+    assert manager.state == before
+    assert worker == worker_before
+
+
+def test_error_wins_then_stop():
+    manager = fitting.FitManager()
+    manager._emit = lambda: None
+    run = fitting._FitRun()
+    manager._active_run = run
+    manager.state = {"state": "running"}
+    manager._publish_terminal(run, error=RuntimeError("failed"))
+    assert manager.stop()["state"] == "error"
+    assert not run.cancel.is_set()
+
+
+@pytest.mark.parametrize("winner", ["stop", "success"])
+def test_stop_success_true_concurrent_lock_order(winner):
+    manager = fitting.FitManager()
+    manager._emit = lambda: None
+    run = fitting._FitRun()
+    manager._active_run = run
+    manager.state = {"state": "running", "phase": "fitting"}
+    ready = threading.Barrier(3)
+    first_published = threading.Event()
+
+    def publish_success():
+        ready.wait()
+        if winner == "stop":
+            _wait(first_published)
+        manager._publish_terminal(
+            run, success={"state": "done", "phase": "done", "eta_seconds": 0}
+        )
+        if winner == "success":
+            first_published.set()
+
+    def publish_stop():
+        ready.wait()
+        if winner == "success":
+            _wait(first_published)
+        manager.stop()
+        if winner == "stop":
+            first_published.set()
+
+    success_thread = threading.Thread(target=publish_success)
+    stop_thread = threading.Thread(target=publish_stop)
+    success_thread.start()
+    stop_thread.start()
+    ready.wait()
+    success_thread.join()
+    stop_thread.join()
+
+    assert manager.state["state"] == ("stopped" if winner == "stop" else "done")
 
 
 def _worker(done=0, total=3):
@@ -467,6 +673,8 @@ def test_popen_failure_respects_concurrent_cancellation(fit_env, monkeypatch, ca
     assert manager.state["state"] == ("stopped" if cancel else "error")
     assert run.processes == []
     assert run.heartbeat_thread is None
+    assert len(manager.state["workers"]) == 1
+    assert manager.state["workers"][0]["state"] == "loading"
 
 
 def test_eta_first_sample_uses_completion_timestamp_not_heartbeat_elapsed():

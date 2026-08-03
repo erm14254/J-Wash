@@ -176,6 +176,9 @@ class _FitRun:
     process_lock: threading.Lock = field(default_factory=threading.Lock)
     processes: list = field(default_factory=list)
     helper_threads: list = field(default_factory=list)
+    reader_threads: list = field(default_factory=list)
+    reader_errors: list = field(default_factory=list)
+    reader_error_lock: threading.Lock = field(default_factory=threading.Lock)
     heartbeat_thread: threading.Thread | None = None
 
 
@@ -327,9 +330,8 @@ class FitManager:
             else:
                 slices = [prompts]
 
-            self._update(run, phase="loading", total=n)
-            workers = []
             started = self._clock()
+            launch_plans = []
             for i, (device, chunk) in enumerate(zip(devices, slices)):
                 self._check_cancelled(run)
                 slice_path = job_dir / f"slice{i}.json"
@@ -351,20 +353,6 @@ class FitManager:
                     cmd += ["--quant", params["quant"]]
                 if params["source_layers"]:
                     cmd += ["--source-layers", json.dumps(params["source_layers"])]
-                with run.process_lock:
-                    self._check_cancelled(run)
-                    proc = subprocess.Popen(
-                        cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        encoding="utf-8",
-                        cwd=str(config.ROOT),
-                    )
-                    run.processes.append(proc)
-                    if run.cancel.is_set():
-                        proc.terminate()
-                        raise _FitCancelled()
                 worker_state = {
                     "device": device,
                     "done": 0,
@@ -379,16 +367,44 @@ class FitManager:
                     "baseline_done": 0,
                     "baseline_elapsed": 0.0,
                 }
-                workers.append(worker_state)
+                launch_plans.append((cmd, worker_state))
+
+            workers = [worker for _, worker in launch_plans]
+            if not self._update(
+                run,
+                phase="loading",
+                workers=workers,
+                total=sum(worker["total"] for worker in workers),
+                done=0,
+                eta_seconds=None,
+            ):
+                raise _FitCancelled()
+
+            for cmd, worker_state in launch_plans:
+                self._check_cancelled(run)
+                with run.process_lock:
+                    self._check_cancelled(run)
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        encoding="utf-8",
+                        cwd=str(config.ROOT),
+                    )
+                    run.processes.append(proc)
+                    if run.cancel.is_set():
+                        proc.terminate()
+                        raise _FitCancelled()
                 reader = threading.Thread(
                     target=self._read_worker,
                     args=(run, proc, worker_state, started),
                     daemon=True,
                 )
                 run.helper_threads.append(reader)
+                run.reader_threads.append(reader)
                 reader.start()
             self._check_cancelled(run)
-            self._update(run, workers=workers)
 
             self._check_cancelled(run)
             heartbeat = threading.Thread(
@@ -415,16 +431,25 @@ class FitManager:
                 t.start()
             for proc in run.processes:
                 proc.wait()
+            # Popen.wait() does not guarantee that Python reader threads have
+            # consumed all bytes buffered in stdout.  Drain stdout to EOF before
+            # evaluating failures or allowing merge/publication to begin.
+            for reader in run.reader_threads:
+                reader.join()
             for t in drainers:
                 t.join()
             self._check_cancelled(run)
+            with run.reader_error_lock:
+                reader_errors = list(run.reader_errors)
+            if reader_errors:
+                index, exc = reader_errors[0]
+                raise RuntimeError(f"worker {index} stdout reader failed: {exc}") from exc
             failed = [i for i, p in enumerate(run.processes) if p.returncode != 0]
             if failed:
                 detail = " | ".join(stderr_tails[i].strip().splitlines()[-1] if stderr_tails[i].strip() else "?" for i in failed)
                 raise RuntimeError(f"worker(s) {failed} failed: {detail}")
 
-            self._update(run, phase="merge")
-            self._check_cancelled(run)
+            self._validate_workers_after_drain(run)
             partials = []
             for i in range(len(slices)):
                 self._check_cancelled(run)
@@ -531,21 +556,33 @@ class FitManager:
         self._emit()
 
     def _read_worker(self, run, proc, worker_state, started):
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(event, dict) or not isinstance(event.get("event"), str):
+                    continue
+                self._handle_worker_event(run, event, worker_state, started)
+        except Exception as exc:
             try:
-                event = json.loads(line)
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if not isinstance(event, dict) or not isinstance(event.get("event"), str):
-                continue
-            self._handle_worker_event(run, event, worker_state, started)
+                index = run.processes.index(proc)
+            except ValueError:
+                index = -1
+            with run.reader_error_lock:
+                run.reader_errors.append((index, exc))
 
     def _handle_worker_event(self, run, event, worker_state, started):
         with self._lock:
-            if self._active_run is not run or run.cancel.is_set():
+            if (
+                self._active_run is not run
+                or run.cancel.is_set()
+                or self.state.get("state") in ("done", "error", "stopped")
+            ):
                 return
             if event["event"] == "loading":
                 worker_state["state"] = "loading"
@@ -586,6 +623,28 @@ class FitManager:
             self._refresh_totals(
                 recalculate_eta=event["event"] in ("progress", "done")
             )
+        self._emit()
+
+    def _validate_workers_after_drain(self, run):
+        """Validate authoritative worker state before entering merge."""
+        with self._lock:
+            if self._active_run is not run or run.cancel.is_set():
+                raise _FitCancelled()
+            workers = self.state.get("workers", [])
+            if len(workers) != len(run.processes):
+                raise RuntimeError("worker process/state inventory is incomplete")
+            self._refresh_totals(recalculate_eta=True)
+            incomplete = [
+                index for index, worker in enumerate(workers)
+                if worker.get("state") != "done"
+            ]
+            if incomplete:
+                raise RuntimeError(
+                    "worker(s) did not emit a terminal done event: "
+                    + ", ".join(map(str, incomplete))
+                )
+            self.state["eta_seconds"] = None
+            self.state["phase"] = "merge"
         self._emit()
 
     def _refresh_totals(self, *, recalculate_eta=True):
