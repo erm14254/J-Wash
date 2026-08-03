@@ -116,20 +116,16 @@ def test_matching_symlinks_are_never_followed_or_deleted(tmp_path):
     assert link.is_symlink() and sentinel.read_text() == "keep"
 
 
-def test_candidate_resolving_outside_root_is_refused(tmp_path, monkeypatch):
+def test_candidate_cleanup_never_resolves_leaf(tmp_path, monkeypatch):
     path = _stage(tmp_path)
     original = Path.resolve
-    outside = tmp_path.parent / "outside"
-
     def resolve(candidate, *args, **kwargs):
-        if candidate == path:
-            return outside
-        return original(candidate, *args, **kwargs)
+        raise AssertionError(f"unexpected resolve of {candidate}")
 
     monkeypatch.setattr(Path, "resolve", resolve)
     result = _cleanup(tmp_path)
-    assert path.exists()
-    assert "escapes" in result["errors"][0]["error"]
+    assert not path.exists()
+    assert result["removed"] == [str(path)]
 
 
 def test_one_deletion_error_does_not_stop_other_cleanup(tmp_path, monkeypatch):
@@ -138,7 +134,7 @@ def test_one_deletion_error_does_not_stop_other_cleanup(tmp_path, monkeypatch):
     original = editing.shutil.rmtree
 
     def rmtree(path, *args, **kwargs):
-        if Path(path) == bad:
+        if Path(path).name.startswith(".bad.tmp-"):
             raise PermissionError("denied")
         return original(path, *args, **kwargs)
 
@@ -251,6 +247,134 @@ def test_self_referential_cleanup_root_returns_safely(tmp_path):
     assert "symlink or junction" in result["errors"][0]["error"]
 
 
+def test_symlinked_cleanup_root_ancestor_is_refused(tmp_path):
+    outside = tmp_path / "outside"
+    edits = outside / "edits"
+    edits.mkdir(parents=True)
+    artifact = _stage(edits)
+    link = tmp_path / "linked"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("directory symlinks are unavailable")
+    result = _cleanup(link / "edits")
+    assert artifact.exists()
+    assert result["removed_count"] == 0
+    assert "symlink or junction/reparse" in result["errors"][0]["error"]
+
+
+def test_real_cleanup_root_ancestor_chain_is_accepted(tmp_path):
+    root = tmp_path / "one" / "two" / "edits"
+    root.mkdir(parents=True)
+    artifact = _stage(root)
+    assert _cleanup(root)["removed"] == [str(artifact)]
+
+
+def test_validated_root_ancestor_change_aborts_cleanup(tmp_path):
+    parent = tmp_path / "parent"
+    root = parent / "edits"
+    root.mkdir(parents=True)
+    artifact = _stage(root)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_artifact = _stage(outside, f".outside.tmp-{'b' * 32}")
+    moved = tmp_path / "original-parent"
+
+    def observer(phase, _value):
+        if phase != "discovered":
+            return
+        parent.rename(moved)
+        parent.symlink_to(outside, target_is_directory=True)
+
+    try:
+        result = editing.cleanup_abandoned_export_temps(
+            root=root, now=NOW, observer=observer,
+        )
+    except (OSError, NotImplementedError):
+        pytest.skip("directory symlinks are unavailable")
+    assert (moved / "edits" / artifact.name).exists()
+    assert outside_artifact.exists()
+    assert result["removed_count"] == 0
+    assert result["skipped_changed"] == [str(root / artifact.name)]
+
+
+@pytest.mark.parametrize("kind", ["file", "directory"])
+def test_candidate_replaced_by_symlink_after_discovery_is_preserved(tmp_path, kind):
+    candidate = _gguf(tmp_path) if kind == "file" else _stage(tmp_path)
+    target = tmp_path / ("target-file" if kind == "file" else "target-dir")
+    if kind == "file":
+        target.write_bytes(b"safe")
+    else:
+        target.mkdir()
+        (target / "sentinel").write_text("safe")
+
+    def observer(phase, _value):
+        if phase != "discovered":
+            return
+        if kind == "file":
+            candidate.unlink()
+        else:
+            candidate.rmdir()
+        candidate.symlink_to(target, target_is_directory=kind == "directory")
+
+    try:
+        result = editing.cleanup_abandoned_export_temps(
+            root=tmp_path, now=NOW, observer=observer,
+        )
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are unavailable")
+    assert candidate.is_symlink()
+    assert target.exists()
+    assert str(candidate) not in result["removed"]
+    assert result["skipped_changed"] == [str(candidate)]
+
+
+def test_candidate_replaced_by_ordinary_inode_after_discovery_is_preserved(tmp_path):
+    candidate = _gguf(tmp_path)
+
+    def observer(phase, _value):
+        if phase == "discovered":
+            candidate.unlink()
+            candidate.write_bytes(b"replacement")
+
+    result = editing.cleanup_abandoned_export_temps(
+        root=tmp_path, now=NOW, observer=observer,
+    )
+    assert candidate.read_bytes() == b"replacement"
+    assert str(candidate) not in result["removed"]
+    assert result["skipped_changed"] == [str(candidate)]
+
+
+def test_candidate_swap_immediately_before_claim_is_preserved(tmp_path):
+    candidate = _gguf(tmp_path)
+
+    def observer(phase, _value):
+        if phase == "before_claim":
+            candidate.unlink()
+            candidate.write_bytes(b"last-moment replacement")
+
+    result = editing.cleanup_abandoned_export_temps(
+        root=tmp_path, now=NOW, observer=observer,
+    )
+    assert candidate.read_bytes() == b"last-moment replacement"
+    assert str(candidate) not in result["removed"]
+
+
+def test_completion_marker_replaced_by_symlink_is_fail_closed(tmp_path):
+    candidate = _stage(tmp_path)
+    marker = candidate / "edit_meta.json"
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps({"name": "other"}))
+    try:
+        marker.symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("file symlinks are unavailable")
+    result = _cleanup(tmp_path)
+    assert candidate.exists() and marker.is_symlink()
+    assert result["removed_count"] == 0
+    assert "safe regular file" in result["errors"][0]["error"]
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
 def test_windows_junction_cleanup_root_is_refused(tmp_path):
     outside = tmp_path / "outside"
@@ -283,6 +407,27 @@ def test_export_rebase_rejects_reserved_final_name(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="reserved for internal temporary export"):
         editing.export_rebase([], object(), {}, fmt="full", name=f".done.tmp-{HEX}")
     assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("name", [
+    f".done.tmp-{HEX}", f"nested/.done.tmp-{HEX}",
+    f".done.tmp-{HEX}.gguf", f".done.tmp-{HEX}.lease",
+])
+def test_export_abliteration_rejects_reserved_name_before_compute(
+    tmp_path, monkeypatch, name,
+):
+    monkeypatch.setattr(editing, "EDITS_DIR", tmp_path)
+    called = []
+    monkeypatch.setattr(
+        editing, "compute_abliteration",
+        lambda *args, **kwargs: called.append(True),
+    )
+    with pytest.raises(ValueError, match="reserved for internal temporary export"):
+        editing.export_abliteration(
+            [{"layers": [0]}], object(), {}, fmt="layers", name=name,
+        )
+    assert called == []
+    assert not tmp_path.exists() or not list(tmp_path.iterdir())
 
 
 def test_legacy_completed_colliding_export_is_preserved(tmp_path):

@@ -6,6 +6,7 @@ import shutil
 import stat
 import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
@@ -157,6 +158,101 @@ def _recognized_temp(path):
     return None
 
 
+def _stat_identity(value):
+    return (
+        value.st_dev, value.st_ino, stat.S_IFMT(value.st_mode),
+        getattr(value, "st_file_attributes", 0),
+        getattr(value, "st_reparse_tag", 0),
+    )
+
+
+def _candidate_identity(value):
+    return _stat_identity(value) + (
+        getattr(value, "st_ctime_ns", None), getattr(value, "st_mtime_ns", None),
+        value.st_size,
+    )
+
+
+def _absolute_no_follow(path):
+    """Return an absolute normalized spelling without resolving any links."""
+    return Path(os.path.abspath(os.path.normpath(os.fspath(path))))
+
+
+def _path_chain(path):
+    anchor = Path(path.anchor)
+    current = anchor
+    chain = [anchor]
+    for part in path.parts[1:]:
+        current = current / part
+        chain.append(current)
+    return chain
+
+
+def _snapshot_directory_chain(path, *, missing_ok=False):
+    snapshots = []
+    for component in _path_chain(path):
+        try:
+            component_stat = component.lstat()
+        except FileNotFoundError:
+            if missing_ok:
+                return None
+            raise
+        if _is_link_or_reparse(component, component_stat):
+            raise ValueError(
+                f"cleanup root chain contains a symlink or junction/reparse point: {component}"
+            )
+        if not stat.S_ISDIR(component_stat.st_mode):
+            raise ValueError(f"cleanup path component is not a directory: {component}")
+        snapshots.append((component, _stat_identity(component_stat)))
+    return tuple(snapshots)
+
+
+def _revalidate_directory_chain(snapshots):
+    for component, expected in snapshots:
+        current = component.lstat()
+        if _is_link_or_reparse(component, current) or _stat_identity(current) != expected:
+            raise ValueError(f"cleanup path component changed: {component}")
+
+
+@dataclass(frozen=True)
+class _TempCandidate:
+    path: Path
+    kind: str
+    identity: tuple
+    parent_chain: tuple
+
+
+def _revalidate_candidate(candidate):
+    _revalidate_directory_chain(candidate.parent_chain)
+    current = candidate.path.lstat()
+    if _is_link_or_reparse(candidate.path, current):
+        raise ValueError("temporary artifact changed or became a link/reparse point")
+    if _candidate_identity(current) != candidate.identity:
+        raise ValueError("temporary artifact changed after discovery")
+    expected = stat.S_ISDIR if candidate.kind == "directory" else stat.S_ISREG
+    if not expected(current.st_mode):
+        raise ValueError("temporary artifact type changed after discovery")
+    return current
+
+
+def _read_completion_marker(marker):
+    marker_stat = marker.lstat()
+    if _is_link_or_reparse(marker, marker_stat) or not stat.S_ISREG(marker_stat.st_mode):
+        raise ValueError("possible completion marker is not a safe regular file")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(marker, flags)
+    try:
+        opened = os.fstat(fd)
+        if _stat_identity(opened) != _stat_identity(marker_stat):
+            raise ValueError("possible completion marker changed during inspection")
+        with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            fd = None
+            return json.load(stream)
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
 def _raise_walk_error(exc):
     raise exc
 
@@ -183,7 +279,7 @@ def _newest_lstat_mtime(path, kind):
 
 
 def cleanup_abandoned_export_temps(
-    *, root=None, now=None, stale_age=DEFAULT_TEMP_STALE_AGE
+    *, root=None, now=None, stale_age=DEFAULT_TEMP_STALE_AGE, observer=None
 ):
     """Remove only abandoned J-Wash transaction artifacts beneath ``root``.
 
@@ -191,28 +287,20 @@ def cleanup_abandoned_export_temps(
     immediate removal.  Legacy artifacts without a lease must be older than the
     configured threshold (24 hours by default).
     """
-    root = Path(root if root is not None else EDITS_DIR)
+    root = _absolute_no_follow(root if root is not None else EDITS_DIR)
     current_time = time.time() if now is None else float(now)
     result = {
         "removed": [], "removed_count": 0, "skipped_active": [],
-        "skipped_recent": [], "skipped_completed": [], "errors": [],
+        "skipped_recent": [], "skipped_completed": [], "skipped_changed": [],
+        "errors": [],
     }
     try:
-        root_stat = root.lstat()
-        if _is_link_or_reparse(root, root_stat):
-            result["errors"].append({
-                "path": str(root), "error": "cleanup root is a symlink or junction",
-            })
+        root_chain = _snapshot_directory_chain(root, missing_ok=True)
+        if root_chain is None:
             return result
-        if not stat.S_ISDIR(root_stat.st_mode):
-            result["errors"].append({
-                "path": str(root), "error": "cleanup root is not a directory",
-            })
-            return result
-        root_resolved = root.resolve(strict=True)
     except FileNotFoundError:
         return result
-    except (OSError, RuntimeError) as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         result["errors"].append({"path": str(root), "error": str(exc)})
         return result
 
@@ -242,37 +330,41 @@ def cleanup_abandoned_export_temps(
             try:
                 kind = _recognized_temp(path)
                 if kind:
-                    candidates.append((path, kind))
+                    path_stat = path.lstat()
+                    parent_chain = _snapshot_directory_chain(path.parent)
+                    candidates.append(_TempCandidate(
+                        path, kind, _candidate_identity(path_stat), parent_chain,
+                    ))
                     if kind == "directory" and name in dirs:
                         dirs.remove(name)
             except OSError as exc:
                 result["errors"].append({"path": str(path), "error": str(exc)})
 
-    for path, kind in candidates:
+    if observer:
+        observer("discovered", tuple(candidate.path for candidate in candidates))
+
+    for candidate in candidates:
+        path, kind = candidate.path, candidate.kind
         lease = ArtifactLease(path, create=False)
         acquired = False
+        claimed = None
         try:
-            lease_stat = lease.path.lstat()
-        except FileNotFoundError:
-            lease_stat = None
-        except OSError as exc:
-            result["errors"].append({"path": str(lease.path), "error": str(exc)})
-            continue
-        if lease_stat is not None and (
-            _is_link_or_reparse(lease.path, lease_stat)
-            or not stat.S_ISREG(lease_stat.st_mode)
-        ):
-            result["errors"].append({
-                "path": str(lease.path),
-                "error": "temporary artifact lease is not a safe regular file",
-            })
-            continue
-        has_lease = lease_stat is not None
-        try:
+            _revalidate_directory_chain(root_chain)
+            path.relative_to(root)
+            _revalidate_candidate(candidate)
+            if observer:
+                observer("before_inspect", path)
+            _revalidate_candidate(candidate)
             try:
-                path.resolve().relative_to(root_resolved)
-            except ValueError:
-                raise ValueError("temporary artifact escapes the edits directory")
+                lease_stat = lease.path.lstat()
+            except FileNotFoundError:
+                lease_stat = None
+            if lease_stat is not None and (
+                _is_link_or_reparse(lease.path, lease_stat)
+                or not stat.S_ISREG(lease_stat.st_mode)
+            ):
+                raise ValueError("temporary artifact lease is not a safe regular file")
+            has_lease = lease_stat is not None
             if has_lease:
                 acquired = lease.acquire(blocking=False)
                 if not acquired:
@@ -282,19 +374,18 @@ def cleanup_abandoned_export_temps(
                 if kind == "directory":
                     marker = path / "edit_meta.json"
                     try:
-                        marker_stat = marker.lstat()
+                        marker.lstat()
                     except FileNotFoundError:
-                        marker_stat = None
+                        marker_present = False
                     except OSError as exc:
-                        raise OSError(f"cannot inspect possible completion marker: {exc}") from exc
-                    if marker_stat is not None:
-                        if (
-                            stat.S_ISLNK(marker_stat.st_mode)
-                            or not stat.S_ISREG(marker_stat.st_mode)
-                        ):
-                            raise ValueError("possible completion marker is not a safe regular file")
+                        raise OSError(
+                            f"cannot inspect possible completion marker: {exc}"
+                        ) from exc
+                    else:
+                        marker_present = True
+                    if marker_present:
                         try:
-                            metadata = json.loads(marker.read_text(encoding="utf-8"))
+                            metadata = _read_completion_marker(marker)
                         except Exception as exc:
                             raise ValueError(f"cannot inspect possible completion marker: {exc}") from exc
                         relative_name = path.relative_to(root).as_posix()
@@ -310,13 +401,48 @@ def cleanup_abandoned_export_temps(
                 if current_time - newest < stale_age:
                     result["skipped_recent"].append(str(path))
                     continue
+            _revalidate_candidate(candidate)
+            if observer:
+                observer("before_claim", path)
+            _revalidate_candidate(candidate)
+            claim_uuid = uuid.uuid4().hex
             if kind == "directory":
-                shutil.rmtree(path)
+                claimed = path.with_name(f".{path.name.lstrip('.')}.tmp-{claim_uuid}")
             else:
-                path.unlink()
+                stem = path.name.split(".tmp-", 1)[0].lstrip(".")
+                claimed = path.with_name(f".{stem}.tmp-{claim_uuid}.gguf")
+            path.replace(claimed)
+            claimed_stat = claimed.lstat()
+            if (
+                _is_link_or_reparse(claimed, claimed_stat)
+                or _stat_identity(claimed_stat) != candidate.identity[:5]
+            ):
+                try:
+                    if not path.exists() and not path.is_symlink():
+                        claimed.replace(path)
+                finally:
+                    claimed = None
+                raise ValueError("claimed temporary artifact identity changed")
+            if kind == "directory":
+                shutil.rmtree(claimed)
+            else:
+                claimed.unlink()
+            claimed = None
             result["removed"].append(str(path))
             result["removed_count"] += 1
         except Exception as exc:
+            if claimed is not None:
+                try:
+                    if not path.exists() and not path.is_symlink():
+                        claimed.replace(path)
+                        claimed = None
+                except OSError as restore_exc:
+                    result["errors"].append({
+                        "path": str(claimed),
+                        "error": f"cannot restore cleanup claim: {restore_exc}",
+                    })
+            if "changed" in str(exc) or "cleanup root chain" in str(exc):
+                result["skipped_changed"].append(str(path))
             result["errors"].append({"path": str(path), "error": str(exc)})
         finally:
             if acquired:
@@ -478,6 +604,9 @@ def export_abliteration(rules, jl, model_meta, *, fmt, name, source_dir=None, sc
     ``lora`` (exact PEFT adapter, rank = n_rules; embed omitted if embeddings
     are tied). Unties ``lm_head`` (full/layers) if the model has tied embeddings,
     to preserve the original un-embedding."""
+    parts = validate_export_name(name)
+    name = "/".join(parts)
+    out_dir = EDITS_DIR.joinpath(*parts)
     rules = [r for r in rules if r["layers"]]  # layers=[] = disabled rule
     if not rules:
         raise ValueError("no active intervention to export")
@@ -490,7 +619,6 @@ def export_abliteration(rules, jl, model_meta, *, fmt, name, source_dir=None, sc
             "the bake changes no weight (neutral factors, scale=0 or null "
             "directions) — the export would be identical to the original model"
         )
-    out_dir = EDITS_DIR / name
     out_dir.mkdir(parents=True, exist_ok=True)
     dtype = torch.bfloat16 if model_meta.get("dtype") == "bf16" else torch.float16
     lm_head_key = info["lm_head_key"]
