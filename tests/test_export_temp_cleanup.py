@@ -335,6 +335,27 @@ def test_preexisting_lease_survives_failed_flock(tmp_path, monkeypatch):
     assert lease.path.read_bytes() == b"0"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX flock regression")
+@pytest.mark.parametrize("preexisting", [False, True])
+def test_nonblocking_flock_contention_removes_only_new_lease(
+    tmp_path, monkeypatch, preexisting,
+):
+    import fcntl
+    artifact = tmp_path / f".model.tmp-{HEX}"
+    lease = editing.ArtifactLease(artifact)
+    if preexisting:
+        lease.path.write_bytes(b"existing")
+    monkeypatch.setattr(
+        fcntl, "flock",
+        lambda *args: (_ for _ in ()).throw(BlockingIOError("busy")),
+    )
+    assert lease.acquire(blocking=False) is False
+    if preexisting:
+        assert lease.path.read_bytes() == b"existing"
+    else:
+        assert not lease.path.exists()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows locking regression")
 def test_new_lease_is_removed_when_windows_locking_fails(tmp_path, monkeypatch):
     import msvcrt

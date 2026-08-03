@@ -55,6 +55,15 @@ class ArtifactLease:
         else:
             fd = os.open(self.path, os.O_RDWR)
         file = os.fdopen(fd, "r+b")
+
+        def close_unacquired():
+            file.close()
+            if created:
+                try:
+                    self.path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
         try:
             file.seek(0, os.SEEK_END)
             if file.tell() == 0:
@@ -70,7 +79,7 @@ class ArtifactLease:
                     if not blocking and exc.errno in (
                         errno.EACCES, errno.EAGAIN, errno.EDEADLK,
                     ):
-                        file.close()
+                        close_unacquired()
                         return False
                     raise
             else:
@@ -79,18 +88,13 @@ class ArtifactLease:
                 try:
                     fcntl.flock(file.fileno(), flag)
                 except BlockingIOError:
-                    file.close()
+                    close_unacquired()
                     return False
             self._file = file
             return True
         except Exception:
             if not file.closed:
-                file.close()
-            if created:
-                try:
-                    self.path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                close_unacquired()
             raise
 
     def release(self, *, remove=True):
