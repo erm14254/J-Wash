@@ -409,7 +409,7 @@ def _revalidate_directory_chain(snapshots):
 def _open_verified_directory_chain(snapshots):
     """Open a POSIX directory chain without following links."""
     if os.name == "nt":
-        raise _UnsafeAnchoredCleanup(
+        raise _UnsafeAnchoredInspection(
             "safe handle-relative temporary inspection is unavailable on Windows"
         )
     flags = (
@@ -426,7 +426,7 @@ def _open_verified_directory_chain(snapshots):
                 opened.append(fd)
             current = os.fstat(fd)
             if _stat_identity(current) != expected or not stat.S_ISDIR(current.st_mode):
-                raise _UnsafeAnchoredCleanup(f"inspection parent changed: {component}")
+                raise _UnsafeAnchoredInspection(f"inspection parent changed: {component}")
         keep = opened.pop()
         return keep
     finally:
@@ -442,11 +442,11 @@ class _TempCandidate:
     parent_chain: tuple
 
 
-class _UnsafeAnchoredCleanup(RuntimeError):
-    """Raised when the platform cannot safely anchor a destructive cleanup."""
+class _UnsafeAnchoredInspection(RuntimeError):
+    """Raised when a no-follow inspection cannot establish the required safety."""
 
 
-class _AnchoredCleanupParent:
+class _AnchoredInspectionParent:
     """Descriptor-relative, no-follow inspector for a temporary candidate."""
 
     def __init__(self, candidate):
@@ -456,8 +456,8 @@ class _AnchoredCleanupParent:
 
     def __enter__(self):
         if os.name == "nt":
-            raise _UnsafeAnchoredCleanup(
-                "safe handle-relative temporary cleanup is unavailable on Windows"
+            raise _UnsafeAnchoredInspection(
+                "safe handle-relative temporary inspection is unavailable on Windows"
             )
         flags = (
             os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
@@ -466,7 +466,7 @@ class _AnchoredCleanupParent:
         snapshots = self.candidate.parent_chain
         try:
             if not snapshots:
-                raise _UnsafeAnchoredCleanup("candidate has no validated parent chain")
+                raise _UnsafeAnchoredInspection("candidate has no validated parent chain")
             anchor, expected = snapshots[0]
             fd = os.open(anchor, flags)
             self._fds.append(fd)
@@ -481,38 +481,38 @@ class _AnchoredCleanupParent:
             return self
         except Exception as exc:
             self.__exit__(None, None, None)
-            if isinstance(exc, _UnsafeAnchoredCleanup):
+            if isinstance(exc, _UnsafeAnchoredInspection):
                 raise
-            raise _UnsafeAnchoredCleanup(
-                f"cannot safely anchor cleanup parent: {exc}"
+            raise _UnsafeAnchoredInspection(
+                f"cannot safely anchor inspection parent: {exc}"
             ) from exc
 
     @staticmethod
     def _verify_fd(fd, expected, display):
         current = os.fstat(fd)
         if _stat_identity(current) != expected or not stat.S_ISDIR(current.st_mode):
-            raise _UnsafeAnchoredCleanup(f"cleanup parent changed: {display}")
+            raise _UnsafeAnchoredInspection(f"inspection parent changed: {display}")
 
     def stat_leaf(self, leaf, expected_identity=None, *, full=False):
         current = os.stat(leaf, dir_fd=self.parent_fd, follow_symlinks=False)
         if _stat_is_link_or_reparse(current):
-            raise _UnsafeAnchoredCleanup(
+            raise _UnsafeAnchoredInspection(
                 "temporary artifact changed or became a link/reparse point"
             )
         expected_type = stat.S_ISDIR if self.candidate.kind == "directory" else stat.S_ISREG
         if not expected_type(current.st_mode):
-            raise _UnsafeAnchoredCleanup("temporary artifact type changed")
+            raise _UnsafeAnchoredInspection("temporary artifact type changed")
         if expected_identity is not None:
             actual = _candidate_identity(current) if full else _stat_identity(current)
             expected = expected_identity if full else expected_identity[:5]
             if actual != expected:
-                raise _UnsafeAnchoredCleanup("temporary artifact identity changed")
+                raise _UnsafeAnchoredInspection("temporary artifact identity changed")
         return current
 
     def read_completion_marker(self, observer=None):
         """Read ``edit_meta.json`` through the retained candidate-parent fd."""
         if self.candidate.kind != "directory":
-            raise _UnsafeAnchoredCleanup("completion marker requires a directory artifact")
+            raise _UnsafeAnchoredInspection("completion marker requires a directory artifact")
         flags = (
             os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
             | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
@@ -525,7 +525,7 @@ class _AnchoredCleanupParent:
                 or _candidate_identity(candidate_stat) != self.candidate.identity
                 or not stat.S_ISDIR(candidate_stat.st_mode)
             ):
-                raise _UnsafeAnchoredCleanup(
+                raise _UnsafeAnchoredInspection(
                     "temporary artifact changed during completion marker inspection"
                 )
             if observer:
@@ -638,18 +638,18 @@ class _LeaseProbe:
 def _inspect_existing_lease(anchored, lease_leaf):
     """Return a retained descriptor proof for an existing POSIX lease."""
     if os.name == "nt":
-        raise _UnsafeAnchoredCleanup(
+        raise _UnsafeAnchoredInspection(
             "safe handle-relative lease inspection is unavailable on Windows"
         )
     lease_stat = os.stat(lease_leaf, dir_fd=anchored.parent_fd, follow_symlinks=False)
     if _stat_is_link_or_reparse(lease_stat) or not stat.S_ISREG(lease_stat.st_mode):
-        raise _UnsafeAnchoredCleanup("temporary artifact lease is not a safe regular file")
+        raise _UnsafeAnchoredInspection("temporary artifact lease is not a safe regular file")
     flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     fd = os.open(lease_leaf, flags, dir_fd=anchored.parent_fd)
     try:
         opened = os.fstat(fd)
         if _stat_identity(opened) != _stat_identity(lease_stat):
-            raise _UnsafeAnchoredCleanup("temporary artifact lease changed during inspection")
+            raise _UnsafeAnchoredInspection("temporary artifact lease changed during inspection")
         import fcntl
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -684,13 +684,13 @@ def _check_held_lease_advisory(
         _stat_identity(parent_start) != expected_parent
         or not stat.S_ISDIR(parent_start.st_mode)
     ):
-        raise _UnsafeAnchoredCleanup(
+        raise _UnsafeAnchoredInspection(
             "temporary artifact parent changed during active checks"
         )
 
     candidate_first = anchored.stat_leaf(candidate.path.name)
     if _stat_identity(candidate_first) != candidate.identity[:5]:
-        raise _UnsafeAnchoredCleanup(
+        raise _UnsafeAnchoredInspection(
             "temporary artifact structural identity changed during active checks"
         )
     if observer:
@@ -705,7 +705,7 @@ def _check_held_lease_advisory(
         or _stat_identity(lease_first) != proof.identity
         or _stat_identity(os.fstat(proof.fd)) != proof.identity
     ):
-        raise _UnsafeAnchoredCleanup(
+        raise _UnsafeAnchoredInspection(
             "temporary artifact lease changed during active checks"
         )
     if observer:
@@ -713,7 +713,7 @@ def _check_held_lease_advisory(
 
     candidate_second = anchored.stat_leaf(candidate.path.name)
     if _stat_identity(candidate_second) != candidate.identity[:5]:
-        raise _UnsafeAnchoredCleanup(
+        raise _UnsafeAnchoredInspection(
             "temporary artifact structural identity changed during active checks"
         )
     if observer:
@@ -727,7 +727,7 @@ def _check_held_lease_advisory(
         or _stat_identity(lease_second) != proof.identity
         or _stat_identity(os.fstat(proof.fd)) != proof.identity
     ):
-        raise _UnsafeAnchoredCleanup(
+        raise _UnsafeAnchoredInspection(
             "temporary artifact lease changed during active checks"
         )
     if observer:
@@ -737,7 +737,7 @@ def _check_held_lease_advisory(
     if (
         _stat_identity(parent_end) != expected_parent
     ):
-        raise _UnsafeAnchoredCleanup(
+        raise _UnsafeAnchoredInspection(
             "temporary artifact parent changed during active checks"
         )
     _revalidate_directory_chain(root_chain)
@@ -835,10 +835,10 @@ def inspect_abandoned_export_temps(
             if observer:
                 observer("before_inspect", path)
             if os.name == "nt":
-                raise _UnsafeAnchoredCleanup(
+                raise _UnsafeAnchoredInspection(
                     "safe handle-relative temporary inspection is unavailable on Windows"
                 )
-            with _AnchoredCleanupParent(candidate) as anchored:
+            with _AnchoredInspectionParent(candidate) as anchored:
                 lease_leaf = path.name + ".lease"
                 try:
                     os.stat(lease_leaf, dir_fd=anchored.parent_fd, follow_symlinks=False)
@@ -872,14 +872,14 @@ def inspect_abandoned_export_temps(
                     except FileNotFoundError:
                         metadata = None
                     except Exception as exc:
-                        raise _UnsafeAnchoredCleanup(
+                        raise _UnsafeAnchoredInspection(
                             f"cannot safely inspect possible completion marker: {exc}"
                         ) from exc
                     if metadata is not None:
                         _revalidate_candidate(candidate)
                         relative_name = path.relative_to(root).as_posix()
                         if not isinstance(metadata, dict) or not isinstance(metadata.get("name"), str):
-                            raise _UnsafeAnchoredCleanup(
+                            raise _UnsafeAnchoredInspection(
                                 "possible completion marker has invalid metadata"
                             )
                         if metadata["name"] == relative_name:
