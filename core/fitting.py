@@ -582,6 +582,10 @@ class FitManager:
                 self._active_run is not run
                 or run.cancel.is_set()
                 or self.state.get("state") in ("done", "error", "stopped")
+                or not any(
+                    worker is worker_state
+                    for worker in self.state.get("workers", [])
+                )
             ):
                 return
             if event["event"] == "loading":
@@ -650,6 +654,7 @@ class FitManager:
     def _refresh_totals(self, *, recalculate_eta=True):
         workers = self.state.get("workers", [])
         self.state["done"] = sum(w["done"] for w in workers)
+        self.state["total"] = sum(w["total"] for w in workers)
         if not recalculate_eta:
             return
         etas = []

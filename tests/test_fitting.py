@@ -414,6 +414,21 @@ def test_terminal_worker_events_are_ignored(terminal):
     assert worker == worker_before
 
 
+def test_unpublished_worker_state_cannot_mutate_authoritative_aggregate():
+    manager, run = _eta_manager(lambda: 10.0)
+    authoritative = manager.state["workers"][0]
+    unpublished = _worker(total=9)
+    before = dict(manager.state)
+
+    manager._handle_worker_event(
+        run, {"event": "progress", "done": 9, "total": 9}, unpublished, 0
+    )
+
+    assert manager.state == before
+    assert authoritative["done"] == 0
+    assert unpublished["done"] == 0
+
+
 def test_error_wins_then_stop():
     manager = fitting.FitManager()
     manager._emit = lambda: None
@@ -716,6 +731,23 @@ def test_eta_multiple_workers_uses_slowest_remaining_worker():
     manager._refresh_totals()
     assert manager.state["done"] == 2
     assert manager.state["eta_seconds"] == 40
+
+
+def test_aggregate_total_is_recomputed_from_authoritative_workers():
+    manager = fitting.FitManager()
+    manager._emit = lambda: None
+    manager.state = {
+        "total": 999,
+        "workers": [
+            {**_worker(1, 2), "hist": [[1, 10.0]]},
+            {**_worker(2, 3), "hist": [[2, 20.0]]},
+        ],
+    }
+
+    manager._refresh_totals()
+
+    assert manager.state["done"] == 3
+    assert manager.state["total"] == 5
 
 
 @pytest.mark.parametrize(
