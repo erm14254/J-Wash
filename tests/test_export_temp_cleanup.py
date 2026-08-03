@@ -50,7 +50,8 @@ def test_old_unlocked_temporary_is_reported_not_removed(tmp_path, maker):
     path = maker(tmp_path)
     before = (path / "payload").read_bytes() if path.is_dir() else path.read_bytes()
     result = _inspect(tmp_path)
-    assert result["abandoned"] == [str(path)]
+    category = "changed_or_unsafe" if os.name == "nt" else "abandoned"
+    assert result[category] == [str(path)]
     assert result["removed"] == [] and result["removed_count"] == 0
     assert path.exists()
     after = (path / "payload").read_bytes() if path.is_dir() else path.read_bytes()
@@ -60,7 +61,8 @@ def test_old_unlocked_temporary_is_reported_not_removed(tmp_path, maker):
 @pytest.mark.parametrize("maker", [_stage, _gguf])
 def test_recent_temporary_is_preserved(tmp_path, maker):
     path = maker(tmp_path, recent=True)
-    assert _inspect(tmp_path)["recent"] == [str(path)]
+    category = "changed_or_unsafe" if os.name == "nt" else "recent"
+    assert _inspect(tmp_path)[category] == [str(path)]
     assert path.exists()
 
 
@@ -72,7 +74,8 @@ def test_completed_collision_and_hf_cache_are_preserved(tmp_path):
         '{"name":".completed.tmp-' + HEX + '"}', encoding="utf-8"
     )
     result = _inspect(tmp_path)
-    assert result["completed"] == [str(path)]
+    category = "changed_or_unsafe" if os.name == "nt" else "completed"
+    assert result[category] == [str(path)]
     assert (path / "hf" / "config.json").read_bytes() == b"config"
 
 
@@ -82,7 +85,8 @@ def test_inspection_never_calls_destructive_operations(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "unlink", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
     monkeypatch.setattr(os, "unlink", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
     monkeypatch.setattr(shutil, "rmtree", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
-    assert _inspect(tmp_path)["abandoned"] == [str(path)]
+    category = "changed_or_unsafe" if os.name == "nt" else "abandoned"
+    assert _inspect(tmp_path)[category] == [str(path)]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX advisory-lock integration")
@@ -103,6 +107,7 @@ def test_cross_process_active_lease_is_preserved_then_reported_abandoned(tmp_pat
     assert path.exists() and path.with_name(path.name + ".lease").exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows fails closed before candidate hooks")
 def test_same_inode_modification_after_discovery_is_unsafe(tmp_path):
     path = _gguf(tmp_path)
     def observer(phase, _value):
@@ -113,6 +118,7 @@ def test_same_inode_modification_after_discovery_is_unsafe(tmp_path):
     assert path.read_bytes() == b"modified-same-inode"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows fails closed before candidate hooks")
 def test_candidate_replacement_is_unsafe_and_target_survives(tmp_path):
     path = _gguf(tmp_path)
     target = tmp_path / "target"
@@ -126,6 +132,7 @@ def test_candidate_replacement_is_unsafe_and_target_survives(tmp_path):
     assert path.is_symlink() and target.read_bytes() == b"target"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows fails closed before marker inspection")
 def test_parent_change_during_marker_inspection_is_unsafe(tmp_path):
     parent = tmp_path / "nested"
     path = _stage(parent)

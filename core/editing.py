@@ -26,6 +26,23 @@ _TEMP_STAGE_RE = re.compile(r"^\..+\.tmp-[0-9a-f]{32}$")
 _TEMP_GGUF_RE = re.compile(r"^\..+\.tmp-[0-9a-f]{32}\.gguf$")
 
 
+def _mark_windows_file_for_deletion(file):
+    """Mark the exact open Windows file handle for deletion on close."""
+    import ctypes
+    import msvcrt
+
+    class FILE_DISPOSITION_INFO(ctypes.Structure):
+        _fields_ = [("DeleteFile", ctypes.c_ubyte)]
+
+    info = FILE_DISPOSITION_INFO(1)
+    handle = msvcrt.get_osfhandle(file.fileno())
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    if not kernel32.SetFileInformationByHandle(
+        ctypes.c_void_p(handle), 4, ctypes.byref(info), ctypes.sizeof(info)
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
 def internal_temp_leaf_kind(name):
     """Classify exact J-Wash temporary/lease leaf names."""
     artifact_name = name[:-6] if name.endswith(".lease") else name
@@ -67,17 +84,15 @@ class ArtifactLease:
         file = os.fdopen(fd, "r+b")
 
         def close_unacquired():
-            file.close()
             if created:
                 try:
                     if parent_fd is not None:
                         os.unlink(self.path.name, dir_fd=parent_fd)
                     else:
-                        # Windows cannot safely remove a newly-created lease by
-                        # pathname after its parent changes. Preserve it.
-                        pass
+                        _mark_windows_file_for_deletion(file)
                 except OSError:
                     pass
+            file.close()
             if parent_fd is not None:
                 os.close(parent_fd)
 
@@ -132,7 +147,16 @@ class ArtifactLease:
                     import fcntl
                     fcntl.flock(file.fileno(), fcntl.LOCK_UN)
             finally:
-                file.close()
+                try:
+                    if remove and created and parent_fd is None:
+                        # Windows deletion is bound to the owned open handle,
+                        # not to a path that could be replaced concurrently.
+                        _mark_windows_file_for_deletion(file)
+                except OSError:
+                    # A harmless stale lease is safer than pathname deletion.
+                    pass
+                finally:
+                    file.close()
         try:
             # Only remove a lease created by this acquisition, through the
             # retained POSIX parent descriptor, and only if it is unchanged.
