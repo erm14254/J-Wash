@@ -968,30 +968,32 @@ def test_stderr_drainer_failure_terminates_live_worker_and_surfaces_error(
 def test_first_helper_failure_wins_concurrently():
     manager = fitting.FitManager()
     run = fitting._FitRun()
-    first_recorded = threading.Event()
-    release_second = threading.Event()
+    barrier = threading.Barrier(3)
+    results = []
+    results_lock = threading.Lock()
 
-    def first():
-        manager._record_helper_failure(
-            run, "stdout reader", RuntimeError("first failure"), worker=0
+    def record(source, message):
+        barrier.wait()
+        won = manager._record_helper_failure(
+            run, source, RuntimeError(message), worker=0
         )
-        first_recorded.set()
+        with results_lock:
+            results.append((source, message, won))
 
-    def second():
-        _wait(release_second)
-        manager._record_helper_failure(
-            run, "stderr drainer", RuntimeError("second failure"), worker=0
-        )
+    threads = [
+        threading.Thread(target=record, args=("stdout reader", "stdout failure")),
+        threading.Thread(target=record, args=("stderr drainer", "stderr failure")),
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
 
-    first_thread = threading.Thread(target=first)
-    second_thread = threading.Thread(target=second)
-    first_thread.start()
-    second_thread.start()
-    _wait(first_recorded)
-    release_second.set()
-    first_thread.join()
-    second_thread.join()
-    with pytest.raises(RuntimeError, match="stdout reader.*first failure"):
+    winners = [result for result in results if result[2]]
+    assert len(winners) == 1
+    source, message, _ = winners[0]
+    with pytest.raises(RuntimeError, match=f"{source}.*{message}"):
         manager._raise_helper_failure(run)
 
 
@@ -1254,3 +1256,201 @@ def test_heartbeat_callback_failure_terminates_worker_and_allows_restart(
     assert "heartbeat failed" in manager.state["error"]
     assert "heartbeat callback failed" in manager.state["error"]
     assert manager._active_run is None
+
+
+def _late_heartbeat_setup(fit_env, monkeypatch, callback):
+    monkeypatch.setattr(fitting, "_load_corpus", lambda *a: ["prompt"])
+    proc = _HelperBlockedProcess(
+        stdout='{"event":"progress","done":1,"total":1}\n{"event":"done"}\n'
+    )
+    monkeypatch.setattr(fitting.subprocess, "Popen", lambda *a, **k: proc)
+    load_started = threading.Event()
+    monkeypatch.setattr(
+        fitting.JacobianLens,
+        "load",
+        lambda *a: (load_started.set(), _Lens())[1],
+    )
+    manager = fitting.FitManager(heartbeat_interval=0.01)
+    manager.on_progress = callback
+    _start(manager)
+    run = manager._active_run
+    assert run is not None
+    return manager, run, proc, load_started
+
+
+def test_late_heartbeat_failure_blocks_merge_and_success(fit_env, monkeypatch):
+    heartbeat_entered = threading.Event()
+    release_heartbeat = threading.Event()
+
+    def callback(state):
+        if "elapsed" in state and not heartbeat_entered.is_set():
+            heartbeat_entered.set()
+            _wait(release_heartbeat)
+            raise RuntimeError("late heartbeat callback failure")
+
+    manager, run, proc, load_started = _late_heartbeat_setup(
+        fit_env, monkeypatch, callback
+    )
+    _wait(heartbeat_entered)
+    proc._release.set()
+    assert not load_started.wait(0.1), "merge began before heartbeat quiescence"
+    release_heartbeat.set()
+    _wait(run.done)
+
+    assert manager.state["state"] == "error"
+    assert "heartbeat failed" in manager.state["error"]
+    assert "late heartbeat callback failure" in manager.state["error"]
+    assert not load_started.is_set()
+    assert run.heartbeat_thread is not None
+    assert not run.heartbeat_thread.is_alive()
+    assert manager._active_run is None
+
+
+def test_merge_waits_for_heartbeat_thread_to_finish(fit_env, monkeypatch):
+    heartbeat_entered = threading.Event()
+    release_heartbeat = threading.Event()
+
+    def callback(state):
+        if "elapsed" in state and not heartbeat_entered.is_set():
+            heartbeat_entered.set()
+            _wait(release_heartbeat)
+
+    manager, run, proc, load_started = _late_heartbeat_setup(
+        fit_env, monkeypatch, callback
+    )
+    _wait(heartbeat_entered)
+    proc._release.set()
+    assert not load_started.wait(0.1)
+
+    acquired = manager._lock.acquire(timeout=1)
+    assert acquired, "heartbeat join held the FitManager lock"
+    manager._lock.release()
+    release_heartbeat.set()
+    _wait(run.done)
+
+    assert load_started.is_set()
+    assert manager.state["state"] == "done"
+    assert not run.heartbeat_thread.is_alive()
+
+
+def test_late_heartbeat_failure_with_cancel(fit_env, monkeypatch):
+    heartbeat_entered = threading.Event()
+    release_heartbeat = threading.Event()
+
+    def callback(state):
+        if "elapsed" in state and not heartbeat_entered.is_set():
+            heartbeat_entered.set()
+            _wait(release_heartbeat)
+            raise RuntimeError("late heartbeat callback failure")
+
+    manager, run, proc, load_started = _late_heartbeat_setup(
+        fit_env, monkeypatch, callback
+    )
+    _wait(heartbeat_entered)
+    proc._release.set()
+    manager.stop()
+    release_heartbeat.set()
+    _wait(run.done)
+
+    assert manager.state["state"] == "stopped"
+    assert not load_started.is_set()
+
+
+def test_no_heartbeat_after_workers_exit(monkeypatch):
+    manager = fitting.FitManager(heartbeat_interval=1)
+    run = fitting._FitRun()
+    proc = _Process(release=threading.Event())
+    run.processes.append(proc)
+    wait_entered = threading.Event()
+    release_wait = threading.Event()
+    heartbeat_calls = []
+
+    class ControlledStop:
+        def is_set(self):
+            return False
+
+        def set(self):
+            pass
+
+        def wait(self, timeout):
+            wait_entered.set()
+            _wait(release_wait)
+            return False
+
+    run.heartbeat_stop = ControlledStop()
+    monkeypatch.setattr(
+        manager, "_heartbeat_once", lambda *a: heartbeat_calls.append(True)
+    )
+    thread = threading.Thread(target=manager._heartbeat, args=(run, 0))
+    thread.start()
+    _wait(wait_entered)
+    proc.returncode = 0
+    release_wait.set()
+    thread.join()
+    assert heartbeat_calls == []
+
+
+def test_helper_failure_between_partial_loads_blocks_merge(fit_env, monkeypatch):
+    monkeypatch.setattr(fitting, "_load_corpus", lambda *a: ["one", "two"])
+    processes = iter([
+        _Process(stdout='{"event":"done"}\n'),
+        _Process(stdout='{"event":"done"}\n'),
+    ])
+    monkeypatch.setattr(fitting.subprocess, "Popen", lambda *a, **k: next(processes))
+    manager = fitting.FitManager(heartbeat_interval=0.01)
+    loads = []
+    merge_called = threading.Event()
+
+    def load(*args):
+        loads.append(args)
+        if len(loads) == 1:
+            manager._record_helper_failure(
+                manager._active_run,
+                "stdout reader",
+                RuntimeError("failure between partial loads"),
+            )
+        return _Lens()
+
+    monkeypatch.setattr(fitting.JacobianLens, "load", load)
+    monkeypatch.setattr(
+        fitting.JacobianLens,
+        "merge",
+        lambda *a: (merge_called.set(), _Lens())[1],
+    )
+    manager.start(
+        model_id="local/model", source="local/model", n_prompts=2,
+        devices=("cuda:0", "cuda:1"), name="fit", dim_batch=2,
+        datasets=("local/corpus",),
+    )
+    run = manager._active_run
+    _wait(run.done)
+    assert manager.state["state"] == "error"
+    assert len(loads) == 1
+    assert not merge_called.is_set()
+
+
+def test_helper_failure_before_lens_save_blocks_publication(fit_env, monkeypatch):
+    monkeypatch.setattr(fitting, "_load_corpus", lambda *a: ["prompt"])
+    monkeypatch.setattr(
+        fitting.subprocess,
+        "Popen",
+        lambda *a, **k: _Process(stdout='{"event":"done"}\n'),
+    )
+    manager = fitting.FitManager(heartbeat_interval=0.01)
+    saved = []
+
+    def load(*args):
+        manager._record_helper_failure(
+            manager._active_run,
+            "stdout reader",
+            RuntimeError("failure before save"),
+        )
+        return _Lens(saved)
+
+    monkeypatch.setattr(fitting.JacobianLens, "load", load)
+    _start(manager)
+    run = manager._active_run
+    _wait(run.done)
+    assert manager.state["state"] == "error"
+    assert saved == []
+    assert not (fit_env[1] / "fit" / "meta.json").exists()

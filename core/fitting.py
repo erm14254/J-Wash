@@ -291,6 +291,14 @@ class FitManager:
         if run.helper_failure.is_set():
             raise _FitHelperFailed()
 
+    @staticmethod
+    def _stop_and_join_heartbeat(run):
+        """Quiesce heartbeat telemetry before any post-worker processing."""
+        run.heartbeat_stop.set()
+        heartbeat = run.heartbeat_thread
+        if heartbeat is not None and heartbeat is not threading.current_thread():
+            heartbeat.join()
+
     def _record_helper_failure(self, run, source, exc, worker=None):
         """Record a stream-helper failure and unblock run-owned children."""
         with run.helper_error_lock:
@@ -542,8 +550,12 @@ class FitManager:
                 reader.join()
             for t in drainers:
                 t.join()
-            self._check_cancelled(run)
-            self._raise_helper_failure(run)
+            # Heartbeat callbacks are helpers too.  They must be fully quiesced
+            # before failure selection, worker validation, merge, or output
+            # publication; otherwise a callback can fail after the last helper
+            # check and allow a successful artifact to be published.
+            self._stop_and_join_heartbeat(run)
+            self._check_run_viable(run)
             failed = [i for i, p in enumerate(run.processes) if p.returncode != 0]
             if failed:
                 detail = " | ".join(stderr_tails[i].strip().splitlines()[-1] if stderr_tails[i].strip() else "?" for i in failed)
@@ -552,12 +564,12 @@ class FitManager:
             self._validate_workers_after_drain(run)
             partials = []
             for i in range(len(slices)):
-                self._check_cancelled(run)
+                self._check_run_viable(run)
                 partials.append(JacobianLens.load(str(job_dir / f"lens{i}.pt")))
-            self._check_cancelled(run)
+            self._check_run_viable(run)
             merged = JacobianLens.merge(partials) if len(partials) > 1 else partials[0]
             if params.get("continue_from"):
-                self._check_cancelled(run)
+                self._check_run_viable(run)
                 base_lens = JacobianLens.load(params["continue_from"])
                 if base_lens.source_layers != merged.source_layers:
                     raise RuntimeError(
@@ -566,15 +578,15 @@ class FitManager:
                         f"{merged.source_layers[0]}..{merged.source_layers[-1]})"
                     )
                 # weighted average by n_prompts = equivalent to a fit over the union
-                self._check_cancelled(run)
+                self._check_run_viable(run)
                 merged = JacobianLens.merge([base_lens, merged])
-            self._check_cancelled(run)
+            self._check_run_viable(run)
             out_dir = config.LENSES_DIR / name
             out_dir.mkdir(parents=True, exist_ok=True)
             lens_path = out_dir / "lens.pt"
-            self._check_cancelled(run)
+            self._check_run_viable(run)
             merged.save(str(lens_path))
-            self._check_cancelled(run)
+            self._check_run_viable(run)
             meta = {
                 "name": name,
                 "model_id": params["model_id"],
@@ -599,10 +611,11 @@ class FitManager:
                 "created_at": _now(),
                 "fit_seconds": round(self._clock() - started, 1),
             }
-            self._check_cancelled(run)
+            self._check_run_viable(run)
             (out_dir / "meta.json").write_text(
                 json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8"
             )
+            self._check_run_viable(run)
             self._publish_terminal(run, success={
                 "state": "done",
                 "phase": "done",
@@ -647,6 +660,16 @@ class FitManager:
                 if run.processes and not any(proc.poll() is None for proc in run.processes):
                     return
                 if run.heartbeat_stop.wait(self._heartbeat_interval):
+                    return
+                if (
+                    run.heartbeat_stop.is_set()
+                    or run.cancel.is_set()
+                    or run.helper_failure.is_set()
+                    or (
+                        run.processes
+                        and not any(proc.poll() is None for proc in run.processes)
+                    )
+                ):
                     return
                 self._heartbeat_once(run, started)
         except Exception as exc:
