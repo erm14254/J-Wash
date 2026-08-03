@@ -3,6 +3,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import time
 import uuid
 from datetime import datetime, timezone
@@ -24,6 +25,16 @@ _TEMP_STAGE_RE = re.compile(r"^\..+\.tmp-[0-9a-f]{32}$")
 _TEMP_GGUF_RE = re.compile(r"^\..+\.tmp-[0-9a-f]{32}\.gguf$")
 
 
+def internal_temp_leaf_kind(name):
+    """Classify exact J-Wash temporary/lease leaf names."""
+    artifact_name = name[:-6] if name.endswith(".lease") else name
+    if _TEMP_STAGE_RE.fullmatch(artifact_name):
+        return "directory-lease" if name.endswith(".lease") else "directory"
+    if _TEMP_GGUF_RE.fullmatch(artifact_name):
+        return "file-lease" if name.endswith(".lease") else "file"
+    return None
+
+
 class ArtifactLease:
     """Exclusive advisory lease for one temporary export artifact."""
 
@@ -34,8 +45,16 @@ class ArtifactLease:
         self._file = None
 
     def acquire(self, *, blocking=True):
-        mode = "a+b" if self.create else "r+b"
-        file = open(self.path, mode)
+        created = False
+        if self.create:
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+                created = True
+            except FileExistsError:
+                fd = os.open(self.path, os.O_RDWR)
+        else:
+            fd = os.open(self.path, os.O_RDWR)
+        file = os.fdopen(fd, "r+b")
         try:
             file.seek(0, os.SEEK_END)
             if file.tell() == 0:
@@ -67,6 +86,11 @@ class ArtifactLease:
         except Exception:
             if not file.closed:
                 file.close()
+            if created:
+                try:
+                    self.path.unlink(missing_ok=True)
+                except OSError:
+                    pass
             raise
 
     def release(self, *, remove=True):
@@ -103,14 +127,26 @@ def artifact_lease(artifact):
     return ArtifactLease(artifact)
 
 
+def _is_link_or_reparse(path, path_stat=None):
+    path_stat = path.lstat() if path_stat is None else path_stat
+    return (
+        stat.S_ISLNK(path_stat.st_mode)
+        or getattr(path, "is_junction", lambda: False)()
+        or bool(
+            getattr(path_stat, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        )
+    )
+
+
 def _recognized_temp(path):
     """Return the owned temporary kind without following a symlink."""
     try:
-        if path.is_symlink():
+        if _is_link_or_reparse(path):
             return None
-        if _TEMP_STAGE_RE.fullmatch(path.name) and path.is_dir():
+        if internal_temp_leaf_kind(path.name) == "directory" and path.is_dir():
             return "directory"
-        if _TEMP_GGUF_RE.fullmatch(path.name) and path.is_file():
+        if internal_temp_leaf_kind(path.name) == "file" and path.is_file():
             return "file"
     except OSError:
         raise
@@ -134,7 +170,7 @@ def _newest_lstat_mtime(path, kind):
         for name in dirs:
             child = base / name
             newest = max(newest, child.lstat().st_mtime)
-            if not child.is_symlink():
+            if not _is_link_or_reparse(child):
                 kept.append(name)
         dirs[:] = kept
         for name in files:
@@ -155,13 +191,24 @@ def cleanup_abandoned_export_temps(
     current_time = time.time() if now is None else float(now)
     result = {
         "removed": [], "removed_count": 0, "skipped_active": [],
-        "skipped_recent": [], "errors": [],
+        "skipped_recent": [], "skipped_completed": [], "errors": [],
     }
     try:
-        root_resolved = root.resolve()
-        if not root.is_dir():
+        root_stat = root.lstat()
+        if _is_link_or_reparse(root, root_stat):
+            result["errors"].append({
+                "path": str(root), "error": "cleanup root is a symlink or junction",
+            })
             return result
-    except OSError as exc:
+        if not stat.S_ISDIR(root_stat.st_mode):
+            result["errors"].append({
+                "path": str(root), "error": "cleanup root is not a directory",
+            })
+            return result
+        root_resolved = root.resolve(strict=True)
+    except FileNotFoundError:
+        return result
+    except (OSError, RuntimeError) as exc:
         result["errors"].append({"path": str(root), "error": str(exc)})
         return result
 
@@ -177,7 +224,15 @@ def cleanup_abandoned_export_temps(
     ):
         base = Path(current)
         # Do not descend through any symlink, including one beneath EDITS_DIR.
-        dirs[:] = [name for name in dirs if not (base / name).is_symlink()]
+        kept_dirs = []
+        for name in dirs:
+            child = base / name
+            try:
+                if not _is_link_or_reparse(child):
+                    kept_dirs.append(name)
+            except OSError as exc:
+                result["errors"].append({"path": str(child), "error": str(exc)})
+        dirs[:] = kept_dirs
         for name in list(dirs) + files:
             path = base / name
             try:
@@ -192,7 +247,23 @@ def cleanup_abandoned_export_temps(
     for path, kind in candidates:
         lease = ArtifactLease(path, create=False)
         acquired = False
-        has_lease = lease.path.is_file() and not lease.path.is_symlink()
+        try:
+            lease_stat = lease.path.lstat()
+        except FileNotFoundError:
+            lease_stat = None
+        except OSError as exc:
+            result["errors"].append({"path": str(lease.path), "error": str(exc)})
+            continue
+        if lease_stat is not None and (
+            _is_link_or_reparse(lease.path, lease_stat)
+            or not stat.S_ISREG(lease_stat.st_mode)
+        ):
+            result["errors"].append({
+                "path": str(lease.path),
+                "error": "temporary artifact lease is not a safe regular file",
+            })
+            continue
+        has_lease = lease_stat is not None
         try:
             try:
                 path.resolve().relative_to(root_resolved)
@@ -204,6 +275,33 @@ def cleanup_abandoned_export_temps(
                     result["skipped_active"].append(str(path))
                     continue
             else:
+                if kind == "directory":
+                    marker = path / "edit_meta.json"
+                    try:
+                        marker_stat = marker.lstat()
+                    except FileNotFoundError:
+                        marker_stat = None
+                    except OSError as exc:
+                        raise OSError(f"cannot inspect possible completion marker: {exc}") from exc
+                    if marker_stat is not None:
+                        if (
+                            stat.S_ISLNK(marker_stat.st_mode)
+                            or not stat.S_ISREG(marker_stat.st_mode)
+                        ):
+                            raise ValueError("possible completion marker is not a safe regular file")
+                        try:
+                            metadata = json.loads(marker.read_text(encoding="utf-8"))
+                        except Exception as exc:
+                            raise ValueError(f"cannot inspect possible completion marker: {exc}") from exc
+                        relative_name = path.relative_to(root).as_posix()
+                        if (
+                            not isinstance(metadata, dict)
+                            or not isinstance(metadata.get("name"), str)
+                        ):
+                            raise ValueError("possible completion marker has invalid metadata")
+                        if metadata["name"] == relative_name:
+                            result["skipped_completed"].append(str(path))
+                            continue
                 newest = _newest_lstat_mtime(path, kind)
                 if current_time - newest < stale_age:
                     result["skipped_recent"].append(str(path))
@@ -687,6 +785,10 @@ def validate_export_name(name):
     if any(part in ("", ".", "..") for part in raw):
         raise ValueError("export name contains an empty, '.', or '..' component")
     for part in raw:
+        if internal_temp_leaf_kind(part) is not None:
+            raise ValueError(
+                f"export name component {part!r} is reserved for internal temporary export use"
+            )
         if part.endswith((" ", ".")) or part.split(".", 1)[0].upper() in _WINDOWS_RESERVED:
             raise ValueError(f"export name contains Windows-reserved component {part!r}")
         if any(ord(char) < 32 or char in '<>:"|?*' for char in part):

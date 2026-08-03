@@ -69,17 +69,26 @@ async def lifespan(_app):
     _loop_holder["loop"] = loop
     access_logger.addFilter(quiet_filter)
     try:
-        cleanup = await asyncio.to_thread(editing.cleanup_abandoned_export_temps)
-        logging.getLogger(__name__).info(
-            "export temporary cleanup: removed=%d active=%d recent=%d errors=%d",
-            cleanup["removed_count"], len(cleanup["skipped_active"]),
-            len(cleanup["skipped_recent"]), len(cleanup["errors"]),
-        )
-        for failure in cleanup["errors"]:
-            logging.getLogger(__name__).warning(
-                "could not clean export temporary artifact %s: %s",
-                failure["path"], failure["error"],
+        try:
+            cleanup = await asyncio.to_thread(editing.cleanup_abandoned_export_temps)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.getLogger(__name__).exception(
+                "abandoned export temporary cleanup failed; startup will continue"
             )
+        else:
+            logging.getLogger(__name__).info(
+                "export temporary cleanup: removed=%d active=%d recent=%d completed=%d errors=%d",
+                cleanup["removed_count"], len(cleanup["skipped_active"]),
+                len(cleanup["skipped_recent"]), len(cleanup.get("skipped_completed", [])),
+                len(cleanup["errors"]),
+            )
+            for failure in cleanup["errors"]:
+                logging.getLogger(__name__).warning(
+                    "could not clean export temporary artifact %s: %s",
+                    failure["path"], failure["error"],
+                )
         yield
     finally:
         access_logger.removeFilter(quiet_filter)

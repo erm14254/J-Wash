@@ -1,4 +1,7 @@
 import os
+import json
+import multiprocessing
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -32,6 +35,15 @@ def _gguf(root, name=f".model-bf16.tmp-{HEX}.gguf", *, mtime=OLD):
 
 def _cleanup(root, **kwargs):
     return editing.cleanup_abandoned_export_temps(root=root, now=NOW, **kwargs)
+
+
+def _hold_artifact_lease(path, connection):
+    lease = editing.ArtifactLease(path)
+    lease.acquire()
+    connection.send("ready")
+    connection.recv()
+    lease.release(remove=False)
+    connection.close()
 
 
 def test_removes_old_recognized_legacy_staging_directory(tmp_path):
@@ -212,3 +224,164 @@ def test_cleanup_lock_error_preserves_artifact(tmp_path, monkeypatch):
     assert path.exists() and lease_path.exists()
     assert result["removed_count"] == 0
     assert result["errors"] == [{"path": str(path), "error": "lock inspection failed"}]
+
+
+def test_symlink_cleanup_root_is_refused(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    artifact = _stage(outside)
+    root = tmp_path / "root"
+    try:
+        root.symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("directory symlinks are unavailable")
+    result = _cleanup(root)
+    assert artifact.exists()
+    assert "symlink or junction" in result["errors"][0]["error"]
+
+
+def test_self_referential_cleanup_root_returns_safely(tmp_path):
+    root = tmp_path / "root"
+    try:
+        root.symlink_to(root, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("directory symlinks are unavailable")
+    result = _cleanup(root)
+    assert result["removed_count"] == 0
+    assert "symlink or junction" in result["errors"][0]["error"]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+def test_windows_junction_cleanup_root_is_refused(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    artifact = _stage(outside)
+    root = tmp_path / "root"
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(root), str(outside)],
+        capture_output=True, text=True,
+    )
+    if result.returncode:
+        pytest.skip(f"junction creation unavailable: {result.stderr}")
+    cleanup = _cleanup(root)
+    assert artifact.exists()
+    assert "symlink or junction" in cleanup["errors"][0]["error"]
+
+
+@pytest.mark.parametrize("name", [
+    f".completed.tmp-{HEX}", f"nested/.completed.tmp-{HEX}",
+    f".model.tmp-{HEX}.gguf", f".model.tmp-{HEX}.lease",
+    f".model.tmp-{HEX}.gguf.lease",
+])
+def test_export_names_reserve_internal_temporary_namespace(name):
+    with pytest.raises(ValueError, match="reserved for internal temporary export"):
+        editing.validate_export_name(name)
+
+
+def test_export_rebase_rejects_reserved_final_name(tmp_path, monkeypatch):
+    monkeypatch.setattr(editing, "EDITS_DIR", tmp_path)
+    with pytest.raises(ValueError, match="reserved for internal temporary export"):
+        editing.export_rebase([], object(), {}, fmt="full", name=f".done.tmp-{HEX}")
+    assert not list(tmp_path.iterdir())
+
+
+def test_legacy_completed_colliding_export_is_preserved(tmp_path):
+    path = _stage(tmp_path, f".completed.tmp-{HEX}")
+    hf = path / "hf"
+    hf.mkdir()
+    sentinel = hf / "config.json"
+    sentinel.write_text("{}")
+    (path / "edit_meta.json").write_text(json.dumps({"name": path.name}))
+    _mtime(path / "edit_meta.json", OLD)
+    _mtime(sentinel, OLD)
+    _mtime(hf, OLD)
+    _mtime(path, OLD)
+    result = _cleanup(tmp_path)
+    assert result["skipped_completed"] == [str(path)]
+    assert sentinel.read_text() == "{}"
+
+
+def test_abandoned_stage_with_final_name_marker_is_removed(tmp_path):
+    path = _stage(tmp_path)
+    marker = path / "edit_meta.json"
+    marker.write_text(json.dumps({"name": "model"}))
+    _mtime(marker, OLD)
+    _mtime(path, OLD)
+    assert _cleanup(tmp_path)["removed"] == [str(path)]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX flock regression")
+def test_new_lease_is_removed_when_flock_fails(tmp_path, monkeypatch):
+    import fcntl
+    artifact = tmp_path / f".model.tmp-{HEX}"
+    lease = editing.ArtifactLease(artifact)
+    def fail(*args):
+        raise OSError("flock exploded")
+    monkeypatch.setattr(fcntl, "flock", fail)
+    with pytest.raises(OSError, match="flock exploded"):
+        lease.acquire()
+    assert not lease.path.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX flock regression")
+def test_preexisting_lease_survives_failed_flock(tmp_path, monkeypatch):
+    import fcntl
+    artifact = tmp_path / f".model.tmp-{HEX}"
+    lease = editing.ArtifactLease(artifact)
+    lease.path.write_bytes(b"0")
+    monkeypatch.setattr(fcntl, "flock", lambda *args: (_ for _ in ()).throw(OSError("busy")))
+    with pytest.raises(OSError, match="busy"):
+        lease.acquire()
+    assert lease.path.read_bytes() == b"0"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows locking regression")
+def test_new_lease_is_removed_when_windows_locking_fails(tmp_path, monkeypatch):
+    import msvcrt
+    artifact = tmp_path / f".model.tmp-{HEX}"
+    lease = editing.ArtifactLease(artifact)
+    def fail(*args):
+        raise OSError("locking exploded")
+    monkeypatch.setattr(msvcrt, "locking", fail)
+    with pytest.raises(OSError, match="locking exploded"):
+        lease.acquire()
+    assert not lease.path.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows locking regression")
+def test_preexisting_lease_survives_failed_windows_locking(tmp_path, monkeypatch):
+    import msvcrt
+    artifact = tmp_path / f".model.tmp-{HEX}"
+    lease = editing.ArtifactLease(artifact)
+    lease.path.write_bytes(b"0")
+    monkeypatch.setattr(
+        msvcrt, "locking", lambda *args: (_ for _ in ()).throw(OSError("busy")),
+    )
+    with pytest.raises(OSError, match="busy"):
+        lease.acquire()
+    assert lease.path.read_bytes() == b"0"
+
+
+def test_cross_process_lease_protects_active_artifact(tmp_path):
+    artifact = _stage(tmp_path, mtime=OLD)
+    context = multiprocessing.get_context("spawn")
+    parent, child_connection = context.Pipe()
+    child = context.Process(
+        target=_hold_artifact_lease, args=(artifact, child_connection),
+    )
+    child.start()
+    try:
+        assert parent.recv() == "ready"
+        first = _cleanup(tmp_path)
+        assert first["skipped_active"] == [str(artifact)] and artifact.exists()
+        parent.send("release")
+        child.join(timeout=10)
+        assert child.exitcode == 0
+        second = _cleanup(tmp_path)
+        assert second["removed"] == [str(artifact)] and not artifact.exists()
+    finally:
+        parent.close()
+        child_connection.close()
+        if child.is_alive():
+            child.kill()
+            child.join()
