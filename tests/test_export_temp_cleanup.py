@@ -46,6 +46,20 @@ def _hold(path, conn):
     lease.release(remove=False)
 
 
+def _inspect_while_child_holds(path, observer):
+    parent, child = multiprocessing.Pipe()
+    proc = multiprocessing.Process(target=_hold, args=(path, child))
+    proc.start()
+    assert parent.recv() == "ready"
+    try:
+        return _inspect(path.parents[1] if path.parent.name == "nested" else path.parent,
+                        observer=observer)
+    finally:
+        parent.send("release")
+        proc.join(10)
+        assert proc.exitcode == 0
+
+
 @pytest.mark.parametrize("maker", [_stage, _gguf])
 def test_old_unlocked_temporary_is_reported_not_removed(tmp_path, maker):
     path = maker(tmp_path)
@@ -329,9 +343,124 @@ def test_active_lease_wins_over_mutable_candidate_metadata(tmp_path):
     assert path.read_bytes() == b"actively-updated"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX active lease proof")
+def test_held_lease_candidate_leaf_replacement_is_unsafe(tmp_path):
+    path = _gguf(tmp_path)
+    original = tmp_path / "original"
+    target = tmp_path / "target"
+    target.write_bytes(b"target")
+
+    def observer(phase, _value):
+        if phase == "after_held_lease_probe":
+            path.rename(original)
+            path.symlink_to(target)
+
+    result = _inspect_while_child_holds(path, observer)
+    assert result["active"] == []
+    assert result["changed_or_unsafe"] == [str(path)]
+    assert "changed" in result["errors"][0]["error"]
+    assert original.read_bytes() == b"file-bytes"
+    assert path.is_symlink() and target.read_bytes() == b"target"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX active lease proof")
+def test_held_lease_parent_replacement_is_unsafe(tmp_path):
+    parent = tmp_path / "nested"
+    path = _gguf(parent)
+    moved = tmp_path / "moved"
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+
+    def observer(phase, _value):
+        if phase == "after_held_lease_probe":
+            parent.rename(moved)
+            parent.symlink_to(replacement, target_is_directory=True)
+
+    result = _inspect_while_child_holds(path, observer)
+    assert result["active"] == []
+    assert result["changed_or_unsafe"] == [str(path)]
+    assert "changed" in result["errors"][0]["error"]
+    assert (moved / path.name).read_bytes() == b"file-bytes"
+    assert (moved / (path.name + ".lease")).is_file()
+    assert parent.is_symlink()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX active lease proof")
+def test_held_lease_leaf_replacement_is_unsafe(tmp_path):
+    path = _gguf(tmp_path)
+    lease_path = path.with_name(path.name + ".lease")
+    original_lease = tmp_path / "original.lease"
+    replacement = b"replacement-lease"
+
+    def observer(phase, _value):
+        if phase == "after_held_lease_probe":
+            lease_path.rename(original_lease)
+            lease_path.write_bytes(replacement)
+
+    result = _inspect_while_child_holds(path, observer)
+    assert result["active"] == []
+    assert result["changed_or_unsafe"] == [str(path)]
+    assert "lease changed" in result["errors"][0]["error"]
+    assert original_lease.is_file()
+    assert lease_path.read_bytes() == replacement
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX active lease proof")
+def test_child_held_lease_allows_mutable_candidate_metadata(tmp_path):
+    path = _gguf(tmp_path)
+
+    def observer(phase, _value):
+        if phase == "after_held_lease_probe":
+            path.write_bytes(b"updated-with-same-inode-and-new-size")
+
+    result = _inspect_while_child_holds(path, observer)
+    assert result["active"] == [str(path)]
+    assert result["changed_or_unsafe"] == []
+    assert path.read_bytes() == b"updated-with-same-inode-and-new-size"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX validation hook")
+def test_late_lease_validation_failure_clears_acquisition_state(tmp_path, monkeypatch):
+    artifact = tmp_path / (".x.tmp-" + HEX + ".gguf")
+    lease = editing.ArtifactLease(artifact)
+    real_validator = editing._validate_acquired_lease_file
+    monkeypatch.setattr(
+        editing,
+        "_validate_acquired_lease_file",
+        lambda _file: (_ for _ in ()).throw(RuntimeError("late validation failed")),
+    )
+    with pytest.raises(RuntimeError, match="late validation failed"):
+        lease.acquire()
+    assert lease._file is None
+    assert lease._parent_fd is None
+    assert lease._identity is None
+    assert lease._created is False
+    lease.release()
+    monkeypatch.setattr(editing, "_validate_acquired_lease_file", real_validator)
+    retry = editing.ArtifactLease(artifact)
+    assert retry.acquire(blocking=False)
+    retry.release()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows fails closed without safe handles")
 def test_windows_inspection_preserves_candidates(tmp_path):
     path = _gguf(tmp_path)
     result = _inspect(tmp_path)
     assert result["changed_or_unsafe"] == [str(path)]
     assert path.read_bytes() == b"file-bytes"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="native Windows reparse validation")
+def test_windows_lease_symlink_is_rejected_without_touching_target(tmp_path):
+    artifact = tmp_path / (".x.tmp-" + HEX + ".gguf")
+    target = tmp_path / "lease-target"
+    target.write_bytes(b"unchanged")
+    lease_path = artifact.with_name(artifact.name + ".lease")
+    try:
+        lease_path.symlink_to(target)
+    except OSError as exc:
+        pytest.skip(f"Windows runner cannot create symlink fixture: {exc}")
+    with pytest.raises((OSError, RuntimeError), match="reparse|safe|normal"):
+        editing.ArtifactLease(artifact).acquire()
+    assert lease_path.is_symlink()
+    assert target.read_bytes() == b"unchanged"

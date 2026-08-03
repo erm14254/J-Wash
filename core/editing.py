@@ -70,6 +70,57 @@ def _open_windows_lease(path, *, create):
     return open_handle(3), False  # OPEN_EXISTING
 
 
+def _validate_windows_lease_file(file):
+    """Return the structural identity of an ordinary disk-file handle."""
+    import ctypes
+    import msvcrt
+
+    class BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", ctypes.c_uint32),
+            ("ftCreationTimeLow", ctypes.c_uint32),
+            ("ftCreationTimeHigh", ctypes.c_uint32),
+            ("ftLastAccessTimeLow", ctypes.c_uint32),
+            ("ftLastAccessTimeHigh", ctypes.c_uint32),
+            ("ftLastWriteTimeLow", ctypes.c_uint32),
+            ("ftLastWriteTimeHigh", ctypes.c_uint32),
+            ("dwVolumeSerialNumber", ctypes.c_uint32),
+            ("nFileSizeHigh", ctypes.c_uint32),
+            ("nFileSizeLow", ctypes.c_uint32),
+            ("nNumberOfLinks", ctypes.c_uint32),
+            ("nFileIndexHigh", ctypes.c_uint32),
+            ("nFileIndexLow", ctypes.c_uint32),
+        ]
+
+    handle = msvcrt.get_osfhandle(file.fileno())
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    if kernel32.GetFileType(ctypes.c_void_p(handle)) != 1:  # FILE_TYPE_DISK
+        raise RuntimeError("temporary artifact lease is not a normal disk file")
+    info = BY_HANDLE_FILE_INFORMATION()
+    if not kernel32.GetFileInformationByHandle(
+        ctypes.c_void_p(handle), ctypes.byref(info)
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    unsafe = 0x10 | 0x400  # FILE_ATTRIBUTE_DIRECTORY | REPARSE_POINT
+    if info.dwFileAttributes & unsafe:
+        raise RuntimeError("temporary artifact lease is a directory or reparse point")
+    return (
+        info.dwVolumeSerialNumber,
+        (info.nFileIndexHigh << 32) | info.nFileIndexLow,
+        info.dwFileAttributes & unsafe,
+    )
+
+
+def _validate_acquired_lease_file(file):
+    """Final fallible lease validation, kept separate for deterministic tests."""
+    if os.name == "nt":
+        return _validate_windows_lease_file(file)
+    current = os.fstat(file.fileno())
+    if _stat_is_link_or_reparse(current) or not stat.S_ISREG(current.st_mode):
+        raise RuntimeError("temporary artifact lease is not a safe regular file")
+    return _stat_identity(current)
+
+
 def internal_temp_leaf_kind(name):
     """Classify exact J-Wash temporary/lease leaf names."""
     artifact_name = name[:-6] if name.endswith(".lease") else name
@@ -120,6 +171,14 @@ class ArtifactLease:
                             0o600, dir_fd=parent_fd,
                         )
                         created = True
+                        created_stat = os.fstat(fd)
+                        if (
+                            _stat_is_link_or_reparse(created_stat)
+                            or not stat.S_ISREG(created_stat.st_mode)
+                        ):
+                            raise RuntimeError(
+                                "new temporary artifact lease is not a safe regular file"
+                            )
                     except FileExistsError:
                         before = os.stat(
                             open_path, dir_fd=parent_fd, follow_symlinks=False,
@@ -151,6 +210,8 @@ class ArtifactLease:
             file = os.fdopen(fd, "r+b")
             fd = None
             if os.name == "nt":
+                _validate_windows_lease_file(file)
+            if os.name == "nt":
                 file.seek(0, os.SEEK_END)
             if os.name == "nt" and file.tell() == 0:
                 file.write(b"0")
@@ -179,14 +240,16 @@ class ArtifactLease:
                     file.close()
                     file = None
                     return False
-            self._file = file
+            identity = _validate_acquired_lease_file(file)
             # POSIX release never removes the persistent lease, so it does not
             # retain a parent descriptor for the export lifetime.
             if parent_fd is not None:
                 os.close(parent_fd)
                 parent_fd = None
             self._parent_fd = None
-            self._identity = _candidate_identity(os.fstat(file.fileno()))
+            # Publish object state only after every fallible validation succeeds.
+            self._file = file
+            self._identity = identity
             self._created = created
             return True
         except Exception:
@@ -433,7 +496,9 @@ class _AnchoredCleanupParent:
     def stat_leaf(self, leaf, expected_identity=None, *, full=False):
         current = os.stat(leaf, dir_fd=self.parent_fd, follow_symlinks=False)
         if _stat_is_link_or_reparse(current):
-            raise _UnsafeAnchoredCleanup("temporary artifact became a link/reparse point")
+            raise _UnsafeAnchoredCleanup(
+                "temporary artifact changed or became a link/reparse point"
+            )
         expected_type = stat.S_ISDIR if self.candidate.kind == "directory" else stat.S_ISREG
         if not expected_type(current.st_mode):
             raise _UnsafeAnchoredCleanup("temporary artifact type changed")
@@ -542,8 +607,36 @@ def _newest_lstat_mtime(path, kind):
     return newest
 
 
+@dataclass
+class _LeaseProbe:
+    """Descriptor-backed proof returned by a safe existing-lease probe."""
+
+    held: bool
+    fd: int
+    identity: tuple
+    locked_by_us: bool = False
+
+    def close(self):
+        if self.fd is None:
+            return
+        fd, self.fd = self.fd, None
+        try:
+            if self.locked_by_us:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+
 def _inspect_existing_lease(anchored, lease_leaf):
-    """Return True when an existing POSIX lease is held by another process."""
+    """Return a retained descriptor proof for an existing POSIX lease."""
     if os.name == "nt":
         raise _UnsafeAnchoredCleanup(
             "safe handle-relative lease inspection is unavailable on Windows"
@@ -554,17 +647,46 @@ def _inspect_existing_lease(anchored, lease_leaf):
     flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     fd = os.open(lease_leaf, flags, dir_fd=anchored.parent_fd)
     try:
-        if _candidate_identity(os.fstat(fd)) != _candidate_identity(lease_stat):
+        opened = os.fstat(fd)
+        if _stat_identity(opened) != _stat_identity(lease_stat):
             raise _UnsafeAnchoredCleanup("temporary artifact lease changed during inspection")
         import fcntl
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return True
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        return False
+            proof = _LeaseProbe(True, fd, _stat_identity(opened))
+        else:
+            proof = _LeaseProbe(False, fd, _stat_identity(opened), locked_by_us=True)
+        fd = None
+        return proof
     finally:
-        os.close(fd)
+        if fd is not None:
+            os.close(fd)
+
+
+def _validate_active_lease_proof(
+    *, root_chain, candidate, anchored, lease_leaf, proof
+):
+    """Validate immutable path structure before reporting a held lease active."""
+    _revalidate_directory_chain(root_chain)
+    _revalidate_directory_chain(candidate.parent_chain)
+    current = anchored.stat_leaf(candidate.path.name)
+    if _stat_identity(current) != candidate.identity[:5]:
+        raise _UnsafeAnchoredCleanup(
+            "temporary artifact structural identity changed during lease inspection"
+        )
+    lease_entry = os.stat(
+        lease_leaf, dir_fd=anchored.parent_fd, follow_symlinks=False,
+    )
+    if (
+        _stat_is_link_or_reparse(lease_entry)
+        or not stat.S_ISREG(lease_entry.st_mode)
+        or _stat_identity(lease_entry) != proof.identity
+        or _stat_identity(os.fstat(proof.fd)) != proof.identity
+    ):
+        raise _UnsafeAnchoredCleanup(
+            "temporary artifact lease changed during active classification"
+        )
 
 
 def inspect_abandoned_export_temps(
@@ -659,9 +781,19 @@ def inspect_abandoned_export_temps(
                     has_lease = False
                 else:
                     has_lease = True
-                    if _inspect_existing_lease(anchored, lease_leaf):
-                        classify("active", path)
-                        continue
+                    with _inspect_existing_lease(anchored, lease_leaf) as lease_proof:
+                        if lease_proof.held:
+                            if observer:
+                                observer("after_held_lease_probe", path)
+                            _validate_active_lease_proof(
+                                root_chain=root_chain,
+                                candidate=candidate,
+                                anchored=anchored,
+                                lease_leaf=lease_leaf,
+                                proof=lease_proof,
+                            )
+                            classify("active", path)
+                            continue
 
                 # An active writer may legitimately change size/timestamps.
                 # Once an existing lease is known to be unlocked (or absent),

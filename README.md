@@ -344,6 +344,9 @@ reports legacy artifacts inactive for at least 24 hours as abandoned, while
 preserving them, active leased exports, completed exports, and cached HF
 checkpoints. Ambiguous or concurrently changed objects fail closed; Windows also
 preserves candidates when exact handle-relative inspection is unavailable.
+Held leases count as active only after the candidate, parent chain, and lease
+entry still match their verified structural identities; ordinary in-place writes
+to an active temporary artifact may change its size and timestamps.
 Destructive offline maintenance is intentionally deferred. POSIX lease files are
 intentionally persistent and reusable because portable POSIX APIs cannot safely
 unlink only a previously verified inode; an unlocked lease does not mean an
