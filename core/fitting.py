@@ -397,10 +397,10 @@ class FitManager:
 
             self._update(run, phase="merge")
             self._check_cancelled(run)
-            partials = [
-                JacobianLens.load(str(job_dir / f"lens{i}.pt"))
-                for i in range(len(slices))
-            ]
+            partials = []
+            for i in range(len(slices)):
+                self._check_cancelled(run)
+                partials.append(JacobianLens.load(str(job_dir / f"lens{i}.pt")))
             self._check_cancelled(run)
             merged = JacobianLens.merge(partials) if len(partials) > 1 else partials[0]
             if params.get("continue_from"):
@@ -413,6 +413,7 @@ class FitManager:
                         f"{merged.source_layers[0]}..{merged.source_layers[-1]})"
                     )
                 # weighted average by n_prompts = equivalent to a fit over the union
+                self._check_cancelled(run)
                 merged = JacobianLens.merge([base_lens, merged])
             self._check_cancelled(run)
             out_dir = config.LENSES_DIR / name
@@ -445,6 +446,7 @@ class FitManager:
                 "created_at": _now(),
                 "fit_seconds": round(self._clock() - started, 1),
             }
+            self._check_cancelled(run)
             (out_dir / "meta.json").write_text(
                 json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8"
             )
@@ -467,8 +469,9 @@ class FitManager:
                     if proc.poll() is None:
                         proc.terminate()
             for proc in run.processes:
-                if proc.poll() is None:
-                    proc.wait()
+                # ``wait`` is required even when terminate made ``poll`` turn
+                # non-None immediately: the child still needs to be reaped.
+                proc.wait()
             heartbeat = run.heartbeat_thread
             if heartbeat is not None and heartbeat is not threading.current_thread():
                 heartbeat.join()
@@ -490,13 +493,14 @@ class FitManager:
             self._heartbeat_once(run, started)
 
     def _heartbeat_once(self, run, started):
-        if not self._owns(run):
-            return
-        elapsed = round(self._clock() - started, 1)
-        self.state["elapsed"] = elapsed
-        for worker in self.state.get("workers", []):
-            if worker.get("state") in ("loading", "fitting"):
-                worker["elapsed"] = elapsed
+        with self._lock:
+            if self._active_run is not run or run.cancel.is_set():
+                return
+            elapsed = round(self._clock() - started, 1)
+            self.state["elapsed"] = elapsed
+            for worker in self.state.get("workers", []):
+                if worker.get("state") in ("loading", "fitting"):
+                    worker["elapsed"] = elapsed
         self._emit()
 
     def _read_worker(self, run, proc, worker_state, started):
@@ -513,31 +517,42 @@ class FitManager:
             self._handle_worker_event(run, event, worker_state, started)
 
     def _handle_worker_event(self, run, event, worker_state, started):
-        if not self._owns(run):
-            return
-        if event["event"] == "loading":
-            worker_state["state"] = "loading"
-        elif event["event"] == "fitting":
-            worker_state["state"] = "fitting"
-            self.state["phase"] = "fitting"
-        elif event["event"] in ("progress", "resume"):
-            if not isinstance(event.get("done"), int) or not isinstance(event.get("total"), int):
+        with self._lock:
+            if self._active_run is not run or run.cancel.is_set():
                 return
-            worker_state["state"] = "fitting"
-            self.state["phase"] = "fitting"
-            worker_state["done"] = event["done"]
-            worker_state["total"] = event["total"]
-            worker_state["elapsed"] = round(self._clock() - started, 1)
-            if event["event"] == "progress":
-                hist = worker_state.setdefault("hist", [])
-                hist.append([worker_state["done"], worker_state["elapsed"]])
-                del hist[:-10]
-        elif event["event"] == "done":
-            worker_state["state"] = "done"
-            worker_state["done"] = worker_state["total"]
-        else:
-            return
-        self._refresh_totals(recalculate_eta=event["event"] == "progress")
+            if event["event"] == "loading":
+                worker_state["state"] = "loading"
+            elif event["event"] == "fitting":
+                worker_state["state"] = "fitting"
+                self.state["phase"] = "fitting"
+            elif event["event"] in ("progress", "resume"):
+                done = event.get("done")
+                total = event.get("total")
+                if (
+                    not isinstance(done, int)
+                    or isinstance(done, bool)
+                    or not isinstance(total, int)
+                    or isinstance(total, bool)
+                    or done < 0
+                    or total < 0
+                    or done > total
+                ):
+                    return
+                worker_state["state"] = "fitting"
+                self.state["phase"] = "fitting"
+                worker_state["done"] = done
+                worker_state["total"] = total
+                worker_state["elapsed"] = round(self._clock() - started, 1)
+                if event["event"] == "progress":
+                    hist = worker_state.setdefault("hist", [])
+                    hist.append([done, worker_state["elapsed"]])
+                    del hist[:-10]
+            elif event["event"] == "done":
+                worker_state["state"] = "done"
+                worker_state["done"] = worker_state["total"]
+            else:
+                return
+            self._refresh_totals(recalculate_eta=event["event"] == "progress")
         self._emit()
 
     def _refresh_totals(self, *, recalculate_eta=True):

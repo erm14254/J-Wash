@@ -188,6 +188,12 @@ def test_old_run_cannot_mutate_new_run():
         _wait(attempt)
         assert not manager._update(old, state="error", name="old")
         manager._heartbeat_once(old, 0)
+        manager._handle_worker_event(
+            old,
+            {"event": "progress", "done": 1, "total": 1},
+            _worker(total=1),
+            0,
+        )
         finished.set()
 
     thread = threading.Thread(target=late_old_update)
@@ -200,6 +206,23 @@ def test_old_run_cannot_mutate_new_run():
     _wait(finished)
     thread.join()
     assert manager.state == {"state": "running", "name": "new"}
+
+
+def test_cancelled_run_ignores_late_worker_and_heartbeat_updates():
+    manager, run = _eta_manager(lambda: 20.0)
+    worker = manager.state["workers"][0]
+    manager.state["state"] = "stopping"
+    run.cancel.set()
+
+    manager._handle_worker_event(
+        run, {"event": "progress", "done": 1, "total": 3}, worker, 0
+    )
+    manager._heartbeat_once(run, 0)
+
+    assert manager.state["state"] == "stopping"
+    assert manager.state["done"] == worker["done"] == 0
+    assert worker["hist"] == []
+    assert "elapsed" not in manager.state
 
 
 @pytest.mark.parametrize("outcome", ["success", "error", "stop"])
@@ -343,7 +366,15 @@ def test_eta_multiple_workers_uses_slowest_remaining_worker():
 
 @pytest.mark.parametrize(
     "line",
-    ["not json\n", "[]\n", "{}\n", '{"event":"other"}\n', '{"event":"progress","done":"one"}\n'],
+    [
+        "not json\n",
+        "[]\n",
+        "{}\n",
+        '{"event":"other"}\n',
+        '{"event":"progress","done":"one"}\n',
+        '{"event":"progress","done":true,"total":3}\n',
+        '{"event":"progress","done":4,"total":3}\n',
+    ],
 )
 def test_worker_output_parser_ignores_malformed_or_unrelated_lines(line):
     manager, run = _eta_manager(lambda: 12.0)
