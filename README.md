@@ -342,7 +342,11 @@ leave hidden transaction artifacts; at startup J-Wash removes only recognized
 abandoned export staging directories and GGUF temporary files. Active artifacts
 leased by another J-Wash process are preserved, as are completed exports and
 cached HF checkpoints. Legacy temporary artifacts without a lease are retained
-until they have been inactive for 24 hours. (llama.cpp's converter
+until they have been inactive for 24 hours.
+Cleanup deletion is anchored to no-follow directory descriptors on POSIX. On
+Windows, artifacts are preserved when equivalent safe handle-relative deletion
+is unavailable; ordinary per-export cleanup still runs when the exporting
+process exits normally. (llama.cpp's converter
 may need extra pip packages for some tokenizers, e.g. `sentencepiece` for
 Gemma - the error shows up in the UI if so.)
 

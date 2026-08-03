@@ -24,6 +24,7 @@ PRESETS_DIR = config.DATA_DIR / "presets"
 DEFAULT_TEMP_STALE_AGE = 24 * 60 * 60
 _TEMP_STAGE_RE = re.compile(r"^\..+\.tmp-[0-9a-f]{32}$")
 _TEMP_GGUF_RE = re.compile(r"^\..+\.tmp-[0-9a-f]{32}\.gguf$")
+_RMTREE_DIR_FD_SAFE = bool(getattr(shutil.rmtree, "avoids_symlink_attacks", False))
 
 
 def internal_temp_leaf_kind(name):
@@ -222,6 +223,117 @@ class _TempCandidate:
     parent_chain: tuple
 
 
+class _UnsafeAnchoredCleanup(RuntimeError):
+    """Raised when the platform cannot safely anchor a destructive cleanup."""
+
+
+class _AnchoredCleanupParent:
+    """Descriptor-relative owner of one candidate's final POSIX operations.
+
+    The descriptor chain is opened without following links and kept alive from
+    the authoritative candidate check through claim verification and deletion.
+    Windows deliberately fails closed until equivalent handle-relative recursive
+    deletion is available.
+    """
+
+    def __init__(self, candidate):
+        self.candidate = candidate
+        self.parent_fd = None
+        self._fds = []
+
+    def __enter__(self):
+        if os.name == "nt":
+            raise _UnsafeAnchoredCleanup(
+                "safe handle-relative temporary cleanup is unavailable on Windows"
+            )
+        flags = (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        )
+        snapshots = self.candidate.parent_chain
+        try:
+            if not snapshots:
+                raise _UnsafeAnchoredCleanup("candidate has no validated parent chain")
+            anchor, expected = snapshots[0]
+            fd = os.open(anchor, flags)
+            self._fds.append(fd)
+            self._verify_fd(fd, expected, anchor)
+            for component, expected in snapshots[1:]:
+                next_fd = os.open(component.name, flags, dir_fd=fd)
+                self._fds.append(next_fd)
+                self._verify_fd(next_fd, expected, component)
+                fd = next_fd
+            self.parent_fd = fd
+            self.stat_leaf(self.candidate.path.name, self.candidate.identity)
+            return self
+        except Exception as exc:
+            self.__exit__(None, None, None)
+            if isinstance(exc, _UnsafeAnchoredCleanup):
+                raise
+            raise _UnsafeAnchoredCleanup(
+                f"cannot safely anchor cleanup parent: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _verify_fd(fd, expected, display):
+        current = os.fstat(fd)
+        if _stat_identity(current) != expected or not stat.S_ISDIR(current.st_mode):
+            raise _UnsafeAnchoredCleanup(f"cleanup parent changed: {display}")
+
+    def stat_leaf(self, leaf, expected_identity=None, *, full=False):
+        current = os.stat(leaf, dir_fd=self.parent_fd, follow_symlinks=False)
+        if _is_link_or_reparse(Path(leaf), current):
+            raise _UnsafeAnchoredCleanup("temporary artifact became a link/reparse point")
+        expected_type = stat.S_ISDIR if self.candidate.kind == "directory" else stat.S_ISREG
+        if not expected_type(current.st_mode):
+            raise _UnsafeAnchoredCleanup("temporary artifact type changed")
+        if expected_identity is not None:
+            actual = _candidate_identity(current) if full else _stat_identity(current)
+            expected = expected_identity if full else expected_identity[:5]
+            if actual != expected:
+                raise _UnsafeAnchoredCleanup("temporary artifact identity changed")
+        return current
+
+    def claim(self, claim_leaf):
+        os.replace(
+            self.candidate.path.name, claim_leaf,
+            src_dir_fd=self.parent_fd, dst_dir_fd=self.parent_fd,
+        )
+        current = self.stat_leaf(claim_leaf, self.candidate.identity)
+        return _candidate_identity(current)
+
+    def restore(self, claim_leaf, claim_identity):
+        self.stat_leaf(claim_leaf, claim_identity, full=True)
+        try:
+            os.stat(self.candidate.path.name, dir_fd=self.parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            os.replace(
+                claim_leaf, self.candidate.path.name,
+                src_dir_fd=self.parent_fd, dst_dir_fd=self.parent_fd,
+            )
+
+    def delete(self, claim_leaf, claim_identity):
+        self.stat_leaf(claim_leaf, claim_identity, full=True)
+        if self.candidate.kind == "file":
+            os.unlink(claim_leaf, dir_fd=self.parent_fd)
+            return
+        if not _RMTREE_DIR_FD_SAFE:
+            raise _UnsafeAnchoredCleanup(
+                "descriptor-relative symlink-resistant directory deletion is unavailable"
+            )
+        shutil.rmtree(claim_leaf, dir_fd=self.parent_fd)
+
+    def __exit__(self, exc_type, exc, tb):
+        for fd in reversed(self._fds):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self._fds.clear()
+        self.parent_fd = None
+        return False
+
+
 def _revalidate_candidate(candidate):
     _revalidate_directory_chain(candidate.parent_chain)
     current = candidate.path.lstat()
@@ -348,6 +460,7 @@ def cleanup_abandoned_export_temps(
         lease = ArtifactLease(path, create=False)
         acquired = False
         claimed = None
+        anchored = None
         try:
             _revalidate_directory_chain(root_chain)
             path.relative_to(root)
@@ -411,37 +524,32 @@ def cleanup_abandoned_export_temps(
             else:
                 stem = path.name.split(".tmp-", 1)[0].lstrip(".")
                 claimed = path.with_name(f".{stem}.tmp-{claim_uuid}.gguf")
-            path.replace(claimed)
-            claimed_stat = claimed.lstat()
-            if (
-                _is_link_or_reparse(claimed, claimed_stat)
-                or _stat_identity(claimed_stat) != candidate.identity[:5]
-            ):
+            if observer:
+                observer("before_anchored_claim", path)
+            with _AnchoredCleanupParent(candidate) as anchored:
+                claim_identity = anchored.claim(claimed.name)
+                if observer:
+                    observer("before_delete", (path, claimed))
                 try:
-                    if not path.exists() and not path.is_symlink():
-                        claimed.replace(path)
-                finally:
-                    claimed = None
-                raise ValueError("claimed temporary artifact identity changed")
-            if kind == "directory":
-                shutil.rmtree(claimed)
-            else:
-                claimed.unlink()
+                    anchored.delete(claimed.name, claim_identity)
+                except Exception:
+                    try:
+                        anchored.restore(claimed.name, claim_identity)
+                        claimed = None
+                    except Exception:
+                        # A changed claim is intentionally left untouched.
+                        pass
+                    raise
             claimed = None
+            anchored = None
             result["removed"].append(str(path))
             result["removed_count"] += 1
         except Exception as exc:
-            if claimed is not None:
-                try:
-                    if not path.exists() and not path.is_symlink():
-                        claimed.replace(path)
-                        claimed = None
-                except OSError as restore_exc:
-                    result["errors"].append({
-                        "path": str(claimed),
-                        "error": f"cannot restore cleanup claim: {restore_exc}",
-                    })
-            if "changed" in str(exc) or "cleanup root chain" in str(exc):
+            if (
+                isinstance(exc, _UnsafeAnchoredCleanup)
+                or "changed" in str(exc)
+                or "cleanup root chain" in str(exc)
+            ):
                 result["skipped_changed"].append(str(path))
             result["errors"].append({"path": str(path), "error": str(exc)})
         finally:

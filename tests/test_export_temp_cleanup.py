@@ -12,6 +12,10 @@ from core import editing
 HEX = "a" * 32
 OLD = 1_000.0
 NOW = OLD + editing.DEFAULT_TEMP_STALE_AGE + 10
+requires_anchored_deletion = pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows cleanup intentionally fails closed without handle-relative deletion",
+)
 
 
 def _mtime(path, value=OLD):
@@ -46,6 +50,7 @@ def _hold_artifact_lease(path, connection):
     connection.close()
 
 
+@requires_anchored_deletion
 def test_removes_old_recognized_legacy_staging_directory(tmp_path):
     path = _stage(tmp_path)
     result = _cleanup(tmp_path)
@@ -54,6 +59,7 @@ def test_removes_old_recognized_legacy_staging_directory(tmp_path):
     assert result["removed_count"] == 1
 
 
+@requires_anchored_deletion
 def test_removes_old_recognized_legacy_gguf_file(tmp_path):
     path = _gguf(tmp_path)
     assert _cleanup(tmp_path)["removed"] == [str(path)]
@@ -97,6 +103,7 @@ def test_preserves_completed_outputs_and_hf_cache(tmp_path):
     assert result["removed_count"] == 0
 
 
+@requires_anchored_deletion
 def test_nested_export_temporary_is_cleaned(tmp_path):
     path = _stage(tmp_path / "outer" / "inner")
     assert _cleanup(tmp_path)["removed"] == [str(path)]
@@ -116,6 +123,7 @@ def test_matching_symlinks_are_never_followed_or_deleted(tmp_path):
     assert link.is_symlink() and sentinel.read_text() == "keep"
 
 
+@requires_anchored_deletion
 def test_candidate_cleanup_never_resolves_leaf(tmp_path, monkeypatch):
     path = _stage(tmp_path)
     original = Path.resolve
@@ -128,6 +136,7 @@ def test_candidate_cleanup_never_resolves_leaf(tmp_path, monkeypatch):
     assert result["removed"] == [str(path)]
 
 
+@requires_anchored_deletion
 def test_one_deletion_error_does_not_stop_other_cleanup(tmp_path, monkeypatch):
     bad = _stage(tmp_path, f".bad.tmp-{HEX}")
     good = _stage(tmp_path, f".good.tmp-{'b' * 32}")
@@ -155,6 +164,7 @@ def test_newest_contained_activity_controls_legacy_staleness(tmp_path):
     assert path.exists() and result["skipped_recent"] == [str(path)]
 
 
+@requires_anchored_deletion
 def test_cleanup_skips_held_lease_then_removes_released_artifact(tmp_path):
     path = _stage(tmp_path, mtime=NOW)
     lease = editing.ArtifactLease(path)
@@ -263,6 +273,7 @@ def test_symlinked_cleanup_root_ancestor_is_refused(tmp_path):
     assert "symlink or junction/reparse" in result["errors"][0]["error"]
 
 
+@requires_anchored_deletion
 def test_real_cleanup_root_ancestor_chain_is_accepted(tmp_path):
     root = tmp_path / "one" / "two" / "edits"
     root.mkdir(parents=True)
@@ -360,6 +371,156 @@ def test_candidate_swap_immediately_before_claim_is_preserved(tmp_path):
     assert str(candidate) not in result["removed"]
 
 
+@pytest.mark.parametrize("kind", ["file", "directory"])
+def test_parent_replacement_before_anchored_claim_is_fail_closed(tmp_path, kind):
+    parent = tmp_path / "nested"
+    candidate = _gguf(parent) if kind == "file" else _stage(parent)
+    moved = tmp_path / "moved"
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    sentinel = replacement / "sentinel"
+    sentinel.write_text("keep")
+
+    def observer(phase, _value):
+        if phase == "before_anchored_claim":
+            parent.rename(moved)
+            parent.symlink_to(replacement, target_is_directory=True)
+
+    try:
+        result = editing.cleanup_abandoned_export_temps(
+            root=tmp_path, now=NOW, observer=observer,
+        )
+    except (OSError, NotImplementedError):
+        pytest.skip("directory symlinks are unavailable")
+    assert (moved / candidate.name).exists()
+    assert parent.is_symlink() and sentinel.read_text() == "keep"
+    assert str(candidate) not in result["removed"]
+    assert str(candidate) in result["skipped_changed"]
+
+
+@pytest.mark.parametrize("kind", ["file", "directory"])
+def test_claim_replacement_before_delete_is_preserved(tmp_path, kind):
+    candidate = _gguf(tmp_path) if kind == "file" else _stage(tmp_path)
+    target = tmp_path / "safe-target"
+    if kind == "file":
+        target.write_bytes(b"safe")
+    else:
+        target.mkdir()
+        (target / "sentinel").write_text("safe")
+    moved_claim = tmp_path / "original-claim"
+    replacement = {}
+
+    def observer(phase, value):
+        if phase != "before_delete":
+            return
+        _, claim = value
+        claim.rename(moved_claim)
+        claim.symlink_to(target, target_is_directory=kind == "directory")
+        replacement["path"] = claim
+
+    try:
+        result = editing.cleanup_abandoned_export_temps(
+            root=tmp_path, now=NOW, observer=observer,
+        )
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are unavailable")
+    assert moved_claim.exists()
+    assert replacement["path"].is_symlink()
+    assert target.exists()
+    assert str(candidate) not in result["removed"]
+    assert str(candidate) in result["skipped_changed"]
+
+
+def test_claim_changed_to_different_inode_is_not_deleted(tmp_path):
+    candidate = _gguf(tmp_path)
+    moved_claim = tmp_path / "original-claim"
+    replacement = {}
+
+    def observer(phase, value):
+        if phase == "before_delete":
+            _, claim = value
+            claim.rename(moved_claim)
+            claim.write_bytes(b"replacement")
+            replacement["path"] = claim
+
+    result = editing.cleanup_abandoned_export_temps(
+        root=tmp_path, now=NOW, observer=observer,
+    )
+    assert moved_claim.read_bytes() == b"partial"
+    assert replacement["path"].read_bytes() == b"replacement"
+    assert str(candidate) not in result["removed"]
+
+
+def test_claim_metadata_change_is_not_deleted(tmp_path):
+    candidate = _gguf(tmp_path)
+    claim_path = {}
+
+    def observer(phase, value):
+        if phase == "before_delete":
+            _, claim = value
+            claim.write_bytes(b"changed during claim")
+            claim_path["path"] = claim
+
+    result = editing.cleanup_abandoned_export_temps(
+        root=tmp_path, now=NOW, observer=observer,
+    )
+    assert claim_path["path"].read_bytes() == b"changed during claim"
+    assert str(candidate) not in result["removed"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor anchoring regression")
+def test_parent_move_after_anchor_stays_attached_to_verified_directory(tmp_path):
+    parent = tmp_path / "nested"
+    candidate = _gguf(parent)
+    moved = tmp_path / "moved"
+    replacement = tmp_path / "replacement"
+    replacement.mkdir()
+    sentinel = replacement / "sentinel"
+    sentinel.write_text("keep")
+
+    def observer(phase, _value):
+        if phase == "before_delete":
+            parent.rename(moved)
+            parent.symlink_to(replacement, target_is_directory=True)
+
+    try:
+        result = editing.cleanup_abandoned_export_temps(
+            root=tmp_path, now=NOW, observer=observer,
+        )
+    except (OSError, NotImplementedError):
+        pytest.skip("directory symlinks are unavailable")
+    assert result["removed"] == [str(candidate)]
+    assert parent.is_symlink() and sentinel.read_text() == "keep"
+    assert not (moved / candidate.name).exists()
+    assert not any(editing.internal_temp_leaf_kind(path.name) for path in moved.iterdir())
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX dir_fd regression")
+def test_final_cleanup_uses_descriptor_relative_operations(tmp_path, monkeypatch):
+    directory = _stage(tmp_path, f".dir.tmp-{'b' * 32}")
+    file = _gguf(tmp_path)
+
+    monkeypatch.setattr(
+        Path, "replace",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Path.replace used")),
+    )
+    monkeypatch.setattr(
+        Path, "unlink",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Path.unlink used")),
+    )
+    original_rmtree = editing.shutil.rmtree
+
+    def anchored_rmtree(path, *args, **kwargs):
+        assert kwargs.get("dir_fd") is not None
+        assert not os.path.isabs(os.fspath(path))
+        return original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(editing.shutil, "rmtree", anchored_rmtree)
+    result = _cleanup(tmp_path)
+    assert result["removed_count"] == 2
+    assert not directory.exists() and not file.exists()
+
+
 def test_completion_marker_replaced_by_symlink_is_fail_closed(tmp_path):
     candidate = _stage(tmp_path)
     marker = candidate / "edit_meta.json"
@@ -446,6 +607,7 @@ def test_legacy_completed_colliding_export_is_preserved(tmp_path):
     assert sentinel.read_text() == "{}"
 
 
+@requires_anchored_deletion
 def test_abandoned_stage_with_final_name_marker_is_removed(tmp_path):
     path = _stage(tmp_path)
     marker = path / "edit_meta.json"
@@ -544,10 +706,25 @@ def test_cross_process_lease_protects_active_artifact(tmp_path):
         child.join(timeout=10)
         assert child.exitcode == 0
         second = _cleanup(tmp_path)
-        assert second["removed"] == [str(artifact)] and not artifact.exists()
+        if os.name == "nt":
+            assert artifact.exists()
+            assert second["removed"] == []
+            assert "handle-relative" in second["errors"][0]["error"]
+        else:
+            assert second["removed"] == [str(artifact)] and not artifact.exists()
     finally:
         parent.close()
         child_connection.close()
         if child.is_alive():
             child.kill()
             child.join()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows fail-closed regression")
+def test_windows_cleanup_without_handle_relative_deletion_fails_closed(tmp_path):
+    artifact = _gguf(tmp_path)
+    result = _cleanup(tmp_path)
+    assert artifact.exists()
+    assert result["removed"] == []
+    assert result["skipped_changed"] == [str(artifact)]
+    assert "handle-relative" in result["errors"][0]["error"]
