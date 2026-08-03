@@ -556,6 +556,8 @@ def cleanup_abandoned_export_temps(
                             # before treating the marker as authoritative or falling
                             # through to pathname-based legacy activity inspection.
                             _revalidate_candidate(candidate)
+                        except _UnsafeAnchoredCleanup:
+                            raise
                         except Exception as exc:
                             raise ValueError(f"cannot inspect possible completion marker: {exc}") from exc
                         relative_name = path.relative_to(root).as_posix()

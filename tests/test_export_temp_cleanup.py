@@ -783,6 +783,10 @@ def test_windows_cleanup_without_handle_relative_deletion_fails_closed(tmp_path,
         hf.mkdir()
         sentinel = hf / "config.json"
     sentinel.write_text("keep")
+    if kind == "directory":
+        _mtime(sentinel, OLD)
+        _mtime(hf, OLD)
+        _mtime(artifact, OLD)
     observed = []
     result = _cleanup(tmp_path, observer=lambda phase, value: observed.append(phase))
     assert artifact.exists()
