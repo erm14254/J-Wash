@@ -42,7 +42,7 @@ class ProgressHandler(logging.Handler):
             )
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
     parser.add_argument("--device", required=True)
@@ -51,10 +51,10 @@ def main():
     parser.add_argument("--prompts", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--out", required=True)
-    parser.add_argument("--dim-batch", type=int, default=8)
+    parser.add_argument("--dim-batch", type=int, required=True)
     parser.add_argument("--max-seq-len", type=int, default=128)
     parser.add_argument("--source-layers", default=None)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.INFO, handlers=[ProgressHandler()])
 
@@ -84,6 +84,10 @@ def main():
     n_src = len(source_layers) if source_layers else model.n_layers - 1
     ckpt_bytes = n_src * model.d_model**2 * 4
     checkpoint_every = max(1, round(ckpt_bytes / 150e6))
+    print(
+        json.dumps({"event": "fitting", "total": len(prompts)}),
+        flush=True,
+    )
     lens = jlens.fit(
         model,
         prompts,
@@ -97,4 +101,5 @@ def main():
     print(json.dumps({"event": "done", "out": args.out, "n_prompts": lens.n_prompts}), flush=True)
 
 
-main()
+if __name__ == "__main__":
+    main()

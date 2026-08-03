@@ -1,10 +1,12 @@
 import hashlib
 import json
+import math
 import re
 import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from jlens.lens import JacobianLens
@@ -135,12 +137,16 @@ def _load_corpus(datasets, n, skip=0):
     random.Random(_SAMPLE_SEED).shuffle(prompts)
     return prompts
 
+def dim_batch_for_vram(vram_bytes):
+    """Return the conservative automatic dimension batch for VRAM bytes."""
+    return 4 if vram_bytes >= 15 * 2**30 else 2
+
+
 def _default_dim_batch(device):
-    """Default dim_batch scaled to the device's VRAM.
-    Measured on a 4B bf16 fit: 8 fits in 16 GB, 4 in 12 GB."""
+    """Resolve automatic ``dim_batch`` from the selected device's VRAM."""
     try:
         total = gpu_stats()[int(device.split(":")[1])]["vram_total"]
-        return 4 if total >= 15 * 2**30 else 2
+        return dim_batch_for_vram(total)
     except Exception:
         return 1
 
@@ -149,10 +155,44 @@ def _now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _finite_number(value):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+class _FitCancelled(Exception):
+    pass
+
+
+class _FitHelperFailed(Exception):
+    pass
+
+
+@dataclass
+class _FitRun:
+    cancel: threading.Event = field(default_factory=threading.Event)
+    done: threading.Event = field(default_factory=threading.Event)
+    heartbeat_stop: threading.Event = field(default_factory=threading.Event)
+    process_lock: threading.Lock = field(default_factory=threading.Lock)
+    processes: list = field(default_factory=list)
+    helper_threads: list = field(default_factory=list)
+    reader_threads: list = field(default_factory=list)
+    helper_failure: threading.Event = field(default_factory=threading.Event)
+    helper_error: tuple | None = None
+    helper_error_lock: threading.Lock = field(default_factory=threading.Lock)
+    heartbeat_thread: threading.Thread | None = None
+
+
 class FitManager:
-    def __init__(self):
+    def __init__(self, *, clock=time.perf_counter, heartbeat_interval=2.0):
         self._lock = threading.Lock()
-        self._procs = []
+        self._clock = clock
+        self._heartbeat_interval = heartbeat_interval
+        self._active_run = None
         self.state = {"state": "idle"}
         self.on_progress = None
 
@@ -165,7 +205,7 @@ class FitManager:
               max_seq_len=128, source_layers=None, model_revision=None,
               continue_from=None, datasets=(DATASET_WIKITEXT,)):
         with self._lock:
-            if self.state.get("state") == "running":
+            if self._active_run is not None:
                 raise ValueError("a fitting is already in progress")
             if not devices:
                 raise ValueError("at least one device required")
@@ -215,22 +255,159 @@ class FitManager:
                 "params": params,
                 "error": None,
             }
-            self._procs = []
-        threading.Thread(target=self._run, args=(name, params), daemon=True).start()
+            run = _FitRun()
+            self._active_run = run
+        threading.Thread(target=self._run, args=(run, name, params), daemon=True).start()
         return dict(self.state)
 
     def stop(self):
         with self._lock:
-            for proc in self._procs:
+            run = self._active_run
+            if run is None:
+                return dict(self.state)
+            if self.state.get("state") in ("done", "error", "stopped"):
+                return dict(self.state)
+            run.cancel.set()
+            run.heartbeat_stop.set()
+            if self._active_run is run and self.state.get("state") == "running":
+                self.state["state"] = "stopping"
+        with run.process_lock:
+            for proc in run.processes:
                 if proc.poll() is None:
                     proc.terminate()
-            if self.state.get("state") == "running":
-                self.state["state"] = "stopping"
         self._emit()
         return dict(self.state)
 
-    def _run(self, name, params):
+    def _owns(self, run):
+        with self._lock:
+            return self._active_run is run
+
+    def _check_cancelled(self, run):
+        if run.cancel.is_set() or not self._owns(run):
+            raise _FitCancelled()
+
+    def _check_run_viable(self, run):
+        self._check_cancelled(run)
+        if run.helper_failure.is_set():
+            raise _FitHelperFailed()
+
+    @staticmethod
+    def _stop_and_join_heartbeat(run):
+        """Quiesce heartbeat telemetry before any post-worker processing."""
+        run.heartbeat_stop.set()
+        heartbeat = run.heartbeat_thread
+        if heartbeat is not None and heartbeat is not threading.current_thread():
+            heartbeat.join()
+
+    def _record_helper_failure(self, run, source, exc, worker=None):
+        """Record a stream-helper failure and unblock run-owned children."""
+        with run.helper_error_lock:
+            if run.helper_error is not None:
+                return False
+            run.helper_error = (source, worker, exc)
+            run.helper_failure.set()
+        run.heartbeat_stop.set()
+        # Process registration uses the same lock.  A concurrent Popen is either
+        # visible here or observes helper_failure immediately after registration.
+        with run.process_lock:
+            processes = list(run.processes)
+        for proc in processes:
+            self._terminate_after_helper_failure(proc)
+        return True
+
+    @staticmethod
+    def _terminate_after_helper_failure(proc):
+        """Best-effort terminate/kill escalation without waiting or reaping."""
         try:
+            if proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
+        try:
+            # A stream helper has disappeared, so graceful shutdown cannot be
+            # allowed to strand the orchestrator behind a full pipe.
+            if proc.poll() is None and hasattr(proc, "kill"):
+                proc.kill()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _join_run_helpers(run):
+        """Reap children and join helpers without holding the manager lock."""
+        for proc in run.processes:
+            try:
+                proc.wait()
+            except Exception:
+                pass
+        for thread in run.helper_threads:
+            if thread is not threading.current_thread():
+                thread.join()
+
+    def _helper_exception(self, run):
+        with run.helper_error_lock:
+            failure = run.helper_error
+        if failure is None:
+            return None
+        source, worker, exc = failure
+        location = f" for worker {worker}" if worker is not None else ""
+        error = RuntimeError(f"{source} failed{location}: {exc}")
+        error.__cause__ = exc
+        return error
+
+    def _raise_helper_failure(self, run):
+        error = self._helper_exception(run)
+        if error is not None:
+            raise error
+
+    def _quiesce_failed_run(self, run):
+        """Stop and join run-owned resources before publishing a failure."""
+        run.heartbeat_stop.set()
+        with run.process_lock:
+            processes = list(run.processes)
+        for proc in processes:
+            if proc.poll() is None:
+                self._terminate_after_helper_failure(proc)
+        self._join_run_helpers(run)
+        heartbeat = run.heartbeat_thread
+        if heartbeat is not None and heartbeat is not threading.current_thread():
+            heartbeat.join()
+
+    def _publish_preferred_failure(self, run, fallback):
+        """Publish cancel > first helper failure > orchestration failure."""
+        self._quiesce_failed_run(run)
+        error = self._helper_exception(run) or fallback
+        self._publish_terminal(run, error=error)
+
+    def _update(self, run, **changes):
+        with self._lock:
+            if self._active_run is not run:
+                return False
+            self.state.update(changes)
+        self._emit()
+        return True
+
+    def _publish_terminal(self, run, *, success=None, error=None):
+        """Linearize cancellation against terminal state publication."""
+        with self._lock:
+            if self._active_run is not run:
+                return False
+            if run.cancel.is_set():
+                self.state.update(state="stopped", phase="stopped", eta_seconds=None)
+            elif success is not None:
+                self.state.update(success)
+            else:
+                self.state.update(state="error", error=str(error), eta_seconds=None)
+        try:
+            self._emit()
+        except Exception:
+            # Terminal state is already linearized.  A broken observer must not
+            # escape the run thread or prevent identity-checked cleanup.
+            pass
+        return True
+
+    def _run(self, run, name, params):
+        try:
+            self._check_cancelled(run)
             job_dir = FITS_DIR / name
             job_dir.mkdir(parents=True, exist_ok=True)
             corpus_path = job_dir / "corpus.json"
@@ -242,9 +419,11 @@ class FitManager:
                     params["n_prompts"],
                     params.get("skip_prompts", 0),
                 )
+                self._check_cancelled(run)
                 corpus_path.write_text(
                     json.dumps(prompts, ensure_ascii=False), encoding="utf-8"
                 )
+            self._check_cancelled(run)
             devices = params["devices"]
             n = len(prompts)
             if len(devices) == 2:
@@ -253,10 +432,10 @@ class FitManager:
             else:
                 slices = [prompts]
 
-            self.state.update(phase="fitting", total=n)
-            workers = []
-            started = time.perf_counter()
+            started = self._clock()
+            launch_plans = []
             for i, (device, chunk) in enumerate(zip(devices, slices)):
+                self._check_cancelled(run)
                 slice_path = job_dir / f"slice{i}.json"
                 if not slice_path.exists():
                     slice_path.write_text(json.dumps(chunk, ensure_ascii=False), encoding="utf-8")
@@ -276,15 +455,6 @@ class FitManager:
                     cmd += ["--quant", params["quant"]]
                 if params["source_layers"]:
                     cmd += ["--source-layers", json.dumps(params["source_layers"])]
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    cwd=str(config.ROOT),
-                )
-                self._procs.append(proc)
                 worker_state = {
                     "device": device,
                     "done": 0,
@@ -296,47 +466,110 @@ class FitManager:
                     # RECENT pace (throughput can degrade mid-fit, e.g. VRAM
                     # saturated — a global average would then freeze the ETA)
                     "hist": [],
+                    "baseline_done": 0,
+                    "baseline_elapsed": 0.0,
                 }
-                workers.append(worker_state)
-                threading.Thread(
-                    target=self._read_worker, args=(proc, worker_state, started), daemon=True
-                ).start()
-            self.state["workers"] = workers
-            self._emit()
+                launch_plans.append((cmd, worker_state))
 
-            stderr_tails = [""] * len(self._procs)
+            workers = [worker for _, worker in launch_plans]
+            if not self._update(
+                run,
+                phase="loading",
+                workers=workers,
+                total=sum(worker["total"] for worker in workers),
+                done=0,
+                eta_seconds=None,
+            ):
+                raise _FitCancelled()
+
+            for cmd, worker_state in launch_plans:
+                self._check_run_viable(run)
+                with run.process_lock:
+                    self._check_run_viable(run)
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        encoding="utf-8",
+                        cwd=str(config.ROOT),
+                    )
+                    run.processes.append(proc)
+                    if run.cancel.is_set() or run.helper_failure.is_set():
+                        if run.helper_failure.is_set():
+                            self._terminate_after_helper_failure(proc)
+                        else:
+                            proc.terminate()
+                        if run.cancel.is_set():
+                            raise _FitCancelled()
+                        raise _FitHelperFailed()
+                reader = threading.Thread(
+                    target=self._read_worker,
+                    args=(run, proc, worker_state, started),
+                    daemon=True,
+                )
+                run.helper_threads.append(reader)
+                run.reader_threads.append(reader)
+                reader.start()
+            self._check_cancelled(run)
+
+            self._check_cancelled(run)
+            heartbeat = threading.Thread(
+                target=self._heartbeat,
+                args=(run, started),
+                daemon=True,
+            )
+            run.heartbeat_thread = heartbeat
+            heartbeat.start()
+            self._check_cancelled(run)
+
+            stderr_tails = [""] * len(run.processes)
 
             def drain_err(index, proc):
-                data = proc.stderr.read()
-                stderr_tails[index] = (data or "")[-2000:]
+                try:
+                    data = proc.stderr.read()
+                    stderr_tails[index] = (data or "")[-2000:]
+                except Exception as exc:
+                    self._record_helper_failure(
+                        run, "stderr drainer", exc, worker=index
+                    )
 
             drainers = [
                 threading.Thread(target=drain_err, args=(i, p), daemon=True)
-                for i, p in enumerate(self._procs)
+                for i, p in enumerate(run.processes)
             ]
+            run.helper_threads.extend(drainers)
             for t in drainers:
                 t.start()
-            for proc in self._procs:
+            for proc in run.processes:
                 proc.wait()
+            # Popen.wait() does not guarantee that Python reader threads have
+            # consumed all bytes buffered in stdout.  Drain stdout to EOF before
+            # evaluating failures or allowing merge/publication to begin.
+            for reader in run.reader_threads:
+                reader.join()
             for t in drainers:
                 t.join()
-            failed = [i for i, p in enumerate(self._procs) if p.returncode != 0]
-            if self.state.get("state") == "stopping":
-                self.state.update(state="stopped")
-                self._emit()
-                return
+            # Heartbeat callbacks are helpers too.  They must be fully quiesced
+            # before failure selection, worker validation, merge, or output
+            # publication; otherwise a callback can fail after the last helper
+            # check and allow a successful artifact to be published.
+            self._stop_and_join_heartbeat(run)
+            self._check_run_viable(run)
+            failed = [i for i, p in enumerate(run.processes) if p.returncode != 0]
             if failed:
                 detail = " | ".join(stderr_tails[i].strip().splitlines()[-1] if stderr_tails[i].strip() else "?" for i in failed)
                 raise RuntimeError(f"worker(s) {failed} failed: {detail}")
 
-            self.state.update(phase="merge")
-            self._emit()
-            partials = [
-                JacobianLens.load(str(job_dir / f"lens{i}.pt"))
-                for i in range(len(slices))
-            ]
+            self._validate_workers_after_drain(run)
+            partials = []
+            for i in range(len(slices)):
+                self._check_run_viable(run)
+                partials.append(JacobianLens.load(str(job_dir / f"lens{i}.pt")))
+            self._check_run_viable(run)
             merged = JacobianLens.merge(partials) if len(partials) > 1 else partials[0]
             if params.get("continue_from"):
+                self._check_run_viable(run)
                 base_lens = JacobianLens.load(params["continue_from"])
                 if base_lens.source_layers != merged.source_layers:
                     raise RuntimeError(
@@ -345,11 +578,15 @@ class FitManager:
                         f"{merged.source_layers[0]}..{merged.source_layers[-1]})"
                     )
                 # weighted average by n_prompts = equivalent to a fit over the union
+                self._check_run_viable(run)
                 merged = JacobianLens.merge([base_lens, merged])
+            self._check_run_viable(run)
             out_dir = config.LENSES_DIR / name
             out_dir.mkdir(parents=True, exist_ok=True)
             lens_path = out_dir / "lens.pt"
+            self._check_run_viable(run)
             merged.save(str(lens_path))
+            self._check_run_viable(run)
             meta = {
                 "name": name,
                 "model_id": params["model_id"],
@@ -372,65 +609,223 @@ class FitManager:
                     json.dumps(params, sort_keys=True).encode()
                 ).hexdigest()[:16],
                 "created_at": _now(),
-                "fit_seconds": round(time.perf_counter() - started, 1),
+                "fit_seconds": round(self._clock() - started, 1),
             }
+            self._check_run_viable(run)
             (out_dir / "meta.json").write_text(
                 json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8"
             )
-            self.state.update(
-                state="done",
-                phase="done",
-                lens_path=str(lens_path),
-                meta=meta,
-                eta_seconds=0,
+            self._check_run_viable(run)
+            self._publish_terminal(run, success={
+                "state": "done",
+                "phase": "done",
+                "lens_path": str(lens_path),
+                "meta": meta,
+                "eta_seconds": 0,
+            })
+        except _FitCancelled:
+            self._quiesce_failed_run(run)
+            self._publish_terminal(run)
+        except _FitHelperFailed:
+            self._publish_preferred_failure(
+                run, RuntimeError("fit helper failed without an error record")
             )
-            self._emit()
         except Exception as exc:
-            self.state.update(state="error", error=str(exc))
-            self._emit()
+            self._publish_preferred_failure(run, exc)
+        finally:
+            run.heartbeat_stop.set()
+            with run.process_lock:
+                for proc in run.processes:
+                    if proc.poll() is None:
+                        proc.terminate()
+            for proc in run.processes:
+                # ``wait`` is required even when terminate made ``poll`` turn
+                # non-None immediately: the child still needs to be reaped.
+                proc.wait()
+            heartbeat = run.heartbeat_thread
+            if heartbeat is not None and heartbeat is not threading.current_thread():
+                heartbeat.join()
+            for thread in run.helper_threads:
+                if thread is not threading.current_thread():
+                    thread.join()
+            with self._lock:
+                if self._active_run is run:
+                    self._active_run = None
+            run.done.set()
 
-    def _read_worker(self, proc, worker_state, started):
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
+    def _heartbeat(self, run, started):
+        """Emit elapsed-time updates while at least one fit worker is alive."""
+        try:
+            while not run.heartbeat_stop.is_set():
+                if run.processes and not any(proc.poll() is None for proc in run.processes):
+                    return
+                if run.heartbeat_stop.wait(self._heartbeat_interval):
+                    return
+                if (
+                    run.heartbeat_stop.is_set()
+                    or run.cancel.is_set()
+                    or run.helper_failure.is_set()
+                    or (
+                        run.processes
+                        and not any(proc.poll() is None for proc in run.processes)
+                    )
+                ):
+                    return
+                self._heartbeat_once(run, started)
+        except Exception as exc:
+            self._record_helper_failure(run, "heartbeat", exc)
+
+    def _heartbeat_once(self, run, started):
+        with self._lock:
+            if self._active_run is not run or run.cancel.is_set():
+                return
+            elapsed = round(self._clock() - started, 1)
+            self.state["elapsed"] = elapsed
+            for worker in self.state.get("workers", []):
+                if worker.get("state") in ("loading", "fitting"):
+                    worker["elapsed"] = elapsed
+        self._emit()
+
+    def _read_worker(self, run, proc, worker_state, started):
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(event, dict) or not isinstance(event.get("event"), str):
+                    continue
+                self._handle_worker_event(run, event, worker_state, started)
+        except Exception as exc:
             try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+                index = run.processes.index(proc)
+            except ValueError:
+                index = -1
+            self._record_helper_failure(
+                run, "stdout reader", exc, worker=index
+            )
+
+    def _handle_worker_event(self, run, event, worker_state, started):
+        with self._lock:
+            if (
+                self._active_run is not run
+                or run.cancel.is_set()
+                or self.state.get("state") in ("done", "error", "stopped")
+                or not any(
+                    worker is worker_state
+                    for worker in self.state.get("workers", [])
+                )
+            ):
+                return
             if event["event"] == "loading":
                 worker_state["state"] = "loading"
-            elif event["event"] in ("progress", "resume"):
+            elif event["event"] == "fitting":
                 worker_state["state"] = "fitting"
-                worker_state["done"] = event["done"]
-                worker_state["total"] = event["total"]
-                worker_state["elapsed"] = round(time.perf_counter() - started, 1)
-                hist = worker_state.setdefault("hist", [])
-                hist.append([worker_state["done"], worker_state["elapsed"]])
-                del hist[:-10]
+                self.state["phase"] = "fitting"
+            elif event["event"] in ("progress", "resume"):
+                done = event.get("done")
+                total = event.get("total")
+                if (
+                    not isinstance(done, int)
+                    or isinstance(done, bool)
+                    or not isinstance(total, int)
+                    or isinstance(total, bool)
+                    or done < 0
+                    or total < 0
+                    or done > total
+                ):
+                    return
+                worker_state["state"] = "fitting"
+                self.state["phase"] = "fitting"
+                worker_state["done"] = done
+                worker_state["total"] = total
+                worker_state["elapsed"] = round(self._clock() - started, 1)
+                if event["event"] == "resume":
+                    worker_state["baseline_done"] = done
+                    worker_state["baseline_elapsed"] = worker_state["elapsed"]
+                    worker_state["hist"] = []
+                else:
+                    hist = worker_state.setdefault("hist", [])
+                    hist.append([done, worker_state["elapsed"]])
+                    del hist[:-10]
             elif event["event"] == "done":
                 worker_state["state"] = "done"
                 worker_state["done"] = worker_state["total"]
-            self._refresh_totals(started)
-            self._emit()
+            else:
+                return
+            self._refresh_totals(
+                recalculate_eta=event["event"] in ("progress", "done")
+            )
+        self._emit()
 
-    def _refresh_totals(self, started):
+    def _validate_workers_after_drain(self, run):
+        """Validate authoritative worker state before entering merge."""
+        with self._lock:
+            if self._active_run is not run or run.cancel.is_set():
+                raise _FitCancelled()
+            workers = self.state.get("workers", [])
+            if len(workers) != len(run.processes):
+                raise RuntimeError("worker process/state inventory is incomplete")
+            self._refresh_totals(recalculate_eta=True)
+            incomplete = [
+                index for index, worker in enumerate(workers)
+                if worker.get("state") != "done"
+            ]
+            if incomplete:
+                raise RuntimeError(
+                    "worker(s) did not emit a terminal done event: "
+                    + ", ".join(map(str, incomplete))
+                )
+            self.state["eta_seconds"] = None
+            self.state["phase"] = "merge"
+        self._emit()
+
+    def _refresh_totals(self, *, recalculate_eta=True):
         workers = self.state.get("workers", [])
         self.state["done"] = sum(w["done"] for w in workers)
+        self.state["total"] = sum(w["total"] for w in workers)
+        if not recalculate_eta:
+            return
         etas = []
+        unknown_unfinished = False
         for w in workers:
-            if not (w["done"] > 0 and w["elapsed"] > 0 and w["done"] < w["total"]):
+            if w["done"] >= w["total"]:
                 continue
-            hist = w.get("hist") or []
+            hist = [
+                sample for sample in (w.get("hist") or [])
+                if (
+                    isinstance(sample, (list, tuple))
+                    and len(sample) == 2
+                    and _finite_number(sample[0])
+                    and _finite_number(sample[1])
+                )
+            ]
             if len(hist) >= 2 and hist[-1][1] > hist[0][1] and hist[-1][0] > hist[0][0]:
                 # pace over the last 10 updates (sliding window)
                 rate = (hist[-1][0] - hist[0][0]) / (hist[-1][1] - hist[0][1])
+            elif hist:
+                progress_delta = hist[-1][0] - w.get("baseline_done", 0)
+                elapsed_delta = hist[-1][1] - w.get("baseline_elapsed", 0.0)
+                rate = progress_delta / elapsed_delta if progress_delta > 0 and elapsed_delta > 0 else 0
             else:
-                rate = w["done"] / w["elapsed"]
+                rate = 0
+            if not rate or not math.isfinite(rate):
+                unknown_unfinished = True
+                continue
             etas.append((w["total"] - w["done"]) / rate)
         # multi-GPU: the fit ETA = the slowest worker
-        self.state["eta_seconds"] = round(max(etas), 0) if etas else None
-        self.state["vram"] = [
-            {"index": g["index"], "used_gb": round(g["vram_used"] / 2**30, 1)}
-            for g in gpu_stats()
-        ]
+        self.state["eta_seconds"] = (
+            None if unknown_unfinished or not etas else round(max(etas), 0)
+        )
+        try:
+            self.state["vram"] = [
+                {"index": g["index"], "used_gb": round(g["vram_used"] / 2**30, 1)}
+                for g in gpu_stats()
+            ]
+        except Exception:
+            # Progress reporting must survive transient NVML failures. Device
+            # telemetry is informative and does not affect fitting.
+            pass
