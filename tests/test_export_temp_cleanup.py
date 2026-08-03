@@ -398,6 +398,7 @@ def test_parent_replacement_before_anchored_claim_is_fail_closed(tmp_path, kind)
     assert str(candidate) in result["skipped_changed"]
 
 
+@requires_anchored_deletion
 @pytest.mark.parametrize("kind", ["file", "directory"])
 def test_claim_replacement_before_delete_is_preserved(tmp_path, kind):
     candidate = _gguf(tmp_path) if kind == "file" else _stage(tmp_path)
@@ -431,6 +432,7 @@ def test_claim_replacement_before_delete_is_preserved(tmp_path, kind):
     assert str(candidate) in result["skipped_changed"]
 
 
+@requires_anchored_deletion
 def test_claim_changed_to_different_inode_is_not_deleted(tmp_path):
     candidate = _gguf(tmp_path)
     moved_claim = tmp_path / "original-claim"
@@ -451,6 +453,7 @@ def test_claim_changed_to_different_inode_is_not_deleted(tmp_path):
     assert str(candidate) not in result["removed"]
 
 
+@requires_anchored_deletion
 def test_claim_metadata_change_is_not_deleted(tmp_path):
     candidate = _gguf(tmp_path)
     claim_path = {}
@@ -533,7 +536,13 @@ def test_completion_marker_replaced_by_symlink_is_fail_closed(tmp_path):
     result = _cleanup(tmp_path)
     assert candidate.exists() and marker.is_symlink()
     assert result["removed_count"] == 0
-    assert "safe regular file" in result["errors"][0]["error"]
+    if os.name == "nt":
+        assert str(candidate) in result["skipped_changed"]
+        assert "handle-relative completion marker inspection is unavailable" in (
+            result["errors"][0]["error"]
+        )
+    else:
+        assert "safe regular file" in result["errors"][0]["error"]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor marker inspection")
@@ -640,7 +649,14 @@ def test_legacy_completed_colliding_export_is_preserved(tmp_path):
     _mtime(hf, OLD)
     _mtime(path, OLD)
     result = _cleanup(tmp_path)
-    assert result["skipped_completed"] == [str(path)]
+    if os.name == "nt":
+        assert result["skipped_completed"] == []
+        assert result["skipped_changed"] == [str(path)]
+        assert "handle-relative completion marker inspection is unavailable" in (
+            result["errors"][0]["error"]
+        )
+    else:
+        assert result["skipped_completed"] == [str(path)]
     assert sentinel.read_text() == "{}"
 
 
@@ -758,10 +774,21 @@ def test_cross_process_lease_protects_active_artifact(tmp_path):
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows fail-closed regression")
-def test_windows_cleanup_without_handle_relative_deletion_fails_closed(tmp_path):
-    artifact = _gguf(tmp_path)
-    result = _cleanup(tmp_path)
+@pytest.mark.parametrize("kind", ["file", "directory"])
+def test_windows_cleanup_without_handle_relative_deletion_fails_closed(tmp_path, kind):
+    artifact = _gguf(tmp_path) if kind == "file" else _stage(tmp_path)
+    sentinel = artifact.parent / "unrelated"
+    if kind == "directory":
+        hf = artifact / "hf"
+        hf.mkdir()
+        sentinel = hf / "config.json"
+    sentinel.write_text("keep")
+    observed = []
+    result = _cleanup(tmp_path, observer=lambda phase, value: observed.append(phase))
     assert artifact.exists()
+    assert sentinel.read_text() == "keep"
     assert result["removed"] == []
+    assert result["removed_count"] == 0
     assert result["skipped_changed"] == [str(artifact)]
     assert "handle-relative" in result["errors"][0]["error"]
+    assert "before_delete" not in observed

@@ -550,6 +550,12 @@ def cleanup_abandoned_export_temps(
                                 )
                             with _AnchoredCleanupParent(candidate) as marker_parent:
                                 metadata = marker_parent.read_completion_marker(observer)
+                            # The descriptor-anchored read above remains attached to
+                            # the discovered directory if its external parent path is
+                            # concurrently moved.  Revalidate that external chain
+                            # before treating the marker as authoritative or falling
+                            # through to pathname-based legacy activity inspection.
+                            _revalidate_candidate(candidate)
                         except Exception as exc:
                             raise ValueError(f"cannot inspect possible completion marker: {exc}") from exc
                         relative_name = path.relative_to(root).as_posix()
