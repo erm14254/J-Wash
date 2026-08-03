@@ -664,15 +664,16 @@ def _inspect_existing_lease(anchored, lease_leaf):
             os.close(fd)
 
 
-def _observe_active_lease_consistently(
+def _check_held_lease_advisory(
     *, root_chain, candidate, anchored, lease_leaf, proof, observer=None
 ):
-    """Make one bounded, descriptor-backed observation of an active lease.
+    """Run ordered, descriptor-backed safety checks for a held lease.
 
-    A successful return is the observation point.  It says that the lexical
-    chains, retained parent directory, candidate entry, lease entry, and open
-    lease descriptor agreed throughout this bounded pass.  It deliberately
-    makes no claim about namespace changes after the pass completes.
+    These checks are deliberately not an atomic filesystem snapshot. A
+    successful return means only that every check succeeded when it ran and no
+    inconsistency was observed before the result was produced. Entries checked
+    earlier may already have changed, so the resulting ``active`` classification
+    is advisory and must never authorize a destructive operation.
     """
     _revalidate_directory_chain(root_chain)
     _revalidate_directory_chain(candidate.parent_chain)
@@ -684,16 +685,13 @@ def _observe_active_lease_consistently(
         or not stat.S_ISDIR(parent_start.st_mode)
     ):
         raise _UnsafeAnchoredCleanup(
-            "temporary artifact parent changed during active observation"
+            "temporary artifact parent changed during active checks"
         )
-    # Directory ctime/mtime bracket namespace changes which may be restored to
-    # the same visible names before the final entry checks.
-    parent_namespace_start = _candidate_identity(parent_start)
 
     candidate_first = anchored.stat_leaf(candidate.path.name)
     if _stat_identity(candidate_first) != candidate.identity[:5]:
         raise _UnsafeAnchoredCleanup(
-            "temporary artifact structural identity changed during active observation"
+            "temporary artifact structural identity changed during active checks"
         )
     if observer:
         observer("after_active_candidate_check_1", candidate.path)
@@ -708,7 +706,7 @@ def _observe_active_lease_consistently(
         or _stat_identity(os.fstat(proof.fd)) != proof.identity
     ):
         raise _UnsafeAnchoredCleanup(
-            "temporary artifact lease changed during active observation"
+            "temporary artifact lease changed during active checks"
         )
     if observer:
         observer("after_active_lease_entry_check_1", candidate.path)
@@ -716,8 +714,10 @@ def _observe_active_lease_consistently(
     candidate_second = anchored.stat_leaf(candidate.path.name)
     if _stat_identity(candidate_second) != candidate.identity[:5]:
         raise _UnsafeAnchoredCleanup(
-            "temporary artifact structural identity changed during active observation"
+            "temporary artifact structural identity changed during active checks"
         )
+    if observer:
+        observer("after_active_candidate_check_2", candidate.path)
     lease_second = os.stat(
         lease_leaf, dir_fd=anchored.parent_fd, follow_symlinks=False,
     )
@@ -728,27 +728,26 @@ def _observe_active_lease_consistently(
         or _stat_identity(os.fstat(proof.fd)) != proof.identity
     ):
         raise _UnsafeAnchoredCleanup(
-            "temporary artifact lease changed during active observation"
+            "temporary artifact lease changed during active checks"
         )
     if observer:
-        observer("before_active_final_namespace_check", candidate.path)
+        observer("after_active_lease_entry_check_2", candidate.path)
 
     parent_end = os.fstat(anchored.parent_fd)
     if (
         _stat_identity(parent_end) != expected_parent
-        or _candidate_identity(parent_end) != parent_namespace_start
     ):
         raise _UnsafeAnchoredCleanup(
-            "temporary artifact parent namespace changed during active observation"
+            "temporary artifact parent changed during active checks"
         )
     _revalidate_directory_chain(root_chain)
     _revalidate_directory_chain(candidate.parent_chain)
 
-    # Linearization point for this advisory, non-destructive observation: all
-    # bounded checks above have passed. Later changes cannot retroactively alter
-    # what was observed here.
+    # This is merely the end of the ordered checks, not a filesystem
+    # linearization point. A previously checked name may change before this
+    # callback or before the caller receives the advisory result.
     if observer:
-        observer("active_observation_complete", candidate.path)
+        observer("before_active_result", candidate.path)
 
 
 def inspect_abandoned_export_temps(
@@ -758,9 +757,10 @@ def inspect_abandoned_export_temps(
 
     Startup inspection deliberately never renames, removes, or modifies an
     artifact or lease. Structural inconsistencies detected during inspection
-    are ``changed_or_unsafe``. ``active`` is a bounded point-in-time advisory
-    observation and may become stale immediately after its observation point;
-    it must never authorize a destructive operation.
+    are ``changed_or_unsafe``. ``active`` means a held lease was observed and
+    each ordered no-follow safety check succeeded when performed. The checks are
+    not an atomic snapshot: an inter-check change may go undetected and the
+    result may already be stale. It must never authorize a destructive action.
     """
     root = _absolute_no_follow(root if root is not None else EDITS_DIR)
     current_time = time.time() if now is None else float(now)
@@ -850,7 +850,7 @@ def inspect_abandoned_export_temps(
                         if lease_proof.held:
                             if observer:
                                 observer("after_held_lease_probe", path)
-                            _observe_active_lease_consistently(
+                            _check_held_lease_advisory(
                                 root_chain=root_chain,
                                 candidate=candidate,
                                 anchored=anchored,

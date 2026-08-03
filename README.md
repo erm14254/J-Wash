@@ -345,12 +345,16 @@ preserving them, active leased exports, completed exports, and cached HF
 checkpoints. Structural inconsistencies detected during inspection are reported
 as changed or unsafe; Windows also preserves candidates when exact
 handle-relative inspection is unavailable. A held lease is reported as active
-only when the parent namespace, candidate, lease entry, and retained lease
-descriptor agree throughout one bounded validation pass. This is a
-non-destructive point-in-time observation, not authorization to delete anything,
-and it may become stale immediately after the observation completes. Ordinary
-in-place writes during the pass may change an active artifact's contents, size,
-and timestamps without changing its structural identity.
+when each ordered no-follow check of the parent chain, candidate, lease entry,
+and retained lease descriptor succeeds at the time that check runs. These checks
+are not an atomic filesystem snapshot: another process may change an earlier
+entry between checks or before the result is returned, so `active` is advisory
+and may already be stale. An inconsistency actually observed by a check is
+reported as changed or unsafe. Neither classification authorizes deletion,
+movement, quarantine, overwrite, or any other destructive action. Directory
+timestamps are not treated as reliable namespace generation counters. Ordinary
+in-place writes may change an active artifact's contents, size, and timestamps
+without changing its structural identity.
 Destructive offline maintenance is intentionally deferred. POSIX lease files are
 intentionally persistent and reusable because portable POSIX APIs cannot safely
 unlink only a previously verified inode; an unlocked lease does not mean an

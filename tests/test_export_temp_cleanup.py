@@ -418,8 +418,8 @@ def test_child_held_lease_allows_mutable_candidate_metadata(tmp_path):
     assert path.read_bytes() == b"updated-with-same-inode-and-new-size"
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX bounded active observation")
-def test_active_observation_detects_candidate_replacement_after_first_check(tmp_path):
+@pytest.mark.skipif(os.name == "nt", reason="POSIX advisory active checks")
+def test_active_checks_detect_candidate_replacement_before_last_check(tmp_path):
     path = _gguf(tmp_path)
     original = tmp_path / "candidate-original"
     target = tmp_path / "candidate-target"
@@ -438,8 +438,8 @@ def test_active_observation_detects_candidate_replacement_after_first_check(tmp_
     assert path.is_symlink() and target.read_bytes() == b"target"
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX bounded active observation")
-def test_active_observation_detects_lease_replacement_after_first_check(tmp_path):
+@pytest.mark.skipif(os.name == "nt", reason="POSIX advisory active checks")
+def test_active_checks_detect_lease_replacement_before_last_check(tmp_path):
     path = _gguf(tmp_path)
     lease_path = path.with_name(path.name + ".lease")
     original = tmp_path / "lease-original"
@@ -459,8 +459,8 @@ def test_active_observation_detects_lease_replacement_after_first_check(tmp_path
     assert lease_path.is_symlink() and target.read_bytes() == b"target"
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX bounded active observation")
-def test_active_observation_detects_parent_replacement_before_final_check(tmp_path):
+@pytest.mark.skipif(os.name == "nt", reason="POSIX advisory active checks")
+def test_active_checks_detect_parent_replacement_before_last_chain_check(tmp_path):
     parent = tmp_path / "nested"
     path = _gguf(parent)
     moved = tmp_path / "nested-original"
@@ -468,7 +468,7 @@ def test_active_observation_detects_parent_replacement_before_final_check(tmp_pa
     replacement.mkdir()
 
     def observer(phase, _value):
-        if phase == "before_active_final_namespace_check":
+        if phase == "after_active_lease_entry_check_2":
             parent.rename(moved)
             parent.symlink_to(replacement, target_is_directory=True)
 
@@ -481,36 +481,88 @@ def test_active_observation_detects_parent_replacement_before_final_check(tmp_pa
     assert parent.is_symlink()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX bounded active observation")
-def test_active_observation_brackets_parent_namespace_changes(tmp_path):
+@pytest.mark.skipif(os.name == "nt", reason="POSIX advisory active checks")
+def test_parent_timestamps_are_not_required_as_namespace_generations(tmp_path):
     path = _gguf(tmp_path)
 
     def observer(phase, _value):
-        if phase == "before_active_final_namespace_check":
+        if phase == "after_active_lease_entry_check_2":
             transient = tmp_path / "transient"
             transient.write_bytes(b"transient")
             transient.unlink()
 
     result = _inspect_while_child_holds(tmp_path, path, observer)
-    assert result["active"] == []
-    assert result["changed_or_unsafe"] == [str(path)]
-    assert "namespace changed" in result["errors"][0]["error"]
+    # A rapid create/remove need not advance directory timestamps on every
+    # filesystem. Ordered structural checks still preserve every object, and an
+    # advisory active result is permitted when no inconsistency is observed.
+    assert result["active"] == [str(path)]
+    assert result["changed_or_unsafe"] == []
+    assert path.read_bytes() == b"file-bytes"
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX bounded active observation")
-def test_active_observation_is_advisory_after_completion_point(tmp_path):
+@pytest.mark.skipif(os.name == "nt", reason="POSIX advisory active checks")
+def test_active_result_is_advisory_after_ordered_checks(tmp_path):
     path = _gguf(tmp_path)
 
     def observer(phase, _value):
-        if phase == "active_observation_complete":
-            # This mutation is deliberately after the bounded observation point.
-            # The report describes the completed snapshot, not timeless state.
+        if phase == "before_active_result":
+            # This mutation is after this entry's last ordered check. There is no
+            # atomic snapshot, so advisory active is permitted and remains
+            # strictly non-destructive.
             path.write_bytes(b"changed-after-observation")
 
     result = _inspect_while_child_holds(tmp_path, path, observer)
     assert result["active"] == [str(path)]
     assert result["changed_or_unsafe"] == []
     assert path.read_bytes() == b"changed-after-observation"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX advisory active checks")
+@pytest.mark.parametrize("entry", ["candidate", "lease"])
+def test_replacement_after_entry_last_check_may_return_advisory_active(tmp_path, entry):
+    path = _gguf(tmp_path)
+    lease_path = path.with_name(path.name + ".lease")
+    changed = tmp_path / f"{entry}-original"
+    target = tmp_path / f"{entry}-target"
+    target.write_bytes(b"target")
+    phase_name = (
+        "after_active_candidate_check_2"
+        if entry == "candidate"
+        else "after_active_lease_entry_check_2"
+    )
+
+    def observer(phase, _value):
+        if phase == phase_name:
+            selected = path if entry == "candidate" else lease_path
+            selected.rename(changed)
+            selected.symlink_to(target)
+
+    result = _inspect_while_child_holds(tmp_path, path, observer)
+    assert result["active"] == [str(path)]
+    assert result["changed_or_unsafe"] == []
+    assert changed.exists()
+    selected = path if entry == "candidate" else lease_path
+    assert selected.is_symlink() and target.read_bytes() == b"target"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX advisory active checks")
+def test_parent_replacement_after_last_chain_check_may_return_advisory_active(tmp_path):
+    parent = tmp_path / "nested"
+    path = _gguf(parent)
+    moved = tmp_path / "nested-original"
+    replacement = tmp_path / "nested-target"
+    replacement.mkdir()
+
+    def observer(phase, _value):
+        if phase == "before_active_result":
+            parent.rename(moved)
+            parent.symlink_to(replacement, target_is_directory=True)
+
+    result = _inspect_while_child_holds(tmp_path, path, observer)
+    assert result["active"] == [str(path)]
+    assert result["changed_or_unsafe"] == []
+    assert (moved / path.name).read_bytes() == b"file-bytes"
+    assert parent.is_symlink() and replacement.is_dir()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX validation hook")
