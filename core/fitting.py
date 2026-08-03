@@ -232,6 +232,8 @@ class FitManager:
             for proc in self._procs:
                 if proc.poll() is None:
                     proc.terminate()
+            if self._heartbeat_stop is not None:
+                self._heartbeat_stop.set()
             if self.state.get("state") == "running":
                 self.state["state"] = "stopping"
         self._emit()

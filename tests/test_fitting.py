@@ -103,6 +103,30 @@ def test_heartbeat_exits_after_worker_stops_or_fails(terminal):
     assert not thread.is_alive()
 
 
+def test_stop_signals_active_heartbeat_without_waiting_for_worker_exit():
+    manager = _manager()
+    heartbeat_stop = threading.Event()
+    manager._heartbeat_stop = heartbeat_stop
+
+    class Proc:
+        terminated = False
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            self.terminated = True
+
+    proc = Proc()
+    manager._procs = [proc]
+
+    state = manager.stop()
+
+    assert proc.terminated
+    assert heartbeat_stop.is_set()
+    assert state["state"] == "stopping"
+
+
 def test_corpus_loader_uses_installed_datasets_without_network(monkeypatch):
     import datasets
 
