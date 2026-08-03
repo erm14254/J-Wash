@@ -342,11 +342,15 @@ leave hidden transaction artifacts. At startup J-Wash non-destructively inspects
 only its precisely recognized staging directories and GGUF temporary files. It
 reports legacy artifacts inactive for at least 24 hours as abandoned, while
 preserving them, active leased exports, completed exports, and cached HF
-checkpoints. Ambiguous or concurrently changed objects fail closed; Windows also
-preserves candidates when exact handle-relative inspection is unavailable.
-Held leases count as active only after the candidate, parent chain, and lease
-entry still match their verified structural identities; ordinary in-place writes
-to an active temporary artifact may change its size and timestamps.
+checkpoints. Structural inconsistencies detected during inspection are reported
+as changed or unsafe; Windows also preserves candidates when exact
+handle-relative inspection is unavailable. A held lease is reported as active
+only when the parent namespace, candidate, lease entry, and retained lease
+descriptor agree throughout one bounded validation pass. This is a
+non-destructive point-in-time observation, not authorization to delete anything,
+and it may become stale immediately after the observation completes. Ordinary
+in-place writes during the pass may change an active artifact's contents, size,
+and timestamps without changing its structural identity.
 Destructive offline maintenance is intentionally deferred. POSIX lease files are
 intentionally persistent and reusable because portable POSIX APIs cannot safely
 unlink only a previously verified inode; an unlocked lease does not mean an

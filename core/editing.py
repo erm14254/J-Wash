@@ -664,29 +664,91 @@ def _inspect_existing_lease(anchored, lease_leaf):
             os.close(fd)
 
 
-def _validate_active_lease_proof(
-    *, root_chain, candidate, anchored, lease_leaf, proof
+def _observe_active_lease_consistently(
+    *, root_chain, candidate, anchored, lease_leaf, proof, observer=None
 ):
-    """Validate immutable path structure before reporting a held lease active."""
+    """Make one bounded, descriptor-backed observation of an active lease.
+
+    A successful return is the observation point.  It says that the lexical
+    chains, retained parent directory, candidate entry, lease entry, and open
+    lease descriptor agreed throughout this bounded pass.  It deliberately
+    makes no claim about namespace changes after the pass completes.
+    """
     _revalidate_directory_chain(root_chain)
     _revalidate_directory_chain(candidate.parent_chain)
-    current = anchored.stat_leaf(candidate.path.name)
-    if _stat_identity(current) != candidate.identity[:5]:
+
+    parent_start = os.fstat(anchored.parent_fd)
+    expected_parent = candidate.parent_chain[-1][1]
+    if (
+        _stat_identity(parent_start) != expected_parent
+        or not stat.S_ISDIR(parent_start.st_mode)
+    ):
         raise _UnsafeAnchoredCleanup(
-            "temporary artifact structural identity changed during lease inspection"
+            "temporary artifact parent changed during active observation"
         )
-    lease_entry = os.stat(
+    # Directory ctime/mtime bracket namespace changes which may be restored to
+    # the same visible names before the final entry checks.
+    parent_namespace_start = _candidate_identity(parent_start)
+
+    candidate_first = anchored.stat_leaf(candidate.path.name)
+    if _stat_identity(candidate_first) != candidate.identity[:5]:
+        raise _UnsafeAnchoredCleanup(
+            "temporary artifact structural identity changed during active observation"
+        )
+    if observer:
+        observer("after_active_candidate_check_1", candidate.path)
+
+    lease_first = os.stat(
         lease_leaf, dir_fd=anchored.parent_fd, follow_symlinks=False,
     )
     if (
-        _stat_is_link_or_reparse(lease_entry)
-        or not stat.S_ISREG(lease_entry.st_mode)
-        or _stat_identity(lease_entry) != proof.identity
+        _stat_is_link_or_reparse(lease_first)
+        or not stat.S_ISREG(lease_first.st_mode)
+        or _stat_identity(lease_first) != proof.identity
         or _stat_identity(os.fstat(proof.fd)) != proof.identity
     ):
         raise _UnsafeAnchoredCleanup(
-            "temporary artifact lease changed during active classification"
+            "temporary artifact lease changed during active observation"
         )
+    if observer:
+        observer("after_active_lease_entry_check_1", candidate.path)
+
+    candidate_second = anchored.stat_leaf(candidate.path.name)
+    if _stat_identity(candidate_second) != candidate.identity[:5]:
+        raise _UnsafeAnchoredCleanup(
+            "temporary artifact structural identity changed during active observation"
+        )
+    lease_second = os.stat(
+        lease_leaf, dir_fd=anchored.parent_fd, follow_symlinks=False,
+    )
+    if (
+        _stat_is_link_or_reparse(lease_second)
+        or not stat.S_ISREG(lease_second.st_mode)
+        or _stat_identity(lease_second) != proof.identity
+        or _stat_identity(os.fstat(proof.fd)) != proof.identity
+    ):
+        raise _UnsafeAnchoredCleanup(
+            "temporary artifact lease changed during active observation"
+        )
+    if observer:
+        observer("before_active_final_namespace_check", candidate.path)
+
+    parent_end = os.fstat(anchored.parent_fd)
+    if (
+        _stat_identity(parent_end) != expected_parent
+        or _candidate_identity(parent_end) != parent_namespace_start
+    ):
+        raise _UnsafeAnchoredCleanup(
+            "temporary artifact parent namespace changed during active observation"
+        )
+    _revalidate_directory_chain(root_chain)
+    _revalidate_directory_chain(candidate.parent_chain)
+
+    # Linearization point for this advisory, non-destructive observation: all
+    # bounded checks above have passed. Later changes cannot retroactively alter
+    # what was observed here.
+    if observer:
+        observer("active_observation_complete", candidate.path)
 
 
 def inspect_abandoned_export_temps(
@@ -695,7 +757,10 @@ def inspect_abandoned_export_temps(
     """Non-destructively classify J-Wash temporary export artifacts.
 
     Startup inspection deliberately never renames, removes, or modifies an
-    artifact or lease. Ambiguous or concurrently changed objects fail closed.
+    artifact or lease. Structural inconsistencies detected during inspection
+    are ``changed_or_unsafe``. ``active`` is a bounded point-in-time advisory
+    observation and may become stale immediately after its observation point;
+    it must never authorize a destructive operation.
     """
     root = _absolute_no_follow(root if root is not None else EDITS_DIR)
     current_time = time.time() if now is None else float(now)
@@ -785,12 +850,13 @@ def inspect_abandoned_export_temps(
                         if lease_proof.held:
                             if observer:
                                 observer("after_held_lease_probe", path)
-                            _validate_active_lease_proof(
+                            _observe_active_lease_consistently(
                                 root_chain=root_chain,
                                 candidate=candidate,
                                 anchored=anchored,
                                 lease_leaf=lease_leaf,
                                 proof=lease_proof,
+                                observer=observer,
                             )
                             classify("active", path)
                             continue
