@@ -5,6 +5,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from jlens.lens import JacobianLens
@@ -153,14 +154,27 @@ def _now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+class _FitCancelled(Exception):
+    pass
+
+
+@dataclass
+class _FitRun:
+    cancel: threading.Event = field(default_factory=threading.Event)
+    done: threading.Event = field(default_factory=threading.Event)
+    heartbeat_stop: threading.Event = field(default_factory=threading.Event)
+    process_lock: threading.Lock = field(default_factory=threading.Lock)
+    processes: list = field(default_factory=list)
+    helper_threads: list = field(default_factory=list)
+    heartbeat_thread: threading.Thread | None = None
+
+
 class FitManager:
     def __init__(self, *, clock=time.perf_counter, heartbeat_interval=2.0):
         self._lock = threading.Lock()
-        self._procs = []
         self._clock = clock
         self._heartbeat_interval = heartbeat_interval
-        self._heartbeat_stop = None
-        self._heartbeat_thread = None
+        self._active_run = None
         self.state = {"state": "idle"}
         self.on_progress = None
 
@@ -173,7 +187,7 @@ class FitManager:
               max_seq_len=128, source_layers=None, model_revision=None,
               continue_from=None, datasets=(DATASET_WIKITEXT,)):
         with self._lock:
-            if self.state.get("state") == "running":
+            if self._active_run is not None:
                 raise ValueError("a fitting is already in progress")
             if not devices:
                 raise ValueError("at least one device required")
@@ -223,25 +237,46 @@ class FitManager:
                 "params": params,
                 "error": None,
             }
-            self._procs = []
-        threading.Thread(target=self._run, args=(name, params), daemon=True).start()
+            run = _FitRun()
+            self._active_run = run
+        threading.Thread(target=self._run, args=(run, name, params), daemon=True).start()
         return dict(self.state)
 
     def stop(self):
         with self._lock:
-            for proc in self._procs:
+            run = self._active_run
+            if run is None:
+                return dict(self.state)
+            run.cancel.set()
+            run.heartbeat_stop.set()
+            if self._active_run is run and self.state.get("state") == "running":
+                self.state["state"] = "stopping"
+        with run.process_lock:
+            for proc in run.processes:
                 if proc.poll() is None:
                     proc.terminate()
-            if self._heartbeat_stop is not None:
-                self._heartbeat_stop.set()
-            if self.state.get("state") == "running":
-                self.state["state"] = "stopping"
         self._emit()
         return dict(self.state)
 
-    def _run(self, name, params):
-        heartbeat_stop = None
+    def _owns(self, run):
+        with self._lock:
+            return self._active_run is run
+
+    def _check_cancelled(self, run):
+        if run.cancel.is_set() or not self._owns(run):
+            raise _FitCancelled()
+
+    def _update(self, run, **changes):
+        with self._lock:
+            if self._active_run is not run:
+                return False
+            self.state.update(changes)
+        self._emit()
+        return True
+
+    def _run(self, run, name, params):
         try:
+            self._check_cancelled(run)
             job_dir = FITS_DIR / name
             job_dir.mkdir(parents=True, exist_ok=True)
             corpus_path = job_dir / "corpus.json"
@@ -253,9 +288,11 @@ class FitManager:
                     params["n_prompts"],
                     params.get("skip_prompts", 0),
                 )
+                self._check_cancelled(run)
                 corpus_path.write_text(
                     json.dumps(prompts, ensure_ascii=False), encoding="utf-8"
                 )
+            self._check_cancelled(run)
             devices = params["devices"]
             n = len(prompts)
             if len(devices) == 2:
@@ -264,10 +301,11 @@ class FitManager:
             else:
                 slices = [prompts]
 
-            self.state.update(phase="loading", total=n)
+            self._update(run, phase="loading", total=n)
             workers = []
             started = self._clock()
             for i, (device, chunk) in enumerate(zip(devices, slices)):
+                self._check_cancelled(run)
                 slice_path = job_dir / f"slice{i}.json"
                 if not slice_path.exists():
                     slice_path.write_text(json.dumps(chunk, ensure_ascii=False), encoding="utf-8")
@@ -287,15 +325,20 @@ class FitManager:
                     cmd += ["--quant", params["quant"]]
                 if params["source_layers"]:
                     cmd += ["--source-layers", json.dumps(params["source_layers"])]
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    cwd=str(config.ROOT),
-                )
-                self._procs.append(proc)
+                with run.process_lock:
+                    self._check_cancelled(run)
+                    proc = subprocess.Popen(
+                        cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        encoding="utf-8",
+                        cwd=str(config.ROOT),
+                    )
+                    run.processes.append(proc)
+                    if run.cancel.is_set():
+                        proc.terminate()
+                        raise _FitCancelled()
                 worker_state = {
                     "device": device,
                     "done": 0,
@@ -309,23 +352,27 @@ class FitManager:
                     "hist": [],
                 }
                 workers.append(worker_state)
-                threading.Thread(
-                    target=self._read_worker, args=(proc, worker_state, started), daemon=True
-                ).start()
-            self.state["workers"] = workers
-            self._emit()
+                reader = threading.Thread(
+                    target=self._read_worker,
+                    args=(run, proc, worker_state, started),
+                    daemon=True,
+                )
+                run.helper_threads.append(reader)
+                reader.start()
+            self._check_cancelled(run)
+            self._update(run, workers=workers)
 
-            heartbeat_stop = threading.Event()
+            self._check_cancelled(run)
             heartbeat = threading.Thread(
                 target=self._heartbeat,
-                args=(heartbeat_stop, started),
+                args=(run, started),
                 daemon=True,
             )
-            self._heartbeat_stop = heartbeat_stop
-            self._heartbeat_thread = heartbeat
+            run.heartbeat_thread = heartbeat
             heartbeat.start()
+            self._check_cancelled(run)
 
-            stderr_tails = [""] * len(self._procs)
+            stderr_tails = [""] * len(run.processes)
 
             def drain_err(index, proc):
                 data = proc.stderr.read()
@@ -333,31 +380,31 @@ class FitManager:
 
             drainers = [
                 threading.Thread(target=drain_err, args=(i, p), daemon=True)
-                for i, p in enumerate(self._procs)
+                for i, p in enumerate(run.processes)
             ]
+            run.helper_threads.extend(drainers)
             for t in drainers:
                 t.start()
-            for proc in self._procs:
+            for proc in run.processes:
                 proc.wait()
             for t in drainers:
                 t.join()
-            failed = [i for i, p in enumerate(self._procs) if p.returncode != 0]
-            if self.state.get("state") == "stopping":
-                self.state.update(state="stopped")
-                self._emit()
-                return
+            self._check_cancelled(run)
+            failed = [i for i, p in enumerate(run.processes) if p.returncode != 0]
             if failed:
                 detail = " | ".join(stderr_tails[i].strip().splitlines()[-1] if stderr_tails[i].strip() else "?" for i in failed)
                 raise RuntimeError(f"worker(s) {failed} failed: {detail}")
 
-            self.state.update(phase="merge")
-            self._emit()
+            self._update(run, phase="merge")
+            self._check_cancelled(run)
             partials = [
                 JacobianLens.load(str(job_dir / f"lens{i}.pt"))
                 for i in range(len(slices))
             ]
+            self._check_cancelled(run)
             merged = JacobianLens.merge(partials) if len(partials) > 1 else partials[0]
             if params.get("continue_from"):
+                self._check_cancelled(run)
                 base_lens = JacobianLens.load(params["continue_from"])
                 if base_lens.source_layers != merged.source_layers:
                     raise RuntimeError(
@@ -367,10 +414,13 @@ class FitManager:
                     )
                 # weighted average by n_prompts = equivalent to a fit over the union
                 merged = JacobianLens.merge([base_lens, merged])
+            self._check_cancelled(run)
             out_dir = config.LENSES_DIR / name
             out_dir.mkdir(parents=True, exist_ok=True)
             lens_path = out_dir / "lens.pt"
+            self._check_cancelled(run)
             merged.save(str(lens_path))
+            self._check_cancelled(run)
             meta = {
                 "name": name,
                 "model_id": params["model_id"],
@@ -398,45 +448,58 @@ class FitManager:
             (out_dir / "meta.json").write_text(
                 json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8"
             )
-            self.state.update(
+            self._check_cancelled(run)
+            self._update(run,
                 state="done",
                 phase="done",
                 lens_path=str(lens_path),
                 meta=meta,
                 eta_seconds=0,
             )
-            self._emit()
+        except _FitCancelled:
+            self._update(run, state="stopped", phase="stopped", eta_seconds=None)
         except Exception as exc:
-            self.state.update(state="error", error=str(exc))
-            self._emit()
+            self._update(run, state="error", error=str(exc))
         finally:
-            if heartbeat_stop is not None:
-                heartbeat_stop.set()
-            heartbeat = self._heartbeat_thread
+            run.heartbeat_stop.set()
+            with run.process_lock:
+                for proc in run.processes:
+                    if proc.poll() is None:
+                        proc.terminate()
+            for proc in run.processes:
+                if proc.poll() is None:
+                    proc.wait()
+            heartbeat = run.heartbeat_thread
             if heartbeat is not None and heartbeat is not threading.current_thread():
-                heartbeat.join(timeout=max(1.0, self._heartbeat_interval * 2))
-            self._heartbeat_stop = None
-            self._heartbeat_thread = None
+                heartbeat.join()
+            for thread in run.helper_threads:
+                if thread is not threading.current_thread():
+                    thread.join()
+            with self._lock:
+                if self._active_run is run:
+                    self._active_run = None
+            run.done.set()
 
-    def _heartbeat(self, stop_event, started):
+    def _heartbeat(self, run, started):
         """Emit elapsed-time updates while at least one fit worker is alive."""
-        while not stop_event.is_set():
-            if not any(proc.poll() is None for proc in self._procs):
+        while not run.heartbeat_stop.is_set():
+            if run.processes and not any(proc.poll() is None for proc in run.processes):
                 return
-            if stop_event.wait(self._heartbeat_interval):
+            if run.heartbeat_stop.wait(self._heartbeat_interval):
                 return
-            self._heartbeat_once(started)
+            self._heartbeat_once(run, started)
 
-    def _heartbeat_once(self, started):
+    def _heartbeat_once(self, run, started):
+        if not self._owns(run):
+            return
         elapsed = round(self._clock() - started, 1)
         self.state["elapsed"] = elapsed
         for worker in self.state.get("workers", []):
             if worker.get("state") in ("loading", "fitting"):
                 worker["elapsed"] = elapsed
-        self._refresh_totals(started)
         self._emit()
 
-    def _read_worker(self, proc, worker_state, started):
+    def _read_worker(self, run, proc, worker_state, started):
         for line in proc.stdout:
             line = line.strip()
             if not line:
@@ -447,9 +510,11 @@ class FitManager:
                 continue
             if not isinstance(event, dict) or not isinstance(event.get("event"), str):
                 continue
-            self._handle_worker_event(event, worker_state, started)
+            self._handle_worker_event(run, event, worker_state, started)
 
-    def _handle_worker_event(self, event, worker_state, started):
+    def _handle_worker_event(self, run, event, worker_state, started):
+        if not self._owns(run):
+            return
         if event["event"] == "loading":
             worker_state["state"] = "loading"
         elif event["event"] == "fitting":
@@ -463,20 +528,23 @@ class FitManager:
             worker_state["done"] = event["done"]
             worker_state["total"] = event["total"]
             worker_state["elapsed"] = round(self._clock() - started, 1)
-            hist = worker_state.setdefault("hist", [])
-            hist.append([worker_state["done"], worker_state["elapsed"]])
-            del hist[:-10]
+            if event["event"] == "progress":
+                hist = worker_state.setdefault("hist", [])
+                hist.append([worker_state["done"], worker_state["elapsed"]])
+                del hist[:-10]
         elif event["event"] == "done":
             worker_state["state"] = "done"
             worker_state["done"] = worker_state["total"]
         else:
             return
-        self._refresh_totals(started)
+        self._refresh_totals(recalculate_eta=event["event"] == "progress")
         self._emit()
 
-    def _refresh_totals(self, started):
+    def _refresh_totals(self, *, recalculate_eta=True):
         workers = self.state.get("workers", [])
         self.state["done"] = sum(w["done"] for w in workers)
+        if not recalculate_eta:
+            return
         etas = []
         for w in workers:
             if not (w["done"] > 0 and w["elapsed"] > 0 and w["done"] < w["total"]):
@@ -486,7 +554,7 @@ class FitManager:
                 # pace over the last 10 updates (sliding window)
                 rate = (hist[-1][0] - hist[0][0]) / (hist[-1][1] - hist[0][1])
             else:
-                rate = w["done"] / w["elapsed"]
+                rate = w["done"] / hist[-1][1]
             etas.append((w["total"] - w["done"]) / rate)
         # multi-GPU: the fit ETA = the slowest worker
         self.state["eta_seconds"] = round(max(etas), 0) if etas else None

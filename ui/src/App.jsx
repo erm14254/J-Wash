@@ -1277,7 +1277,7 @@ export default function App() {
             return (
               <div>
                 <div className="status-line">
-                  {fit.name} · {fit.phase === 'loading' ? 'loading model' : fit.phase === 'fitting' ? `fitting sequence ${Math.min(fit.total, fit.done + 1)} of ${fit.total}` : fit.phase === 'merge' ? 'merging' : fit.phase} · {fit.done}/{fit.total}
+                  {fit.name} · {fit.phase === 'loading' ? 'loading model' : fit.phase === 'fitting' ? `fitting · ${fit.done} of ${fit.total} sequences complete` : fit.phase === 'merge' ? 'merging' : fit.phase} · {fit.done}/{fit.total}
                   {fit.elapsed != null ? ` · elapsed ${Math.max(0, Math.round(fit.elapsed))} sec` : ''}
                   {fit.eta_seconds ? ` · ETA ${Math.max(1, Math.round(fit.eta_seconds / 60))} min` : ''}
                 </div>
