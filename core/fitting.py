@@ -168,6 +168,10 @@ class _FitCancelled(Exception):
     pass
 
 
+class _FitHelperFailed(Exception):
+    pass
+
+
 @dataclass
 class _FitRun:
     cancel: threading.Event = field(default_factory=threading.Event)
@@ -177,8 +181,9 @@ class _FitRun:
     processes: list = field(default_factory=list)
     helper_threads: list = field(default_factory=list)
     reader_threads: list = field(default_factory=list)
-    reader_errors: list = field(default_factory=list)
-    reader_error_lock: threading.Lock = field(default_factory=threading.Lock)
+    helper_failure: threading.Event = field(default_factory=threading.Event)
+    helper_error: tuple | None = None
+    helper_error_lock: threading.Lock = field(default_factory=threading.Lock)
     heartbeat_thread: threading.Thread | None = None
 
 
@@ -281,6 +286,64 @@ class FitManager:
         if run.cancel.is_set() or not self._owns(run):
             raise _FitCancelled()
 
+    def _check_run_viable(self, run):
+        self._check_cancelled(run)
+        if run.helper_failure.is_set():
+            raise _FitHelperFailed()
+
+    def _record_helper_failure(self, run, source, exc, worker=None):
+        """Record a stream-helper failure and unblock run-owned children."""
+        with run.helper_error_lock:
+            if run.helper_error is not None:
+                return False
+            run.helper_error = (source, worker, exc)
+            run.helper_failure.set()
+        run.heartbeat_stop.set()
+        # Process registration uses the same lock.  A concurrent Popen is either
+        # visible here or observes helper_failure immediately after registration.
+        with run.process_lock:
+            processes = list(run.processes)
+        for proc in processes:
+            self._terminate_after_helper_failure(proc)
+        return True
+
+    @staticmethod
+    def _terminate_after_helper_failure(proc):
+        """Best-effort terminate/kill escalation without waiting or reaping."""
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+        except Exception:
+            pass
+        try:
+            # A stream helper has disappeared, so graceful shutdown cannot be
+            # allowed to strand the orchestrator behind a full pipe.
+            if proc.poll() is None and hasattr(proc, "kill"):
+                proc.kill()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _join_run_helpers(run):
+        """Reap children and join helpers without holding the manager lock."""
+        for proc in run.processes:
+            try:
+                proc.wait()
+            except Exception:
+                pass
+        for thread in run.helper_threads:
+            if thread is not threading.current_thread():
+                thread.join()
+
+    def _raise_helper_failure(self, run):
+        with run.helper_error_lock:
+            failure = run.helper_error
+        if failure is None:
+            return
+        source, worker, exc = failure
+        location = f" for worker {worker}" if worker is not None else ""
+        raise RuntimeError(f"{source} failed{location}: {exc}") from exc
+
     def _update(self, run, **changes):
         with self._lock:
             if self._active_run is not run:
@@ -381,9 +444,9 @@ class FitManager:
                 raise _FitCancelled()
 
             for cmd, worker_state in launch_plans:
-                self._check_cancelled(run)
+                self._check_run_viable(run)
                 with run.process_lock:
-                    self._check_cancelled(run)
+                    self._check_run_viable(run)
                     proc = subprocess.Popen(
                         cmd,
                         stdout=subprocess.PIPE,
@@ -393,9 +456,14 @@ class FitManager:
                         cwd=str(config.ROOT),
                     )
                     run.processes.append(proc)
-                    if run.cancel.is_set():
-                        proc.terminate()
-                        raise _FitCancelled()
+                    if run.cancel.is_set() or run.helper_failure.is_set():
+                        if run.helper_failure.is_set():
+                            self._terminate_after_helper_failure(proc)
+                        else:
+                            proc.terminate()
+                        if run.cancel.is_set():
+                            raise _FitCancelled()
+                        raise _FitHelperFailed()
                 reader = threading.Thread(
                     target=self._read_worker,
                     args=(run, proc, worker_state, started),
@@ -419,8 +487,13 @@ class FitManager:
             stderr_tails = [""] * len(run.processes)
 
             def drain_err(index, proc):
-                data = proc.stderr.read()
-                stderr_tails[index] = (data or "")[-2000:]
+                try:
+                    data = proc.stderr.read()
+                    stderr_tails[index] = (data or "")[-2000:]
+                except Exception as exc:
+                    self._record_helper_failure(
+                        run, "stderr drainer", exc, worker=index
+                    )
 
             drainers = [
                 threading.Thread(target=drain_err, args=(i, p), daemon=True)
@@ -439,11 +512,7 @@ class FitManager:
             for t in drainers:
                 t.join()
             self._check_cancelled(run)
-            with run.reader_error_lock:
-                reader_errors = list(run.reader_errors)
-            if reader_errors:
-                index, exc = reader_errors[0]
-                raise RuntimeError(f"worker {index} stdout reader failed: {exc}") from exc
+            self._raise_helper_failure(run)
             failed = [i for i, p in enumerate(run.processes) if p.returncode != 0]
             if failed:
                 detail = " | ".join(stderr_tails[i].strip().splitlines()[-1] if stderr_tails[i].strip() else "?" for i in failed)
@@ -512,6 +581,18 @@ class FitManager:
             })
         except _FitCancelled:
             self._publish_terminal(run)
+        except _FitHelperFailed:
+            # A helper can fail while a later worker is being registered.  The
+            # normal post-wait drain has not been reached in that path, so make
+            # all run-owned resources quiescent before terminal publication.
+            self._join_run_helpers(run)
+            if run.cancel.is_set():
+                self._publish_terminal(run)
+            else:
+                try:
+                    self._raise_helper_failure(run)
+                except Exception as exc:
+                    self._publish_terminal(run, error=exc)
         except Exception as exc:
             self._publish_terminal(run, error=exc)
         finally:
@@ -573,8 +654,9 @@ class FitManager:
                 index = run.processes.index(proc)
             except ValueError:
                 index = -1
-            with run.reader_error_lock:
-                run.reader_errors.append((index, exc))
+            self._record_helper_failure(
+                run, "stdout reader", exc, worker=index
+            )
 
     def _handle_worker_event(self, run, event, worker_state, started):
         with self._lock:

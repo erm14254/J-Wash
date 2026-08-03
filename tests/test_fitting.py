@@ -829,3 +829,216 @@ def test_ui_auto_dim_batch_help_has_no_numeric_policy():
     source = (fitting.config.ROOT / "ui" / "src" / "App.jsx").read_text(encoding="utf-8")
     tooltip = source.split('title="auto is selected', 1)[1].split('"', 1)[0]
     assert "15" not in tooltip and "4" not in tooltip and "2" not in tooltip
+
+
+class _HelperBlockedProcess(_Process):
+    """A worker that cannot exit until manager-driven termination occurs."""
+
+    def __init__(self, *, stdout="", stderr=None):
+        super().__init__(release=threading.Event(), stdout=stdout)
+        if stderr is not None:
+            self.stderr = stderr
+        self.killed = False
+
+    def terminate(self):
+        super().terminate()
+        self._release.set()
+
+    def kill(self):
+        self.killed = True
+        self.terminated = True
+        self._release.set()
+
+
+class _RaiseOnceOnFitting:
+    def __init__(self):
+        self.raised = False
+
+    def __call__(self, state):
+        if state.get("phase") == "fitting" and not self.raised:
+            self.raised = True
+            raise RuntimeError("progress callback failed")
+
+
+def test_stdout_reader_failure_terminates_live_worker_and_surfaces_error(
+    fit_env, monkeypatch
+):
+    monkeypatch.setattr(fitting, "_load_corpus", lambda *a: ["prompt"])
+    proc = _HelperBlockedProcess(stdout='{"event":"fitting"}\n')
+    monkeypatch.setattr(fitting.subprocess, "Popen", lambda *a, **k: proc)
+    merge_started = threading.Event()
+    monkeypatch.setattr(
+        fitting.JacobianLens,
+        "load",
+        lambda *a: (merge_started.set(), _Lens())[1],
+    )
+    manager = fitting.FitManager(heartbeat_interval=0.01)
+    manager.on_progress = _RaiseOnceOnFitting()
+    _start(manager)
+    run = manager._active_run
+
+    _wait(run.helper_failure, "stdout helper failure was not signalled")
+    _wait(run.done, "helper failure did not unblock the fit")
+
+    assert proc.terminated and proc.waited
+    assert manager.state["state"] == "error"
+    assert "stdout reader failed" in manager.state["error"]
+    assert "progress callback failed" in manager.state["error"]
+    assert not merge_started.is_set()
+    assert run.heartbeat_stop.is_set()
+    assert all(not thread.is_alive() for thread in run.helper_threads)
+    assert manager._active_run is None
+
+
+def test_stdout_reader_failure_user_cancel_has_precedence(fit_env, monkeypatch):
+    monkeypatch.setattr(fitting, "_load_corpus", lambda *a: ["prompt"])
+    release_termination = threading.Event()
+
+    class DelayedTermination(_HelperBlockedProcess):
+        def terminate(self):
+            self.terminated = True
+            _wait(release_termination)
+
+        def kill(self):
+            self.killed = True
+            self._release.set()
+
+    proc = DelayedTermination(stdout='{"event":"fitting"}\n')
+    monkeypatch.setattr(fitting.subprocess, "Popen", lambda *a, **k: proc)
+    manager = fitting.FitManager(heartbeat_interval=0.01)
+    manager.on_progress = _RaiseOnceOnFitting()
+    _start(manager)
+    run = manager._active_run
+    _wait(run.helper_failure)
+    stopper = threading.Thread(target=manager.stop)
+    stopper.start()
+    assert run.cancel.wait(1)
+    release_termination.set()
+    stopper.join()
+    _wait(run.done)
+    assert manager.state["state"] == "stopped"
+
+
+class _ExplodingStderr:
+    def read(self):
+        raise OSError("stderr pipe failed")
+
+
+def test_stderr_drainer_failure_terminates_live_worker_and_surfaces_error(
+    fit_env, monkeypatch
+):
+    monkeypatch.setattr(fitting, "_load_corpus", lambda *a: ["prompt"])
+    proc = _HelperBlockedProcess(
+        stdout='{"event":"fitting"}\n', stderr=_ExplodingStderr()
+    )
+    monkeypatch.setattr(fitting.subprocess, "Popen", lambda *a, **k: proc)
+    manager = fitting.FitManager(heartbeat_interval=0.01)
+    _start(manager)
+    run = manager._active_run
+    _wait(run.done)
+    assert proc.terminated and proc.waited
+    assert manager.state["state"] == "error"
+    assert "stderr drainer failed" in manager.state["error"]
+    assert "stderr pipe failed" in manager.state["error"]
+
+
+def test_helper_failure_first_error_wins():
+    manager = fitting.FitManager()
+    run = fitting._FitRun()
+    manager._record_helper_failure(
+        run, "stdout reader", RuntimeError("first failure"), worker=0
+    )
+    manager._record_helper_failure(
+        run, "stderr drainer", RuntimeError("second failure"), worker=0
+    )
+    with pytest.raises(RuntimeError, match="stdout reader.*first failure"):
+        manager._raise_helper_failure(run)
+
+
+def test_real_subprocess_pipe_backpressure_recovery(fit_env, monkeypatch, tmp_path):
+    monkeypatch.setattr(fitting, "_load_corpus", lambda *a: ["prompt"])
+    worker = tmp_path / "stream_worker.py"
+    worker.write_text(
+        "import json\n"
+        "while True:\n"
+        " print(json.dumps({'event': 'fitting'}), flush=True)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(fitting, "WORKER", worker)
+    manager = fitting.FitManager(heartbeat_interval=0.01)
+    manager.on_progress = _RaiseOnceOnFitting()
+    _start(manager)
+    run = manager._active_run
+    _wait(run.done, "real streaming child was not terminated")
+    assert manager.state["state"] == "error"
+    assert "stdout reader failed" in manager.state["error"]
+    assert "progress callback failed" in manager.state["error"]
+    assert run.processes[0].poll() is not None
+
+
+def test_helper_failure_during_later_worker_spawn(fit_env, monkeypatch):
+    monkeypatch.setattr(fitting, "_load_corpus", lambda *a: ["one", "two"])
+    release_stdout = threading.Event()
+    second_spawned = threading.Event()
+    release_second = threading.Event()
+    first = _HelperBlockedProcess()
+    first.stdout = _BlockingStdout(release_stdout, '{"event":"fitting"}\n')
+    second = _HelperBlockedProcess(stdout='{"event":"done"}\n')
+    calls = [0]
+
+    def popen(*args, **kwargs):
+        calls[0] += 1
+        if calls[0] == 1:
+            return first
+        second_spawned.set()
+        _wait(release_second)
+        return second
+
+    monkeypatch.setattr(fitting.subprocess, "Popen", popen)
+    manager = fitting.FitManager(heartbeat_interval=0.01)
+    manager.on_progress = _RaiseOnceOnFitting()
+    manager.start(
+        model_id="local/model", source="local/model", n_prompts=2,
+        devices=("cuda:0", "cuda:1"), name="fit", dim_batch=2,
+        datasets=("local/corpus",),
+    )
+    run = manager._active_run
+    _wait(second_spawned)
+    release_stdout.set()
+    _wait(run.helper_failure)
+    release_second.set()
+    _wait(run.done)
+
+    assert first.terminated and first.waited
+    assert second.terminated and second.waited
+    assert manager.state["state"] == "error"
+    assert "stdout reader failed" in manager.state["error"]
+    assert all(not thread.is_alive() for thread in run.helper_threads)
+
+
+def test_manager_lock_available_during_helper_failure_cleanup(fit_env, monkeypatch):
+    monkeypatch.setattr(fitting, "_load_corpus", lambda *a: ["prompt"])
+    terminate_entered = threading.Event()
+    release_terminate = threading.Event()
+
+    class BlockingTerminate(_HelperBlockedProcess):
+        def terminate(self):
+            self.terminated = True
+            terminate_entered.set()
+            _wait(release_terminate)
+            self._release.set()
+
+    proc = BlockingTerminate(stdout='{"event":"fitting"}\n')
+    monkeypatch.setattr(fitting.subprocess, "Popen", lambda *a, **k: proc)
+    manager = fitting.FitManager(heartbeat_interval=0.01)
+    manager.on_progress = _RaiseOnceOnFitting()
+    _start(manager)
+    run = manager._active_run
+    _wait(terminate_entered)
+
+    acquired = manager._lock.acquire(timeout=1)
+    assert acquired, "helper cleanup held the FitManager lock"
+    manager._lock.release()
+    release_terminate.set()
+    _wait(run.done)
+    assert manager.state["state"] == "error"
