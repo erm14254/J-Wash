@@ -46,14 +46,13 @@ def _hold(path, conn):
     lease.release(remove=False)
 
 
-def _inspect_while_child_holds(path, observer):
+def _inspect_while_child_holds(root, path, observer):
     parent, child = multiprocessing.Pipe()
     proc = multiprocessing.Process(target=_hold, args=(path, child))
     proc.start()
     assert parent.recv() == "ready"
     try:
-        return _inspect(path.parents[1] if path.parent.name == "nested" else path.parent,
-                        observer=observer)
+        return _inspect(root, observer=observer)
     finally:
         parent.send("release")
         proc.join(10)
@@ -355,7 +354,7 @@ def test_held_lease_candidate_leaf_replacement_is_unsafe(tmp_path):
             path.rename(original)
             path.symlink_to(target)
 
-    result = _inspect_while_child_holds(path, observer)
+    result = _inspect_while_child_holds(tmp_path, path, observer)
     assert result["active"] == []
     assert result["changed_or_unsafe"] == [str(path)]
     assert "changed" in result["errors"][0]["error"]
@@ -376,7 +375,7 @@ def test_held_lease_parent_replacement_is_unsafe(tmp_path):
             parent.rename(moved)
             parent.symlink_to(replacement, target_is_directory=True)
 
-    result = _inspect_while_child_holds(path, observer)
+    result = _inspect_while_child_holds(tmp_path, path, observer)
     assert result["active"] == []
     assert result["changed_or_unsafe"] == [str(path)]
     assert "changed" in result["errors"][0]["error"]
@@ -397,7 +396,7 @@ def test_held_lease_leaf_replacement_is_unsafe(tmp_path):
             lease_path.rename(original_lease)
             lease_path.write_bytes(replacement)
 
-    result = _inspect_while_child_holds(path, observer)
+    result = _inspect_while_child_holds(tmp_path, path, observer)
     assert result["active"] == []
     assert result["changed_or_unsafe"] == [str(path)]
     assert "lease changed" in result["errors"][0]["error"]
@@ -413,7 +412,7 @@ def test_child_held_lease_allows_mutable_candidate_metadata(tmp_path):
         if phase == "after_held_lease_probe":
             path.write_bytes(b"updated-with-same-inode-and-new-size")
 
-    result = _inspect_while_child_holds(path, observer)
+    result = _inspect_while_child_holds(tmp_path, path, observer)
     assert result["active"] == [str(path)]
     assert result["changed_or_unsafe"] == []
     assert path.read_bytes() == b"updated-with-same-inode-and-new-size"
