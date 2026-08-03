@@ -12,7 +12,7 @@ NOW = OLD + editing.DEFAULT_TEMP_STALE_AGE + 10
 
 
 def _mtime(path, value=OLD):
-    os.utime(path, (value, value), follow_symlinks=False)
+    os.utime(path, (value, value))
 
 
 def _stage(root, name=f".model.tmp-{HEX}", *, mtime=OLD):
