@@ -247,6 +247,8 @@ class FitManager:
             run = self._active_run
             if run is None:
                 return dict(self.state)
+            if self.state.get("state") in ("done", "error", "stopped"):
+                return dict(self.state)
             run.cancel.set()
             run.heartbeat_stop.set()
             if self._active_run is run and self.state.get("state") == "running":
@@ -271,6 +273,20 @@ class FitManager:
             if self._active_run is not run:
                 return False
             self.state.update(changes)
+        self._emit()
+        return True
+
+    def _publish_terminal(self, run, *, success=None, error=None):
+        """Linearize cancellation against terminal state publication."""
+        with self._lock:
+            if self._active_run is not run:
+                return False
+            if run.cancel.is_set():
+                self.state.update(state="stopped", phase="stopped", eta_seconds=None)
+            elif success is not None:
+                self.state.update(success)
+            else:
+                self.state.update(state="error", error=str(error), eta_seconds=None)
         self._emit()
         return True
 
@@ -350,6 +366,8 @@ class FitManager:
                     # RECENT pace (throughput can degrade mid-fit, e.g. VRAM
                     # saturated — a global average would then freeze the ETA)
                     "hist": [],
+                    "baseline_done": 0,
+                    "baseline_elapsed": 0.0,
                 }
                 workers.append(worker_state)
                 reader = threading.Thread(
@@ -450,18 +468,17 @@ class FitManager:
             (out_dir / "meta.json").write_text(
                 json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8"
             )
-            self._check_cancelled(run)
-            self._update(run,
-                state="done",
-                phase="done",
-                lens_path=str(lens_path),
-                meta=meta,
-                eta_seconds=0,
-            )
+            self._publish_terminal(run, success={
+                "state": "done",
+                "phase": "done",
+                "lens_path": str(lens_path),
+                "meta": meta,
+                "eta_seconds": 0,
+            })
         except _FitCancelled:
-            self._update(run, state="stopped", phase="stopped", eta_seconds=None)
+            self._publish_terminal(run)
         except Exception as exc:
-            self._update(run, state="error", error=str(exc))
+            self._publish_terminal(run, error=exc)
         finally:
             run.heartbeat_stop.set()
             with run.process_lock:
@@ -543,7 +560,11 @@ class FitManager:
                 worker_state["done"] = done
                 worker_state["total"] = total
                 worker_state["elapsed"] = round(self._clock() - started, 1)
-                if event["event"] == "progress":
+                if event["event"] == "resume":
+                    worker_state["baseline_done"] = done
+                    worker_state["baseline_elapsed"] = worker_state["elapsed"]
+                    worker_state["hist"] = []
+                else:
                     hist = worker_state.setdefault("hist", [])
                     hist.append([done, worker_state["elapsed"]])
                     del hist[:-10]
@@ -552,7 +573,9 @@ class FitManager:
                 worker_state["done"] = worker_state["total"]
             else:
                 return
-            self._refresh_totals(recalculate_eta=event["event"] == "progress")
+            self._refresh_totals(
+                recalculate_eta=event["event"] in ("progress", "done")
+            )
         self._emit()
 
     def _refresh_totals(self, *, recalculate_eta=True):
@@ -561,18 +584,28 @@ class FitManager:
         if not recalculate_eta:
             return
         etas = []
+        unknown_unfinished = False
         for w in workers:
-            if not (w["done"] > 0 and w["elapsed"] > 0 and w["done"] < w["total"]):
+            if w["done"] >= w["total"]:
                 continue
             hist = w.get("hist") or []
             if len(hist) >= 2 and hist[-1][1] > hist[0][1] and hist[-1][0] > hist[0][0]:
                 # pace over the last 10 updates (sliding window)
                 rate = (hist[-1][0] - hist[0][0]) / (hist[-1][1] - hist[0][1])
+            elif hist:
+                progress_delta = hist[-1][0] - w.get("baseline_done", 0)
+                elapsed_delta = hist[-1][1] - w.get("baseline_elapsed", 0.0)
+                rate = progress_delta / elapsed_delta if progress_delta > 0 and elapsed_delta > 0 else 0
             else:
-                rate = w["done"] / hist[-1][1]
+                rate = 0
+            if not rate or not (rate < float("inf")):
+                unknown_unfinished = True
+                continue
             etas.append((w["total"] - w["done"]) / rate)
         # multi-GPU: the fit ETA = the slowest worker
-        self.state["eta_seconds"] = round(max(etas), 0) if etas else None
+        self.state["eta_seconds"] = (
+            None if unknown_unfinished or not etas else round(max(etas), 0)
+        )
         try:
             self.state["vram"] = [
                 {"index": g["index"], "used_gb": round(g["vram_used"] / 2**30, 1)}

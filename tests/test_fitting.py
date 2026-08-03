@@ -323,6 +323,106 @@ def test_resume_updates_done_without_creating_completion_sample():
     assert manager.state["eta_seconds"] is None
 
 
+def test_resume_worker_then_other_worker_progress_does_not_crash():
+    now = [0.0]
+    manager, run = _eta_manager(lambda: now[0])
+    first = manager.state["workers"][0]
+    second = _worker(total=3)
+    manager.state["workers"].append(second)
+    manager._handle_worker_event(run, {"event": "resume", "done": 1, "total": 3}, first, 0)
+
+    now[0] = 10.0
+    manager._handle_worker_event(run, {"event": "progress", "done": 1, "total": 3}, second, 0)
+    assert manager.state["done"] == 2
+    assert manager.state["eta_seconds"] is None
+    assert first["hist"] == []
+
+    now[0] = 20.0
+    manager._handle_worker_event(run, {"event": "progress", "done": 2, "total": 3}, second, 0)
+    assert second["done"] == 2
+
+
+def test_first_post_resume_completion_uses_delta_rate():
+    now = [0.0]
+    manager, run = _eta_manager(lambda: now[0])
+    worker = manager.state["workers"][0]
+    manager._handle_worker_event(run, {"event": "resume", "done": 50, "total": 100}, worker, 0)
+    now[0] = 10.0
+    manager._handle_worker_event(run, {"event": "progress", "done": 51, "total": 100}, worker, 0)
+    assert manager.state["eta_seconds"] == 490
+
+
+def test_resumed_worker_eta_uses_current_process_recent_window():
+    now = [0.0]
+    manager, run = _eta_manager(lambda: now[0])
+    worker = manager.state["workers"][0]
+    manager._handle_worker_event(run, {"event": "resume", "done": 50, "total": 100}, worker, 0)
+    now[0] = 10.0
+    manager._handle_worker_event(run, {"event": "progress", "done": 51, "total": 100}, worker, 0)
+    now[0] = 30.0
+    manager._handle_worker_event(run, {"event": "progress", "done": 52, "total": 100}, worker, 0)
+    assert manager.state["eta_seconds"] == 960
+
+
+def test_done_event_clears_stale_eta():
+    now = [10.0]
+    manager, run = _eta_manager(lambda: now[0])
+    worker = manager.state["workers"][0]
+    manager._handle_worker_event(run, {"event": "progress", "done": 1, "total": 3}, worker, 0)
+    assert manager.state["eta_seconds"] == 20
+    manager._handle_worker_event(run, {"event": "done"}, worker, 0)
+    assert manager.state["done"] == 3
+    assert manager.state["eta_seconds"] is None
+
+
+def test_stop_and_success_publication_are_linearized():
+    manager = fitting.FitManager()
+    run = fitting._FitRun()
+    manager._active_run = run
+    manager.state = {"state": "running", "eta_seconds": 12}
+    manager._emit = lambda: None
+
+    manager.stop()
+    manager._publish_terminal(run, success={"state": "done", "eta_seconds": 0})
+    assert manager.state["state"] == "stopped"
+
+    second = fitting._FitRun()
+    manager._active_run = second
+    manager.state = {"state": "running"}
+    manager._publish_terminal(second, success={"state": "done", "eta_seconds": 0})
+    assert manager.stop()["state"] == "done"
+    assert not second.cancel.is_set()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_popen_failure_respects_concurrent_cancellation(fit_env, monkeypatch, cancel):
+    monkeypatch.setattr(fitting, "_load_corpus", lambda *a: ["prompt"])
+    entered = threading.Event()
+    release = threading.Event()
+
+    def popen(*args, **kwargs):
+        entered.set()
+        _wait(release)
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(fitting.subprocess, "Popen", popen)
+    manager = fitting.FitManager(heartbeat_interval=0.01)
+    _start(manager)
+    run = manager._active_run
+    _wait(entered)
+    if cancel:
+        stopper = threading.Thread(target=manager.stop)
+        stopper.start()
+        assert run.cancel.wait(1)
+    release.set()
+    if cancel:
+        stopper.join()
+    _wait(run.done)
+    assert manager.state["state"] == ("stopped" if cancel else "error")
+    assert run.processes == []
+    assert run.heartbeat_thread is None
+
+
 def test_eta_first_sample_uses_completion_timestamp_not_heartbeat_elapsed():
     now = [10.0]
     manager, run = _eta_manager(lambda: now[0])
