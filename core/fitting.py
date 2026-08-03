@@ -335,14 +335,40 @@ class FitManager:
             if thread is not threading.current_thread():
                 thread.join()
 
-    def _raise_helper_failure(self, run):
+    def _helper_exception(self, run):
         with run.helper_error_lock:
             failure = run.helper_error
         if failure is None:
-            return
+            return None
         source, worker, exc = failure
         location = f" for worker {worker}" if worker is not None else ""
-        raise RuntimeError(f"{source} failed{location}: {exc}") from exc
+        error = RuntimeError(f"{source} failed{location}: {exc}")
+        error.__cause__ = exc
+        return error
+
+    def _raise_helper_failure(self, run):
+        error = self._helper_exception(run)
+        if error is not None:
+            raise error
+
+    def _quiesce_failed_run(self, run):
+        """Stop and join run-owned resources before publishing a failure."""
+        run.heartbeat_stop.set()
+        with run.process_lock:
+            processes = list(run.processes)
+        for proc in processes:
+            if proc.poll() is None:
+                self._terminate_after_helper_failure(proc)
+        self._join_run_helpers(run)
+        heartbeat = run.heartbeat_thread
+        if heartbeat is not None and heartbeat is not threading.current_thread():
+            heartbeat.join()
+
+    def _publish_preferred_failure(self, run, fallback):
+        """Publish cancel > first helper failure > orchestration failure."""
+        self._quiesce_failed_run(run)
+        error = self._helper_exception(run) or fallback
+        self._publish_terminal(run, error=error)
 
     def _update(self, run, **changes):
         with self._lock:
@@ -363,7 +389,12 @@ class FitManager:
                 self.state.update(success)
             else:
                 self.state.update(state="error", error=str(error), eta_seconds=None)
-        self._emit()
+        try:
+            self._emit()
+        except Exception:
+            # Terminal state is already linearized.  A broken observer must not
+            # escape the run thread or prevent identity-checked cleanup.
+            pass
         return True
 
     def _run(self, run, name, params):
@@ -580,21 +611,14 @@ class FitManager:
                 "eta_seconds": 0,
             })
         except _FitCancelled:
+            self._quiesce_failed_run(run)
             self._publish_terminal(run)
         except _FitHelperFailed:
-            # A helper can fail while a later worker is being registered.  The
-            # normal post-wait drain has not been reached in that path, so make
-            # all run-owned resources quiescent before terminal publication.
-            self._join_run_helpers(run)
-            if run.cancel.is_set():
-                self._publish_terminal(run)
-            else:
-                try:
-                    self._raise_helper_failure(run)
-                except Exception as exc:
-                    self._publish_terminal(run, error=exc)
+            self._publish_preferred_failure(
+                run, RuntimeError("fit helper failed without an error record")
+            )
         except Exception as exc:
-            self._publish_terminal(run, error=exc)
+            self._publish_preferred_failure(run, exc)
         finally:
             run.heartbeat_stop.set()
             with run.process_lock:
@@ -618,12 +642,15 @@ class FitManager:
 
     def _heartbeat(self, run, started):
         """Emit elapsed-time updates while at least one fit worker is alive."""
-        while not run.heartbeat_stop.is_set():
-            if run.processes and not any(proc.poll() is None for proc in run.processes):
-                return
-            if run.heartbeat_stop.wait(self._heartbeat_interval):
-                return
-            self._heartbeat_once(run, started)
+        try:
+            while not run.heartbeat_stop.is_set():
+                if run.processes and not any(proc.poll() is None for proc in run.processes):
+                    return
+                if run.heartbeat_stop.wait(self._heartbeat_interval):
+                    return
+                self._heartbeat_once(run, started)
+        except Exception as exc:
+            self._record_helper_failure(run, "heartbeat", exc)
 
     def _heartbeat_once(self, run, started):
         with self._lock:
