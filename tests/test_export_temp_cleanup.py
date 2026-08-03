@@ -536,6 +536,43 @@ def test_completion_marker_replaced_by_symlink_is_fail_closed(tmp_path):
     assert "safe regular file" in result["errors"][0]["error"]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor marker inspection")
+def test_parent_change_during_completion_marker_inspection_is_fail_closed(tmp_path):
+    parent = tmp_path / "nested"
+    candidate = _stage(parent)
+    marker = candidate / "edit_meta.json"
+    marker.write_text(json.dumps({"name": "model"}))
+    _mtime(marker, OLD)
+    _mtime(candidate, OLD)
+
+    moved = tmp_path / "moved"
+    replacement_parent = tmp_path / "replacement"
+    replacement_candidate = replacement_parent / candidate.name
+    replacement_candidate.mkdir(parents=True)
+    replacement_marker = replacement_candidate / "edit_meta.json"
+    replacement_marker.write_text(json.dumps({"name": f"nested/{candidate.name}"}))
+    sentinel = replacement_candidate / "sentinel"
+    sentinel.write_text("keep")
+
+    def observer(phase, _value):
+        if phase == "before_marker_open":
+            parent.rename(moved)
+            parent.symlink_to(replacement_parent, target_is_directory=True)
+
+    try:
+        result = editing.cleanup_abandoned_export_temps(
+            root=tmp_path, now=NOW, observer=observer,
+        )
+    except (OSError, NotImplementedError):
+        pytest.skip("directory symlinks are unavailable")
+
+    assert (moved / candidate.name / "edit_meta.json").is_file()
+    assert parent.is_symlink()
+    assert sentinel.read_text() == "keep"
+    assert result["removed_count"] == 0
+    assert str(candidate) in result["skipped_changed"]
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
 def test_windows_junction_cleanup_root_is_refused(tmp_path):
     outside = tmp_path / "outside"

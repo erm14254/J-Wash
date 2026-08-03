@@ -136,12 +136,16 @@ def artifact_lease(artifact):
 def _is_link_or_reparse(path, path_stat=None):
     path_stat = path.lstat() if path_stat is None else path_stat
     return (
-        stat.S_ISLNK(path_stat.st_mode)
+        _stat_is_link_or_reparse(path_stat)
         or getattr(path, "is_junction", lambda: False)()
-        or bool(
-            getattr(path_stat, "st_file_attributes", 0)
-            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
-        )
+    )
+
+
+def _stat_is_link_or_reparse(path_stat):
+    """Classify links from no-follow stat data without another path lookup."""
+    return stat.S_ISLNK(path_stat.st_mode) or bool(
+        getattr(path_stat, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
     )
 
 
@@ -282,7 +286,7 @@ class _AnchoredCleanupParent:
 
     def stat_leaf(self, leaf, expected_identity=None, *, full=False):
         current = os.stat(leaf, dir_fd=self.parent_fd, follow_symlinks=False)
-        if _is_link_or_reparse(Path(leaf), current):
+        if _stat_is_link_or_reparse(current):
             raise _UnsafeAnchoredCleanup("temporary artifact became a link/reparse point")
         expected_type = stat.S_ISDIR if self.candidate.kind == "directory" else stat.S_ISREG
         if not expected_type(current.st_mode):
@@ -293,6 +297,47 @@ class _AnchoredCleanupParent:
             if actual != expected:
                 raise _UnsafeAnchoredCleanup("temporary artifact identity changed")
         return current
+
+    def read_completion_marker(self, observer=None):
+        """Read ``edit_meta.json`` through the retained candidate-parent fd."""
+        if self.candidate.kind != "directory":
+            raise _UnsafeAnchoredCleanup("completion marker requires a directory artifact")
+        flags = (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        )
+        candidate_fd = os.open(self.candidate.path.name, flags, dir_fd=self.parent_fd)
+        try:
+            candidate_stat = os.fstat(candidate_fd)
+            if (
+                _stat_is_link_or_reparse(candidate_stat)
+                or _candidate_identity(candidate_stat) != self.candidate.identity
+                or not stat.S_ISDIR(candidate_stat.st_mode)
+            ):
+                raise _UnsafeAnchoredCleanup(
+                    "temporary artifact changed during completion marker inspection"
+                )
+            if observer:
+                observer("before_marker_open", self.candidate.path)
+            marker_stat = os.stat(
+                "edit_meta.json", dir_fd=candidate_fd, follow_symlinks=False,
+            )
+            if _stat_is_link_or_reparse(marker_stat) or not stat.S_ISREG(marker_stat.st_mode):
+                raise ValueError("possible completion marker is not a safe regular file")
+            marker_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+            marker_fd = os.open("edit_meta.json", marker_flags, dir_fd=candidate_fd)
+            try:
+                opened = os.fstat(marker_fd)
+                if _stat_identity(opened) != _stat_identity(marker_stat):
+                    raise ValueError("possible completion marker changed during inspection")
+                with os.fdopen(marker_fd, "r", encoding="utf-8") as stream:
+                    marker_fd = None
+                    return json.load(stream)
+            finally:
+                if marker_fd is not None:
+                    os.close(marker_fd)
+        finally:
+            os.close(candidate_fd)
 
     def claim(self, claim_leaf):
         os.replace(
@@ -498,7 +543,13 @@ def cleanup_abandoned_export_temps(
                         marker_present = True
                     if marker_present:
                         try:
-                            metadata = _read_completion_marker(marker)
+                            if os.name == "nt":
+                                raise _UnsafeAnchoredCleanup(
+                                    "safe handle-relative completion marker inspection "
+                                    "is unavailable on Windows"
+                                )
+                            with _AnchoredCleanupParent(candidate) as marker_parent:
+                                metadata = marker_parent.read_completion_marker(observer)
                         except Exception as exc:
                             raise ValueError(f"cannot inspect possible completion marker: {exc}") from exc
                         relative_name = path.relative_to(root).as_posix()
