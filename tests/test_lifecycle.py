@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import logging
+import threading
 
 from fastapi.testclient import TestClient
 
@@ -70,3 +71,21 @@ def test_no_deprecated_event_handlers_remain():
     assert app_module.app.router.on_startup == []
     assert app_module.app.router.on_shutdown == []
     assert "on_event" not in inspect.getsource(app_module)
+
+
+def test_cleanup_runs_off_the_event_loop_thread(monkeypatch):
+    cleanup_thread = []
+
+    def cleanup():
+        cleanup_thread.append(threading.get_ident())
+        return _result()
+
+    monkeypatch.setattr(app_module.editing, "cleanup_abandoned_export_temps", cleanup)
+
+    async def exercise():
+        loop_thread = threading.get_ident()
+        async with app_module.lifespan(None):
+            assert cleanup_thread == [cleanup_thread[0]]
+        assert cleanup_thread[0] != loop_thread
+
+    asyncio.run(exercise())
