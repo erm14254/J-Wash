@@ -43,6 +43,33 @@ def _mark_windows_file_for_deletion(file):
         raise ctypes.WinError(ctypes.get_last_error())
 
 
+def _open_windows_lease(path, *, create):
+    """Open a lease with DELETE access so disposal stays handle-bound."""
+    import ctypes
+    import msvcrt
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    access = 0x80000000 | 0x40000000 | 0x00010000  # read, write, delete
+    sharing = 0x1 | 0x2 | 0x4
+    flags = 0x00200000  # FILE_FLAG_OPEN_REPARSE_POINT
+
+    def open_handle(disposition):
+        handle = kernel32.CreateFileW(
+            str(path), access, sharing, None, disposition, flags, None,
+        )
+        if handle == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return msvcrt.open_osfhandle(handle, os.O_RDWR)
+
+    if create:
+        try:
+            return open_handle(1), True  # CREATE_NEW
+        except FileExistsError:
+            pass
+    return open_handle(3), False  # OPEN_EXISTING
+
+
 def internal_temp_leaf_kind(name):
     """Classify exact J-Wash temporary/lease leaf names."""
     artifact_name = name[:-6] if name.endswith(".lease") else name
@@ -68,19 +95,21 @@ class ArtifactLease:
     def acquire(self, *, blocking=True):
         created = False
         parent_fd = None
-        if os.name != "nt":
+        if os.name == "nt":
+            fd, created = _open_windows_lease(self.path, create=self.create)
+        else:
             parent_chain = _snapshot_directory_chain(_absolute_no_follow(self.path.parent))
             parent_fd = _open_verified_directory_chain(parent_chain)
-        open_path = self.path.name if parent_fd is not None else self.path
-        open_kwargs = {"dir_fd": parent_fd} if parent_fd is not None else {}
-        if self.create:
-            try:
-                fd = os.open(open_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600, **open_kwargs)
-                created = True
-            except FileExistsError:
+            open_path = self.path.name
+            open_kwargs = {"dir_fd": parent_fd}
+            if self.create:
+                try:
+                    fd = os.open(open_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600, **open_kwargs)
+                    created = True
+                except FileExistsError:
+                    fd = os.open(open_path, os.O_RDWR, **open_kwargs)
+            else:
                 fd = os.open(open_path, os.O_RDWR, **open_kwargs)
-        else:
-            fd = os.open(open_path, os.O_RDWR, **open_kwargs)
         file = os.fdopen(fd, "r+b")
 
         def close_unacquired():
