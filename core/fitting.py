@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import re
 import subprocess
 import sys
@@ -152,6 +153,15 @@ def _default_dim_batch(device):
 
 def _now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _finite_number(value):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 class _FitCancelled(Exception):
@@ -588,7 +598,15 @@ class FitManager:
         for w in workers:
             if w["done"] >= w["total"]:
                 continue
-            hist = w.get("hist") or []
+            hist = [
+                sample for sample in (w.get("hist") or [])
+                if (
+                    isinstance(sample, (list, tuple))
+                    and len(sample) == 2
+                    and _finite_number(sample[0])
+                    and _finite_number(sample[1])
+                )
+            ]
             if len(hist) >= 2 and hist[-1][1] > hist[0][1] and hist[-1][0] > hist[0][0]:
                 # pace over the last 10 updates (sliding window)
                 rate = (hist[-1][0] - hist[0][0]) / (hist[-1][1] - hist[0][1])
@@ -598,7 +616,7 @@ class FitManager:
                 rate = progress_delta / elapsed_delta if progress_delta > 0 and elapsed_delta > 0 else 0
             else:
                 rate = 0
-            if not rate or not (rate < float("inf")):
+            if not rate or not math.isfinite(rate):
                 unknown_unfinished = True
                 continue
             etas.append((w["total"] - w["done"]) / rate)

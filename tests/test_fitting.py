@@ -342,6 +342,52 @@ def test_resume_worker_then_other_worker_progress_does_not_crash():
     assert second["done"] == 2
 
 
+def test_reader_continues_with_unestimated_resumed_worker():
+    now = [0.0]
+    manager, run = _eta_manager(lambda: now[0])
+    resumed = manager.state["workers"][0]
+    active = _worker(total=3)
+    manager.state["workers"].append(active)
+    manager._handle_worker_event(
+        run, {"event": "resume", "done": 1, "total": 3}, resumed, 0
+    )
+
+    now[0] = 10.0
+    proc = SimpleNamespace(
+        stdout=io.StringIO(
+            '{"event":"progress","done":1,"total":3}\n'
+            'not-json\n'
+            '{"event":"progress","done":2,"total":3}\n'
+        )
+    )
+    manager._read_worker(run, proc, active, 0)
+
+    assert active["done"] == 2
+    assert len(active["hist"]) == 2
+    # The resumed worker is unfinished but has no post-resume observation, so
+    # reporting the other worker's estimate would understate total fit time.
+    assert manager.state["eta_seconds"] is None
+
+
+def test_malformed_completion_history_fails_eta_closed_without_stopping_reader():
+    now = [10.0]
+    manager, run = _eta_manager(lambda: now[0])
+    worker = manager.state["workers"][0]
+    worker["hist"] = [[1], None, [float("nan"), 2.0]]
+    proc = SimpleNamespace(
+        stdout=io.StringIO(
+            '{"event":"progress","done":1,"total":3}\n'
+            '{"event":"progress","done":2,"total":3}\n'
+        )
+    )
+
+    manager._read_worker(run, proc, worker, 0)
+
+    assert worker["done"] == 2
+    assert manager.state["done"] == 2
+    assert manager.state["eta_seconds"] == 5
+
+
 def test_first_post_resume_completion_uses_delta_rate():
     now = [0.0]
     manager, run = _eta_manager(lambda: now[0])
