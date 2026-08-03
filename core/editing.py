@@ -24,7 +24,6 @@ PRESETS_DIR = config.DATA_DIR / "presets"
 DEFAULT_TEMP_STALE_AGE = 24 * 60 * 60
 _TEMP_STAGE_RE = re.compile(r"^\..+\.tmp-[0-9a-f]{32}$")
 _TEMP_GGUF_RE = re.compile(r"^\..+\.tmp-[0-9a-f]{32}\.gguf$")
-_RMTREE_DIR_FD_SAFE = bool(getattr(shutil.rmtree, "avoids_symlink_attacks", False))
 
 
 def internal_temp_leaf_kind(name):
@@ -45,26 +44,42 @@ class ArtifactLease:
         self.path = self.artifact.with_name(self.artifact.name + ".lease")
         self.create = create
         self._file = None
+        self._parent_fd = None
+        self._identity = None
+        self._created = False
 
     def acquire(self, *, blocking=True):
         created = False
+        parent_fd = None
+        if os.name != "nt":
+            parent_chain = _snapshot_directory_chain(_absolute_no_follow(self.path.parent))
+            parent_fd = _open_verified_directory_chain(parent_chain)
+        open_path = self.path.name if parent_fd is not None else self.path
+        open_kwargs = {"dir_fd": parent_fd} if parent_fd is not None else {}
         if self.create:
             try:
-                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+                fd = os.open(open_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600, **open_kwargs)
                 created = True
             except FileExistsError:
-                fd = os.open(self.path, os.O_RDWR)
+                fd = os.open(open_path, os.O_RDWR, **open_kwargs)
         else:
-            fd = os.open(self.path, os.O_RDWR)
+            fd = os.open(open_path, os.O_RDWR, **open_kwargs)
         file = os.fdopen(fd, "r+b")
 
         def close_unacquired():
             file.close()
             if created:
                 try:
-                    self.path.unlink(missing_ok=True)
+                    if parent_fd is not None:
+                        os.unlink(self.path.name, dir_fd=parent_fd)
+                    else:
+                        # Windows cannot safely remove a newly-created lease by
+                        # pathname after its parent changes. Preserve it.
+                        pass
                 except OSError:
                     pass
+            if parent_fd is not None:
+                os.close(parent_fd)
 
         try:
             file.seek(0, os.SEEK_END)
@@ -93,6 +108,9 @@ class ArtifactLease:
                     close_unacquired()
                     return False
             self._file = file
+            self._parent_fd = parent_fd
+            self._identity = _candidate_identity(os.fstat(file.fileno()))
+            self._created = created
             return True
         except Exception:
             if not file.closed:
@@ -101,6 +119,9 @@ class ArtifactLease:
 
     def release(self, *, remove=True):
         file, self._file = self._file, None
+        parent_fd, self._parent_fd = self._parent_fd, None
+        identity, self._identity = self._identity, None
+        created, self._created = self._created, False
         if file is not None:
             try:
                 if os.name == "nt":
@@ -112,8 +133,20 @@ class ArtifactLease:
                     fcntl.flock(file.fileno(), fcntl.LOCK_UN)
             finally:
                 file.close()
-        if remove:
-            self.path.unlink(missing_ok=True)
+        try:
+            # Only remove a lease created by this acquisition, through the
+            # retained POSIX parent descriptor, and only if it is unchanged.
+            if remove and created and parent_fd is not None and identity is not None:
+                current = os.stat(self.path.name, dir_fd=parent_fd, follow_symlinks=False)
+                if (
+                    not _stat_is_link_or_reparse(current)
+                    and stat.S_ISREG(current.st_mode)
+                    and _candidate_identity(current) == identity
+                ):
+                    os.unlink(self.path.name, dir_fd=parent_fd)
+        finally:
+            if parent_fd is not None:
+                os.close(parent_fd)
 
     def __enter__(self):
         if not self.acquire():
@@ -219,6 +252,34 @@ def _revalidate_directory_chain(snapshots):
             raise ValueError(f"cleanup path component changed: {component}")
 
 
+def _open_verified_directory_chain(snapshots):
+    """Open a POSIX directory chain without following links."""
+    if os.name == "nt":
+        raise _UnsafeAnchoredCleanup(
+            "safe handle-relative temporary inspection is unavailable on Windows"
+        )
+    flags = (
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    )
+    opened = []
+    try:
+        fd = os.open(snapshots[0][0], flags)
+        opened.append(fd)
+        for index, (component, expected) in enumerate(snapshots):
+            if index:
+                fd = os.open(component.name, flags, dir_fd=fd)
+                opened.append(fd)
+            current = os.fstat(fd)
+            if _stat_identity(current) != expected or not stat.S_ISDIR(current.st_mode):
+                raise _UnsafeAnchoredCleanup(f"inspection parent changed: {component}")
+        keep = opened.pop()
+        return keep
+    finally:
+        for fd in reversed(opened):
+            os.close(fd)
+
+
 @dataclass(frozen=True)
 class _TempCandidate:
     path: Path
@@ -232,13 +293,7 @@ class _UnsafeAnchoredCleanup(RuntimeError):
 
 
 class _AnchoredCleanupParent:
-    """Descriptor-relative owner of one candidate's final POSIX operations.
-
-    The descriptor chain is opened without following links and kept alive from
-    the authoritative candidate check through claim verification and deletion.
-    Windows deliberately fails closed until equivalent handle-relative recursive
-    deletion is available.
-    """
+    """Descriptor-relative, no-follow inspector for a temporary candidate."""
 
     def __init__(self, candidate):
         self.candidate = candidate
@@ -339,35 +394,6 @@ class _AnchoredCleanupParent:
         finally:
             os.close(candidate_fd)
 
-    def claim(self, claim_leaf):
-        os.replace(
-            self.candidate.path.name, claim_leaf,
-            src_dir_fd=self.parent_fd, dst_dir_fd=self.parent_fd,
-        )
-        current = self.stat_leaf(claim_leaf, self.candidate.identity)
-        return _candidate_identity(current)
-
-    def restore(self, claim_leaf, claim_identity):
-        self.stat_leaf(claim_leaf, claim_identity, full=True)
-        try:
-            os.stat(self.candidate.path.name, dir_fd=self.parent_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            os.replace(
-                claim_leaf, self.candidate.path.name,
-                src_dir_fd=self.parent_fd, dst_dir_fd=self.parent_fd,
-            )
-
-    def delete(self, claim_leaf, claim_identity):
-        self.stat_leaf(claim_leaf, claim_identity, full=True)
-        if self.candidate.kind == "file":
-            os.unlink(claim_leaf, dir_fd=self.parent_fd)
-            return
-        if not _RMTREE_DIR_FD_SAFE:
-            raise _UnsafeAnchoredCleanup(
-                "descriptor-relative symlink-resistant directory deletion is unavailable"
-            )
-        shutil.rmtree(claim_leaf, dir_fd=self.parent_fd)
-
     def __exit__(self, exc_type, exc, tb):
         for fd in reversed(self._fds):
             try:
@@ -390,24 +416,6 @@ def _revalidate_candidate(candidate):
     if not expected(current.st_mode):
         raise ValueError("temporary artifact type changed after discovery")
     return current
-
-
-def _read_completion_marker(marker):
-    marker_stat = marker.lstat()
-    if _is_link_or_reparse(marker, marker_stat) or not stat.S_ISREG(marker_stat.st_mode):
-        raise ValueError("possible completion marker is not a safe regular file")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(marker, flags)
-    try:
-        opened = os.fstat(fd)
-        if _stat_identity(opened) != _stat_identity(marker_stat):
-            raise ValueError("possible completion marker changed during inspection")
-        with os.fdopen(fd, "r", encoding="utf-8") as stream:
-            fd = None
-            return json.load(stream)
-    finally:
-        if fd is not None:
-            os.close(fd)
 
 
 def _raise_walk_error(exc):
@@ -435,34 +443,58 @@ def _newest_lstat_mtime(path, kind):
     return newest
 
 
-def cleanup_abandoned_export_temps(
+def _inspect_existing_lease(anchored, lease_leaf):
+    """Return True when an existing POSIX lease is held by another process."""
+    if os.name == "nt":
+        raise _UnsafeAnchoredCleanup(
+            "safe handle-relative lease inspection is unavailable on Windows"
+        )
+    lease_stat = os.stat(lease_leaf, dir_fd=anchored.parent_fd, follow_symlinks=False)
+    if _stat_is_link_or_reparse(lease_stat) or not stat.S_ISREG(lease_stat.st_mode):
+        raise _UnsafeAnchoredCleanup("temporary artifact lease is not a safe regular file")
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(lease_leaf, flags, dir_fd=anchored.parent_fd)
+    try:
+        if _candidate_identity(os.fstat(fd)) != _candidate_identity(lease_stat):
+            raise _UnsafeAnchoredCleanup("temporary artifact lease changed during inspection")
+        import fcntl
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        return False
+    finally:
+        os.close(fd)
+
+
+def inspect_abandoned_export_temps(
     *, root=None, now=None, stale_age=DEFAULT_TEMP_STALE_AGE, observer=None
 ):
-    """Remove only abandoned J-Wash transaction artifacts beneath ``root``.
+    """Non-destructively classify J-Wash temporary export artifacts.
 
-    A held lease always wins.  An unlocked lease proves abandonment and permits
-    immediate removal.  Legacy artifacts without a lease must be older than the
-    configured threshold (24 hours by default).
+    Startup inspection deliberately never renames, removes, or modifies an
+    artifact or lease. Ambiguous or concurrently changed objects fail closed.
     """
     root = _absolute_no_follow(root if root is not None else EDITS_DIR)
     current_time = time.time() if now is None else float(now)
     result = {
-        "removed": [], "removed_count": 0, "skipped_active": [],
-        "skipped_recent": [], "skipped_completed": [], "skipped_changed": [],
-        "errors": [],
+        "active": [], "recent": [], "completed": [], "abandoned": [],
+        "changed_or_unsafe": [], "errors": [],
+        # Deprecated compatibility fields. Startup inspection never deletes.
+        "removed": [], "removed_count": 0,
+        "skipped_active": [], "skipped_recent": [],
+        "skipped_completed": [], "skipped_changed": [],
     }
     try:
         root_chain = _snapshot_directory_chain(root, missing_ok=True)
         if root_chain is None:
             return result
-    except FileNotFoundError:
-        return result
     except (OSError, RuntimeError, ValueError) as exc:
         result["errors"].append({"path": str(root), "error": str(exc)})
         return result
 
     candidates = []
-
     def record_walk_error(exc):
         result["errors"].append({
             "path": str(getattr(exc, "filename", root)), "error": str(exc),
@@ -472,7 +504,6 @@ def cleanup_abandoned_export_temps(
         root, topdown=True, followlinks=False, onerror=record_walk_error,
     ):
         base = Path(current)
-        # Do not descend through any symlink, including one beneath EDITS_DIR.
         kept_dirs = []
         for name in dirs:
             child = base / name
@@ -487,11 +518,11 @@ def cleanup_abandoned_export_temps(
             try:
                 kind = _recognized_temp(path)
                 if kind:
-                    path_stat = path.lstat()
-                    parent_chain = _snapshot_directory_chain(path.parent)
-                    candidates.append(_TempCandidate(
-                        path, kind, _candidate_identity(path_stat), parent_chain,
-                    ))
+                    snapshot = _TempCandidate(
+                        path, kind, _candidate_identity(path.lstat()),
+                        _snapshot_directory_chain(path.parent),
+                    )
+                    candidates.append(snapshot)
                     if kind == "directory" and name in dirs:
                         dirs.remove(name)
             except OSError as exc:
@@ -500,12 +531,17 @@ def cleanup_abandoned_export_temps(
     if observer:
         observer("discovered", tuple(candidate.path for candidate in candidates))
 
+    def classify(key, path):
+        result[key].append(str(path))
+        legacy = {
+            "active": "skipped_active", "recent": "skipped_recent",
+            "completed": "skipped_completed", "changed_or_unsafe": "skipped_changed",
+        }.get(key)
+        if legacy:
+            result[legacy].append(str(path))
+
     for candidate in candidates:
         path, kind = candidate.path, candidate.kind
-        lease = ArtifactLease(path, create=False)
-        acquired = False
-        claimed = None
-        anchored = None
         try:
             _revalidate_directory_chain(root_chain)
             path.relative_to(root)
@@ -513,111 +549,64 @@ def cleanup_abandoned_export_temps(
             if observer:
                 observer("before_inspect", path)
             _revalidate_candidate(candidate)
-            try:
-                lease_stat = lease.path.lstat()
-            except FileNotFoundError:
-                lease_stat = None
-            if lease_stat is not None and (
-                _is_link_or_reparse(lease.path, lease_stat)
-                or not stat.S_ISREG(lease_stat.st_mode)
-            ):
-                raise ValueError("temporary artifact lease is not a safe regular file")
-            has_lease = lease_stat is not None
-            if has_lease:
-                acquired = lease.acquire(blocking=False)
-                if not acquired:
-                    result["skipped_active"].append(str(path))
-                    continue
-            else:
-                if kind == "directory":
-                    marker = path / "edit_meta.json"
-                    try:
-                        marker.lstat()
-                    except FileNotFoundError:
-                        marker_present = False
-                    except OSError as exc:
-                        raise OSError(
-                            f"cannot inspect possible completion marker: {exc}"
-                        ) from exc
-                    else:
-                        marker_present = True
-                    if marker_present:
-                        try:
-                            if os.name == "nt":
-                                raise _UnsafeAnchoredCleanup(
-                                    "safe handle-relative completion marker inspection "
-                                    "is unavailable on Windows"
-                                )
-                            with _AnchoredCleanupParent(candidate) as marker_parent:
-                                metadata = marker_parent.read_completion_marker(observer)
-                            # The descriptor-anchored read above remains attached to
-                            # the discovered directory if its external parent path is
-                            # concurrently moved.  Revalidate that external chain
-                            # before treating the marker as authoritative or falling
-                            # through to pathname-based legacy activity inspection.
-                            _revalidate_candidate(candidate)
-                        except _UnsafeAnchoredCleanup:
-                            raise
-                        except Exception as exc:
-                            raise ValueError(f"cannot inspect possible completion marker: {exc}") from exc
-                        relative_name = path.relative_to(root).as_posix()
-                        if (
-                            not isinstance(metadata, dict)
-                            or not isinstance(metadata.get("name"), str)
-                        ):
-                            raise ValueError("possible completion marker has invalid metadata")
-                        if metadata["name"] == relative_name:
-                            result["skipped_completed"].append(str(path))
-                            continue
-                newest = _newest_lstat_mtime(path, kind)
-                if current_time - newest < stale_age:
-                    result["skipped_recent"].append(str(path))
-                    continue
-            _revalidate_candidate(candidate)
-            if observer:
-                observer("before_claim", path)
-            _revalidate_candidate(candidate)
-            claim_uuid = uuid.uuid4().hex
-            if kind == "directory":
-                claimed = path.with_name(f".{path.name.lstrip('.')}.tmp-{claim_uuid}")
-            else:
-                stem = path.name.split(".tmp-", 1)[0].lstrip(".")
-                claimed = path.with_name(f".{stem}.tmp-{claim_uuid}.gguf")
-            if observer:
-                observer("before_anchored_claim", path)
+            if os.name == "nt":
+                raise _UnsafeAnchoredCleanup(
+                    "safe handle-relative temporary inspection is unavailable on Windows"
+                )
             with _AnchoredCleanupParent(candidate) as anchored:
-                claim_identity = anchored.claim(claimed.name)
-                if observer:
-                    observer("before_delete", (path, claimed))
+                anchored.stat_leaf(path.name, candidate.identity, full=True)
+                lease_leaf = path.name + ".lease"
                 try:
-                    anchored.delete(claimed.name, claim_identity)
-                except Exception:
+                    os.stat(lease_leaf, dir_fd=anchored.parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    has_lease = False
+                else:
+                    has_lease = True
+                    if _inspect_existing_lease(anchored, lease_leaf):
+                        classify("active", path)
+                        continue
+
+                if not has_lease and kind == "directory":
                     try:
-                        anchored.restore(claimed.name, claim_identity)
-                        claimed = None
-                    except Exception:
-                        # A changed claim is intentionally left untouched.
-                        pass
-                    raise
-            claimed = None
-            anchored = None
-            result["removed"].append(str(path))
-            result["removed_count"] += 1
+                        metadata = anchored.read_completion_marker(observer)
+                    except FileNotFoundError:
+                        metadata = None
+                    except Exception as exc:
+                        raise _UnsafeAnchoredCleanup(
+                            f"cannot safely inspect possible completion marker: {exc}"
+                        ) from exc
+                    if metadata is not None:
+                        _revalidate_candidate(candidate)
+                        relative_name = path.relative_to(root).as_posix()
+                        if not isinstance(metadata, dict) or not isinstance(metadata.get("name"), str):
+                            raise _UnsafeAnchoredCleanup(
+                                "possible completion marker has invalid metadata"
+                            )
+                        if metadata["name"] == relative_name:
+                            classify("completed", path)
+                            continue
+
+            # Activity inspection is advisory and path based, so validate both
+            # before and after it. Any concurrent mutation is preserved.
+            _revalidate_candidate(candidate)
+            newest = _newest_lstat_mtime(path, kind)
+            if observer:
+                observer("after_activity", path)
+            _revalidate_candidate(candidate)
+            _revalidate_directory_chain(root_chain)
+            if current_time - newest < stale_age:
+                classify("recent", path)
+            else:
+                classify("abandoned", path)
         except Exception as exc:
-            if (
-                isinstance(exc, _UnsafeAnchoredCleanup)
-                or "changed" in str(exc)
-                or "cleanup root chain" in str(exc)
-            ):
-                result["skipped_changed"].append(str(path))
+            classify("changed_or_unsafe", path)
             result["errors"].append({"path": str(path), "error": str(exc)})
-        finally:
-            if acquired:
-                try:
-                    lease.release(remove=True)
-                except Exception as exc:
-                    result["errors"].append({"path": str(lease.path), "error": str(exc)})
     return result
+
+
+def cleanup_abandoned_export_temps(**kwargs):
+    """Deprecated non-destructive alias for startup inspection."""
+    return inspect_abandoned_export_temps(**kwargs)
 
 
 # Residual writes edited by the global abliteration (embed aside)

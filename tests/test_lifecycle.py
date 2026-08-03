@@ -10,8 +10,8 @@ from api import app as app_module
 
 def _result(errors=None):
     return {
-        "removed": [], "removed_count": 0, "skipped_active": [],
-        "skipped_recent": [], "errors": errors or [],
+        "active": [], "recent": [], "completed": [], "abandoned": [],
+        "changed_or_unsafe": [], "errors": errors or [],
     }
 
 
@@ -25,7 +25,7 @@ def test_quiet_polling_filter_only_drops_status_get():
 
 def test_lifespan_installs_loop_filter_and_cleans_matching_state(monkeypatch):
     calls = []
-    monkeypatch.setattr(app_module.editing, "cleanup_abandoned_export_temps", lambda: calls.append(1) or _result())
+    monkeypatch.setattr(app_module.editing, "inspect_abandoned_export_temps", lambda: calls.append(1) or _result())
     logger = logging.getLogger("uvicorn.access")
     before = list(logger.filters)
     with TestClient(app_module.app):
@@ -39,7 +39,7 @@ def test_lifespan_installs_loop_filter_and_cleans_matching_state(monkeypatch):
 
 
 def test_shutdown_clears_only_matching_event_loop(monkeypatch):
-    monkeypatch.setattr(app_module.editing, "cleanup_abandoned_export_temps", lambda: _result())
+    monkeypatch.setattr(app_module.editing, "inspect_abandoned_export_temps", lambda: _result())
     replacement = object()
     with TestClient(app_module.app):
         app_module._loop_holder["loop"] = replacement
@@ -48,7 +48,7 @@ def test_shutdown_clears_only_matching_event_loop(monkeypatch):
 
 
 def test_sequential_lifespans_do_not_accumulate_filters(monkeypatch):
-    monkeypatch.setattr(app_module.editing, "cleanup_abandoned_export_temps", lambda: _result())
+    monkeypatch.setattr(app_module.editing, "inspect_abandoned_export_temps", lambda: _result())
     logger = logging.getLogger("uvicorn.access")
     before = list(logger.filters)
     for _ in range(2):
@@ -59,7 +59,7 @@ def test_sequential_lifespans_do_not_accumulate_filters(monkeypatch):
 
 def test_cleanup_error_is_logged_without_preventing_startup(monkeypatch, caplog):
     monkeypatch.setattr(
-        app_module.editing, "cleanup_abandoned_export_temps",
+        app_module.editing, "inspect_abandoned_export_temps",
         lambda: _result([{"path": "/tmp/artifact", "error": "denied"}]),
     )
     with caplog.at_level(logging.WARNING), TestClient(app_module.app):
@@ -70,7 +70,7 @@ def test_cleanup_error_is_logged_without_preventing_startup(monkeypatch, caplog)
 def test_unexpected_cleanup_exception_is_nonfatal(monkeypatch, caplog):
     def fail():
         raise PermissionError("root denied")
-    monkeypatch.setattr(app_module.editing, "cleanup_abandoned_export_temps", fail)
+    monkeypatch.setattr(app_module.editing, "inspect_abandoned_export_temps", fail)
     logger = logging.getLogger("uvicorn.access")
     before = list(logger.filters)
     with caplog.at_level(logging.ERROR), TestClient(app_module.app):
@@ -98,7 +98,7 @@ def test_cleanup_cancellation_propagates_without_lifecycle_leaks(monkeypatch):
 
 
 def test_fit_progress_after_shutdown_is_a_noop(monkeypatch):
-    monkeypatch.setattr(app_module.editing, "cleanup_abandoned_export_temps", lambda: _result())
+    monkeypatch.setattr(app_module.editing, "inspect_abandoned_export_temps", lambda: _result())
     with TestClient(app_module.app):
         pass
     app_module._broadcast_fit({"state": "fitting"})
@@ -118,7 +118,7 @@ def test_cleanup_runs_off_the_event_loop_thread(monkeypatch):
         cleanup_thread.append(threading.get_ident())
         return _result()
 
-    monkeypatch.setattr(app_module.editing, "cleanup_abandoned_export_temps", cleanup)
+    monkeypatch.setattr(app_module.editing, "inspect_abandoned_export_temps", cleanup)
 
     async def exercise():
         loop_thread = threading.get_ident()

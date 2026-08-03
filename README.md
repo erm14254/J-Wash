@@ -338,15 +338,14 @@ types), a **GGUF** entry appears in the export formats: J-Wash bakes the full
 checkpoint into a local cache, converts it, and quantizes if asked
 (`q4_k_m`, `q8_0`, …). The cached checkpoint is reused when exporting several
 GGUF types - a *clean cache* button reclaims the space. Interrupted exports may
-leave hidden transaction artifacts; at startup J-Wash removes only recognized
-abandoned export staging directories and GGUF temporary files. Active artifacts
-leased by another J-Wash process are preserved, as are completed exports and
-cached HF checkpoints. Legacy temporary artifacts without a lease are retained
-until they have been inactive for 24 hours.
-Cleanup deletion is anchored to no-follow directory descriptors on POSIX. On
-Windows, artifacts are preserved when equivalent safe handle-relative deletion
-is unavailable; ordinary per-export cleanup still runs when the exporting
-process exits normally. (llama.cpp's converter
+leave hidden transaction artifacts. At startup J-Wash non-destructively inspects
+only its precisely recognized staging directories and GGUF temporary files. It
+reports legacy artifacts inactive for at least 24 hours as abandoned, while
+preserving them, active leased exports, completed exports, and cached HF
+checkpoints. Ambiguous or concurrently changed objects fail closed; Windows also
+preserves candidates when exact handle-relative inspection is unavailable.
+Destructive offline maintenance is intentionally deferred. Ordinary per-export
+cleanup still runs when the exporting process exits normally. (llama.cpp's converter
 may need extra pip packages for some tokenizers, e.g. `sentencepiece` for
 Gemma - the error shows up in the UI if so.)
 
