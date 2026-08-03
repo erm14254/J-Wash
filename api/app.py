@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import logging
 import mimetypes
@@ -38,7 +39,6 @@ store = Store()
 fit_manager = FitManager()
 interventions = Interventions()
 neighbors = TokenNeighbors()
-app = FastAPI(title="J-Wash")
 
 _ws_locks = {}
 _loop_holder = {}
@@ -61,10 +61,33 @@ class _QuietPolling(logging.Filter):
         return "GET /api/status " not in record.getMessage()
 
 
-@app.on_event("startup")
-async def _on_startup():
-    _loop_holder["loop"] = asyncio.get_running_loop()
-    logging.getLogger("uvicorn.access").addFilter(_QuietPolling())
+@asynccontextmanager
+async def lifespan(_app):
+    loop = asyncio.get_running_loop()
+    access_logger = logging.getLogger("uvicorn.access")
+    quiet_filter = _QuietPolling()
+    _loop_holder["loop"] = loop
+    access_logger.addFilter(quiet_filter)
+    try:
+        cleanup = await asyncio.to_thread(editing.cleanup_abandoned_export_temps)
+        logging.getLogger(__name__).info(
+            "export temporary cleanup: removed=%d active=%d recent=%d errors=%d",
+            cleanup["removed_count"], len(cleanup["skipped_active"]),
+            len(cleanup["skipped_recent"]), len(cleanup["errors"]),
+        )
+        for failure in cleanup["errors"]:
+            logging.getLogger(__name__).warning(
+                "could not clean export temporary artifact %s: %s",
+                failure["path"], failure["error"],
+            )
+        yield
+    finally:
+        access_logger.removeFilter(quiet_filter)
+        if _loop_holder.get("loop") is loop:
+            _loop_holder.pop("loop", None)
+
+
+app = FastAPI(title="J-Wash", lifespan=lifespan)
 
 
 async def _ws_send(ws, text):
@@ -607,25 +630,26 @@ def _gguf_worker(job_name, job_dir, filename_stem, gguf_type,
                 f".{base_gguf.stem}.tmp-{uuid.uuid4().hex}.gguf"
             )
             temp_gguf.unlink(missing_ok=True)
-            try:
-                proc = subprocess.run(
-                    [sys.executable, "-X", "utf8", str(convert), str(hf_dir),
-                     "--outfile", str(temp_gguf), "--outtype", base_type],
-                    capture_output=True, text=True, env=env,
-                )
-                if proc.returncode != 0:
-                    raise RuntimeError(
-                        f"convert_hf_to_gguf failed: {proc.stderr[-2000:]}"
+            with editing.artifact_lease(temp_gguf):
+                try:
+                    proc = subprocess.run(
+                        [sys.executable, "-X", "utf8", str(convert), str(hf_dir),
+                         "--outfile", str(temp_gguf), "--outtype", base_type],
+                        capture_output=True, text=True, env=env,
                     )
-                if not temp_gguf.is_file():
-                    raise RuntimeError(
-                        "convert_hf_to_gguf succeeded without producing an output"
-                    )
-                if temp_gguf.stat().st_size <= 0:
-                    raise RuntimeError("convert_hf_to_gguf produced an empty output")
-                temp_gguf.replace(base_gguf)
-            finally:
-                temp_gguf.unlink(missing_ok=True)
+                    if proc.returncode != 0:
+                        raise RuntimeError(
+                            f"convert_hf_to_gguf failed: {proc.stderr[-2000:]}"
+                        )
+                    if not temp_gguf.is_file():
+                        raise RuntimeError(
+                            "convert_hf_to_gguf succeeded without producing an output"
+                        )
+                    if temp_gguf.stat().st_size <= 0:
+                        raise RuntimeError("convert_hf_to_gguf produced an empty output")
+                    temp_gguf.replace(base_gguf)
+                finally:
+                    temp_gguf.unlink(missing_ok=True)
         result_path = base_gguf
         if gguf_type not in GGUF_BASE_TYPES:
             if quantize is None:
@@ -639,22 +663,23 @@ def _gguf_worker(job_name, job_dir, filename_stem, gguf_type,
                 f".{result_path.stem}.tmp-{uuid.uuid4().hex}.gguf"
             )
             temp_quantized.unlink(missing_ok=True)
-            try:
-                proc = subprocess.run(
-                    [str(quantize), str(base_gguf), str(temp_quantized), gguf_type],
-                    capture_output=True, text=True,
-                )
-                if proc.returncode != 0:
-                    raise RuntimeError(f"llama-quantize failed: {proc.stderr[-2000:]}")
-                if not temp_quantized.is_file():
-                    raise RuntimeError(
-                        "llama-quantize succeeded without producing an output"
+            with editing.artifact_lease(temp_quantized):
+                try:
+                    proc = subprocess.run(
+                        [str(quantize), str(base_gguf), str(temp_quantized), gguf_type],
+                        capture_output=True, text=True,
                     )
-                if temp_quantized.stat().st_size <= 0:
-                    raise RuntimeError("llama-quantize produced an empty output")
-                temp_quantized.replace(result_path)
-            finally:
-                temp_quantized.unlink(missing_ok=True)
+                    if proc.returncode != 0:
+                        raise RuntimeError(f"llama-quantize failed: {proc.stderr[-2000:]}")
+                    if not temp_quantized.is_file():
+                        raise RuntimeError(
+                            "llama-quantize succeeded without producing an output"
+                        )
+                    if temp_quantized.stat().st_size <= 0:
+                        raise RuntimeError("llama-quantize produced an empty output")
+                    temp_quantized.replace(result_path)
+                finally:
+                    temp_quantized.unlink(missing_ok=True)
         _gguf_state.update(
             state="done", step=None, error=None,
             result={

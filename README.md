@@ -337,7 +337,12 @@ folder (one that has `convert_hf_to_gguf.py`; `llama-quantize` too for quantized
 types), a **GGUF** entry appears in the export formats: J-Wash bakes the full
 checkpoint into a local cache, converts it, and quantizes if asked
 (`q4_k_m`, `q8_0`, …). The cached checkpoint is reused when exporting several
-GGUF types - a *clean cache* button reclaims the space. (llama.cpp's converter
+GGUF types - a *clean cache* button reclaims the space. Interrupted exports may
+leave hidden transaction artifacts; at startup J-Wash removes only recognized
+abandoned export staging directories and GGUF temporary files. Active artifacts
+leased by another J-Wash process are preserved, as are completed exports and
+cached HF checkpoints. Legacy temporary artifacts without a lease are retained
+until they have been inactive for 24 hours. (llama.cpp's converter
 may need extra pip packages for some tokenizers, e.g. `sentencepiece` for
 Gemma - the error shows up in the UI if so.)
 

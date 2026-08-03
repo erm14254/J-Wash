@@ -324,6 +324,7 @@ def test_quantized_gguf_is_published_atomically_and_retries(
     assert Path(app._gguf_state["result"]["gguf"]) == final
     assert final.read_bytes() == b"VALID-QUANTIZED"
     assert not list(job_dir.glob(".*.tmp-*.gguf"))
+    assert not list(job_dir.glob(".*.lease"))
     assert base.read_bytes() == b"BASE-GGUF" and cache.read_text() == '{"cached": true}'
 
 
@@ -355,3 +356,4 @@ def test_gguf_atomic_rejects_missing_or_empty_converter_output(body, message, tm
     assert app._gguf_state["state"] == "error" and message in app._gguf_state["error"]
     assert not (job_dir / "job-bf16.gguf").exists()
     assert not list(job_dir.glob(".*.tmp-*.gguf"))
+    assert not list(job_dir.glob(".*.lease"))

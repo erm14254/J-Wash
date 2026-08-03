@@ -1,6 +1,9 @@
+import errno
 import json
+import os
 import re
 import shutil
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -15,6 +18,212 @@ from core.ablation import abliteration_direction, effective_coeffs
 
 EDITS_DIR = config.DATA_DIR / "edits"
 PRESETS_DIR = config.DATA_DIR / "presets"
+
+DEFAULT_TEMP_STALE_AGE = 24 * 60 * 60
+_TEMP_STAGE_RE = re.compile(r"^\..+\.tmp-[0-9a-f]{32}$")
+_TEMP_GGUF_RE = re.compile(r"^\..+\.tmp-[0-9a-f]{32}\.gguf$")
+
+
+class ArtifactLease:
+    """Exclusive advisory lease for one temporary export artifact."""
+
+    def __init__(self, artifact, *, create=True):
+        self.artifact = Path(artifact)
+        self.path = self.artifact.with_name(self.artifact.name + ".lease")
+        self.create = create
+        self._file = None
+
+    def acquire(self, *, blocking=True):
+        mode = "a+b" if self.create else "r+b"
+        file = open(self.path, mode)
+        try:
+            file.seek(0, os.SEEK_END)
+            if file.tell() == 0:
+                file.write(b"0")
+                file.flush()
+            file.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                flag = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
+                try:
+                    msvcrt.locking(file.fileno(), flag, 1)
+                except OSError as exc:
+                    if not blocking and exc.errno in (
+                        errno.EACCES, errno.EAGAIN, errno.EDEADLK,
+                    ):
+                        file.close()
+                        return False
+                    raise
+            else:
+                import fcntl
+                flag = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+                try:
+                    fcntl.flock(file.fileno(), flag)
+                except BlockingIOError:
+                    file.close()
+                    return False
+            self._file = file
+            return True
+        except Exception:
+            if not file.closed:
+                file.close()
+            raise
+
+    def release(self, *, remove=True):
+        file, self._file = self._file, None
+        if file is not None:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    file.seek(0)
+                    msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(file.fileno(), fcntl.LOCK_UN)
+            finally:
+                file.close()
+        if remove:
+            self.path.unlink(missing_ok=True)
+
+    def __enter__(self):
+        if not self.acquire():
+            raise RuntimeError(f"temporary artifact lease is already held: {self.path}")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            self.release()
+        except Exception:
+            if exc is None:
+                raise
+        return False
+
+
+def artifact_lease(artifact):
+    return ArtifactLease(artifact)
+
+
+def _recognized_temp(path):
+    """Return the owned temporary kind without following a symlink."""
+    try:
+        if path.is_symlink():
+            return None
+        if _TEMP_STAGE_RE.fullmatch(path.name) and path.is_dir():
+            return "directory"
+        if _TEMP_GGUF_RE.fullmatch(path.name) and path.is_file():
+            return "file"
+    except OSError:
+        raise
+    return None
+
+
+def _raise_walk_error(exc):
+    raise exc
+
+
+def _newest_lstat_mtime(path, kind):
+    newest = path.lstat().st_mtime
+    if kind == "file":
+        return newest
+    for current, dirs, files in os.walk(
+        path, followlinks=False, onerror=_raise_walk_error,
+    ):
+        base = Path(current)
+        # Never traverse directory symlinks, but include their own lstat time.
+        kept = []
+        for name in dirs:
+            child = base / name
+            newest = max(newest, child.lstat().st_mtime)
+            if not child.is_symlink():
+                kept.append(name)
+        dirs[:] = kept
+        for name in files:
+            newest = max(newest, (base / name).lstat().st_mtime)
+    return newest
+
+
+def cleanup_abandoned_export_temps(
+    *, root=None, now=None, stale_age=DEFAULT_TEMP_STALE_AGE
+):
+    """Remove only abandoned J-Wash transaction artifacts beneath ``root``.
+
+    A held lease always wins.  An unlocked lease proves abandonment and permits
+    immediate removal.  Legacy artifacts without a lease must be older than the
+    configured threshold (24 hours by default).
+    """
+    root = Path(root if root is not None else EDITS_DIR)
+    current_time = time.time() if now is None else float(now)
+    result = {
+        "removed": [], "removed_count": 0, "skipped_active": [],
+        "skipped_recent": [], "errors": [],
+    }
+    try:
+        root_resolved = root.resolve()
+        if not root.is_dir():
+            return result
+    except OSError as exc:
+        result["errors"].append({"path": str(root), "error": str(exc)})
+        return result
+
+    candidates = []
+
+    def record_walk_error(exc):
+        result["errors"].append({
+            "path": str(getattr(exc, "filename", root)), "error": str(exc),
+        })
+
+    for current, dirs, files in os.walk(
+        root, topdown=True, followlinks=False, onerror=record_walk_error,
+    ):
+        base = Path(current)
+        # Do not descend through any symlink, including one beneath EDITS_DIR.
+        dirs[:] = [name for name in dirs if not (base / name).is_symlink()]
+        for name in list(dirs) + files:
+            path = base / name
+            try:
+                kind = _recognized_temp(path)
+                if kind:
+                    candidates.append((path, kind))
+                    if kind == "directory" and name in dirs:
+                        dirs.remove(name)
+            except OSError as exc:
+                result["errors"].append({"path": str(path), "error": str(exc)})
+
+    for path, kind in candidates:
+        lease = ArtifactLease(path, create=False)
+        acquired = False
+        has_lease = lease.path.is_file() and not lease.path.is_symlink()
+        try:
+            try:
+                path.resolve().relative_to(root_resolved)
+            except ValueError:
+                raise ValueError("temporary artifact escapes the edits directory")
+            if has_lease:
+                acquired = lease.acquire(blocking=False)
+                if not acquired:
+                    result["skipped_active"].append(str(path))
+                    continue
+            else:
+                newest = _newest_lstat_mtime(path, kind)
+                if current_time - newest < stale_age:
+                    result["skipped_recent"].append(str(path))
+                    continue
+            if kind == "directory":
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+            result["removed"].append(str(path))
+            result["removed_count"] += 1
+        except Exception as exc:
+            result["errors"].append({"path": str(path), "error": str(exc)})
+        finally:
+            if acquired:
+                try:
+                    lease.release(remove=True)
+                except Exception as exc:
+                    result["errors"].append({"path": str(lease.path), "error": str(exc)})
+    return result
+
 
 # Residual writes edited by the global abliteration (embed aside)
 TARGET_SUFFIXES = ("self_attn.o_proj", "mlp.down_proj")
@@ -541,18 +750,18 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
         raise ValueError(f"export destination already exists: {final_dir}")
     final_dir.parent.mkdir(parents=True, exist_ok=True)
     stage = final_dir.parent / f".{final_dir.name}.tmp-{uuid.uuid4().hex}"
-    stage.mkdir()
-    try:
-        result = _export_rebase_impl(
-            rules, jl, model_meta, fmt=fmt, name=name, source_dir=source_dir,
-            scale=scale, exact=exact, out_dir=stage,
-        )
-        stage.replace(final_dir)
-        result["out_dir"] = str(final_dir)
-        return result
-    except Exception:
-        shutil.rmtree(stage, ignore_errors=True)
-        raise
+    with artifact_lease(stage):
+        stage.mkdir()
+        try:
+            result = _export_rebase_impl(
+                rules, jl, model_meta, fmt=fmt, name=name, source_dir=source_dir,
+                scale=scale, exact=exact, out_dir=stage,
+            )
+            stage.replace(final_dir)
+            result["out_dir"] = str(final_dir)
+            return result
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
 
 
 def _export_rebase_impl(rules, jl, model_meta, *, fmt, name, source_dir=None,
