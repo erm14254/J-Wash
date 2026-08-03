@@ -81,7 +81,13 @@ def internal_temp_leaf_kind(name):
 
 
 class ArtifactLease:
-    """Exclusive advisory lease for one temporary export artifact."""
+    """Exclusive advisory lease for one temporary export artifact.
+
+    POSIX lease files are deliberately persistent.  Portable POSIX APIs cannot
+    condition an unlink on the inode previously inspected, so removing a lease
+    during release could delete an unrelated replacement.  Unlocked retained
+    leases are safe and reusable.
+    """
 
     def __init__(self, artifact, *, create=True):
         self.artifact = Path(artifact)
@@ -95,42 +101,62 @@ class ArtifactLease:
     def acquire(self, *, blocking=True):
         created = False
         parent_fd = None
-        if os.name == "nt":
-            fd, created = _open_windows_lease(self.path, create=self.create)
-        else:
-            parent_chain = _snapshot_directory_chain(_absolute_no_follow(self.path.parent))
-            parent_fd = _open_verified_directory_chain(parent_chain)
-            open_path = self.path.name
-            open_kwargs = {"dir_fd": parent_fd}
-            if self.create:
-                try:
-                    fd = os.open(open_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600, **open_kwargs)
-                    created = True
-                except FileExistsError:
-                    fd = os.open(open_path, os.O_RDWR, **open_kwargs)
-            else:
-                fd = os.open(open_path, os.O_RDWR, **open_kwargs)
-        file = os.fdopen(fd, "r+b")
-
-        def close_unacquired():
-            if created:
-                try:
-                    if parent_fd is not None:
-                        os.unlink(self.path.name, dir_fd=parent_fd)
-                    else:
-                        _mark_windows_file_for_deletion(file)
-                except OSError:
-                    pass
-            file.close()
-            if parent_fd is not None:
-                os.close(parent_fd)
-
+        fd = None
+        file = None
         try:
-            file.seek(0, os.SEEK_END)
-            if file.tell() == 0:
+            if os.name == "nt":
+                fd, created = _open_windows_lease(self.path, create=self.create)
+            else:
+                if not hasattr(os, "O_NOFOLLOW"):
+                    raise RuntimeError("safe no-follow POSIX lease acquisition is unavailable")
+                parent_chain = _snapshot_directory_chain(_absolute_no_follow(self.path.parent))
+                parent_fd = _open_verified_directory_chain(parent_chain)
+                open_path = self.path.name
+                common_flags = os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+                if self.create:
+                    try:
+                        fd = os.open(
+                            open_path, common_flags | os.O_CREAT | os.O_EXCL,
+                            0o600, dir_fd=parent_fd,
+                        )
+                        created = True
+                    except FileExistsError:
+                        before = os.stat(
+                            open_path, dir_fd=parent_fd, follow_symlinks=False,
+                        )
+                        if _stat_is_link_or_reparse(before) or not stat.S_ISREG(before.st_mode):
+                            raise RuntimeError("temporary artifact lease is not a safe regular file")
+                        fd = os.open(open_path, common_flags, dir_fd=parent_fd)
+                        opened = os.fstat(fd)
+                        if (
+                            _stat_is_link_or_reparse(opened)
+                            or not stat.S_ISREG(opened.st_mode)
+                            or _candidate_identity(opened) != _candidate_identity(before)
+                        ):
+                            raise RuntimeError("temporary artifact lease changed during acquisition")
+                else:
+                    before = os.stat(
+                        open_path, dir_fd=parent_fd, follow_symlinks=False,
+                    )
+                    if _stat_is_link_or_reparse(before) or not stat.S_ISREG(before.st_mode):
+                        raise RuntimeError("temporary artifact lease is not a safe regular file")
+                    fd = os.open(open_path, common_flags, dir_fd=parent_fd)
+                    opened = os.fstat(fd)
+                    if (
+                        _stat_is_link_or_reparse(opened)
+                        or not stat.S_ISREG(opened.st_mode)
+                        or _candidate_identity(opened) != _candidate_identity(before)
+                    ):
+                        raise RuntimeError("temporary artifact lease changed during acquisition")
+            file = os.fdopen(fd, "r+b")
+            fd = None
+            if os.name == "nt":
+                file.seek(0, os.SEEK_END)
+            if os.name == "nt" and file.tell() == 0:
                 file.write(b"0")
                 file.flush()
-            file.seek(0)
+            if os.name == "nt":
+                file.seek(0)
             if os.name == "nt":
                 import msvcrt
                 flag = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
@@ -140,7 +166,8 @@ class ArtifactLease:
                     if not blocking and exc.errno in (
                         errno.EACCES, errno.EAGAIN, errno.EDEADLK,
                     ):
-                        close_unacquired()
+                        file.close()
+                        file = None
                         return False
                     raise
             else:
@@ -149,57 +176,68 @@ class ArtifactLease:
                 try:
                     fcntl.flock(file.fileno(), flag)
                 except BlockingIOError:
-                    close_unacquired()
+                    file.close()
+                    file = None
                     return False
             self._file = file
-            self._parent_fd = parent_fd
+            # POSIX release never removes the persistent lease, so it does not
+            # retain a parent descriptor for the export lifetime.
+            if parent_fd is not None:
+                os.close(parent_fd)
+                parent_fd = None
+            self._parent_fd = None
             self._identity = _candidate_identity(os.fstat(file.fileno()))
             self._created = created
             return True
         except Exception:
-            if not file.closed:
-                close_unacquired()
+            if file is not None and not file.closed:
+                if created and os.name == "nt":
+                    try:
+                        _mark_windows_file_for_deletion(file)
+                    except OSError:
+                        pass
+                file.close()
+            elif fd is not None:
+                os.close(fd)
             raise
+        finally:
+            if parent_fd is not None:
+                os.close(parent_fd)
 
     def release(self, *, remove=True):
         file, self._file = self._file, None
         parent_fd, self._parent_fd = self._parent_fd, None
-        identity, self._identity = self._identity, None
+        _, self._identity = self._identity, None
         created, self._created = self._created, False
-        if file is not None:
-            try:
-                if os.name == "nt":
-                    import msvcrt
-                    file.seek(0)
-                    msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(file.fileno(), fcntl.LOCK_UN)
-            finally:
+        unlock_error = None
+        try:
+            if file is not None:
                 try:
-                    if remove and created and parent_fd is None:
-                        # Windows deletion is bound to the owned open handle,
-                        # not to a path that could be replaced concurrently.
+                    if os.name == "nt":
+                        import msvcrt
+                        file.seek(0)
+                        msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(file.fileno(), fcntl.LOCK_UN)
+                except Exception as exc:
+                    unlock_error = exc
+                try:
+                    if remove and created and os.name == "nt":
+                        # Windows deletion is bound to the owned open handle.
                         _mark_windows_file_for_deletion(file)
                 except OSError:
-                    # A harmless stale lease is safer than pathname deletion.
                     pass
                 finally:
                     file.close()
-        try:
-            # Only remove a lease created by this acquisition, through the
-            # retained POSIX parent descriptor, and only if it is unchanged.
-            if remove and created and parent_fd is not None and identity is not None:
-                current = os.stat(self.path.name, dir_fd=parent_fd, follow_symlinks=False)
-                if (
-                    not _stat_is_link_or_reparse(current)
-                    and stat.S_ISREG(current.st_mode)
-                    and _candidate_identity(current) == identity
-                ):
-                    os.unlink(self.path.name, dir_fd=parent_fd)
         finally:
             if parent_fd is not None:
-                os.close(parent_fd)
+                try:
+                    os.close(parent_fd)
+                except OSError:
+                    pass
+        if unlock_error is not None:
+            raise unlock_error
 
     def __enter__(self):
         if not self.acquire():
@@ -436,11 +474,19 @@ class _AnchoredCleanupParent:
             marker_fd = os.open("edit_meta.json", marker_flags, dir_fd=candidate_fd)
             try:
                 opened = os.fstat(marker_fd)
-                if _stat_identity(opened) != _stat_identity(marker_stat):
+                marker_identity = _candidate_identity(marker_stat)
+                if _candidate_identity(opened) != marker_identity:
                     raise ValueError("possible completion marker changed during inspection")
+                if observer:
+                    observer("after_marker_open", self.candidate.path)
                 with os.fdopen(marker_fd, "r", encoding="utf-8") as stream:
                     marker_fd = None
-                    return json.load(stream)
+                    metadata = json.load(stream)
+                    if _candidate_identity(os.fstat(stream.fileno())) != marker_identity:
+                        raise ValueError(
+                            "possible completion marker changed while being read"
+                        )
+                    return metadata
             finally:
                 if marker_fd is not None:
                     os.close(marker_fd)
@@ -601,13 +647,11 @@ def inspect_abandoned_export_temps(
             _revalidate_candidate(candidate)
             if observer:
                 observer("before_inspect", path)
-            _revalidate_candidate(candidate)
             if os.name == "nt":
                 raise _UnsafeAnchoredCleanup(
                     "safe handle-relative temporary inspection is unavailable on Windows"
                 )
             with _AnchoredCleanupParent(candidate) as anchored:
-                anchored.stat_leaf(path.name, candidate.identity, full=True)
                 lease_leaf = path.name + ".lease"
                 try:
                     os.stat(lease_leaf, dir_fd=anchored.parent_fd, follow_symlinks=False)
@@ -618,6 +662,11 @@ def inspect_abandoned_export_temps(
                     if _inspect_existing_lease(anchored, lease_leaf):
                         classify("active", path)
                         continue
+
+                # An active writer may legitimately change size/timestamps.
+                # Once an existing lease is known to be unlocked (or absent),
+                # require the complete discovery identity before classification.
+                anchored.stat_leaf(path.name, candidate.identity, full=True)
 
                 if not has_lease and kind == "directory":
                     try:

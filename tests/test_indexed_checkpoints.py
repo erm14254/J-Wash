@@ -112,7 +112,10 @@ def test_malformed_index_is_controlled_and_never_published(tiny, tmp_path, monke
         editing.export_rebase(rules_for(tiny), lens(tiny), {"dtype": "fp32"},
                               fmt="full", name="malformed", source_dir=source)
     assert not (editing.EDITS_DIR / "malformed").exists()
-    assert not list(editing.EDITS_DIR.glob(".malformed.tmp-*"))
+    assert not [
+        path for path in editing.EDITS_DIR.glob(".malformed.tmp-*")
+        if not path.name.endswith(".lease")
+    ]
 
 
 def test_nonstring_index_key_is_controlled(tiny, tmp_path, monkeypatch):
@@ -152,4 +155,7 @@ def test_transaction_rolls_back_index_write_failure(tmp_path, monkeypatch):
         editing.export_rebase(rules, jl, {"dtype": "fp16"}, fmt="full",
                               name="index-failure", source_dir=source)
     assert not (editing.EDITS_DIR / "index-failure").exists()
-    assert not list(editing.EDITS_DIR.glob(".index-failure.tmp-*"))
+    assert not [
+        path for path in editing.EDITS_DIR.glob(".index-failure.tmp-*")
+        if not path.name.endswith(".lease")
+    ]

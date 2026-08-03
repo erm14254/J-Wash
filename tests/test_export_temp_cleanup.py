@@ -1,6 +1,7 @@
 import multiprocessing
 import os
 import shutil
+import socket
 from pathlib import Path
 
 import pytest
@@ -167,17 +168,21 @@ def test_reserved_names_rejected():
         editing.validate_export_name(".x.tmp-" + HEX + ".gguf")
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor-relative lease removal")
-def test_owned_lease_release_removes_unchanged_lease(tmp_path):
+@pytest.mark.skipif(os.name == "nt", reason="POSIX persistent lease policy")
+def test_owned_lease_release_retains_reusable_lease(tmp_path):
     artifact = tmp_path / (".x.tmp-" + HEX + ".gguf")
     lease = editing.ArtifactLease(artifact)
     lease.acquire()
     assert lease.path.exists()
     lease.release()
-    assert not lease.path.exists()
+    assert lease.path.is_file()
+    second = editing.ArtifactLease(artifact)
+    assert second.acquire(blocking=False)
+    second.release()
+    assert lease.path.is_file()
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX descriptor-relative lease removal")
+@pytest.mark.skipif(os.name == "nt", reason="POSIX persistent lease policy")
 def test_lease_parent_change_does_not_unlink_unrelated_lease(tmp_path):
     parent = tmp_path / "parent"
     parent.mkdir()
@@ -191,6 +196,137 @@ def test_lease_parent_change_does_not_unlink_unrelated_lease(tmp_path):
     unrelated.write_bytes(b"unrelated")
     lease.release()
     assert unrelated.read_bytes() == b"unrelated"
+    assert (moved / lease.path.name).is_file()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX no-follow lease acquisition")
+def test_preexisting_lease_symlink_is_rejected_without_touching_target(tmp_path):
+    artifact = tmp_path / (".x.tmp-" + HEX + ".gguf")
+    target = tmp_path / "target"
+    target.write_bytes(b"")
+    lease_path = artifact.with_name(artifact.name + ".lease")
+    lease_path.symlink_to(target)
+    with pytest.raises((OSError, RuntimeError)):
+        editing.ArtifactLease(artifact).acquire()
+    assert lease_path.is_symlink()
+    assert target.read_bytes() == b""
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX no-follow lease acquisition")
+@pytest.mark.parametrize("kind", ["directory", "fifo", "socket"])
+def test_preexisting_nonregular_lease_is_rejected(tmp_path, kind):
+    artifact = tmp_path / (".x.tmp-" + HEX + ".gguf")
+    lease_path = artifact.with_name(artifact.name + ".lease")
+    sock = None
+    if kind == "directory":
+        lease_path.mkdir()
+    elif kind == "fifo":
+        os.mkfifo(lease_path)
+    else:
+        sock = socket.socket(socket.AF_UNIX)
+        short_socket = tmp_path / "socket"
+        sock.bind(str(short_socket))
+        short_socket.rename(lease_path)
+    try:
+        with pytest.raises((OSError, RuntimeError)):
+            editing.ArtifactLease(artifact).acquire()
+    finally:
+        if sock is not None:
+            sock.close()
+    assert lease_path.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX persistent lease policy")
+def test_posix_release_never_uses_path_unlink(tmp_path, monkeypatch):
+    artifact = tmp_path / (".x.tmp-" + HEX + ".gguf")
+    lease = editing.ArtifactLease(artifact)
+    lease.acquire()
+    monkeypatch.setattr(os, "unlink", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(Path, "unlink", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
+    lease.release()
+    assert lease.path.is_file()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX flock behavior")
+def test_failed_initial_lock_leaves_closed_reusable_regular_lease(tmp_path, monkeypatch):
+    import fcntl
+
+    artifact = tmp_path / (".x.tmp-" + HEX + ".gguf")
+    real_flock = fcntl.flock
+    monkeypatch.setattr(fcntl, "flock", lambda *_: (_ for _ in ()).throw(OSError("lock failed")))
+    with pytest.raises(OSError, match="lock failed"):
+        editing.ArtifactLease(artifact).acquire()
+    lease_path = artifact.with_name(artifact.name + ".lease")
+    assert lease_path.is_file()
+    monkeypatch.setattr(fcntl, "flock", real_flock)
+    retry = editing.ArtifactLease(artifact)
+    assert retry.acquire(blocking=False)
+    retry.release()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX flock behavior")
+def test_unlock_failure_closes_descriptor_and_preserves_primary_error(tmp_path, monkeypatch):
+    import fcntl
+
+    artifact = tmp_path / (".x.tmp-" + HEX + ".gguf")
+    lease = editing.ArtifactLease(artifact)
+    lease.acquire()
+    fd = lease._file.fileno()
+    real_flock = fcntl.flock
+
+    def fail_unlock(target_fd, operation):
+        if operation == fcntl.LOCK_UN:
+            raise OSError("unlock failed")
+        return real_flock(target_fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", fail_unlock)
+    with pytest.raises(OSError, match="unlock failed"):
+        lease.release()
+    assert lease._file is None and lease._parent_fd is None
+    with pytest.raises(OSError):
+        os.fstat(fd)
+    lease.release()  # idempotent
+
+    other = editing.ArtifactLease(artifact)
+    with pytest.raises(RuntimeError, match="primary export failure"):
+        with other:
+            raise RuntimeError("primary export failure")
+    assert other._file is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX completion-marker inspection")
+def test_completion_marker_same_inode_rewrite_is_unsafe(tmp_path):
+    path = _stage(tmp_path, ".completed.tmp-" + HEX)
+    marker = path / "edit_meta.json"
+    marker.write_text('{"name":".completed.tmp-' + HEX + '"}', encoding="utf-8")
+
+    def observer(phase, _value):
+        if phase == "after_marker_open":
+            marker.write_text('{"name":"changed","padding":"different"}', encoding="utf-8")
+
+    result = _inspect(tmp_path, observer=observer)
+    assert result["completed"] == []
+    assert result["changed_or_unsafe"] == [str(path)]
+    assert marker.read_text(encoding="utf-8").startswith('{"name":"changed"')
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX active lease classification")
+def test_active_lease_wins_over_mutable_candidate_metadata(tmp_path):
+    path = _gguf(tmp_path)
+    lease = editing.ArtifactLease(path)
+    lease.acquire()
+
+    def observer(phase, _value):
+        if phase == "before_inspect":
+            path.write_bytes(b"actively-updated")
+
+    try:
+        result = _inspect(tmp_path, observer=observer)
+    finally:
+        lease.release()
+    assert result["active"] == [str(path)]
+    assert result["changed_or_unsafe"] == []
+    assert path.read_bytes() == b"actively-updated"
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows fails closed without safe handles")

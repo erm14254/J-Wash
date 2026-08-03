@@ -344,8 +344,12 @@ reports legacy artifacts inactive for at least 24 hours as abandoned, while
 preserving them, active leased exports, completed exports, and cached HF
 checkpoints. Ambiguous or concurrently changed objects fail closed; Windows also
 preserves candidates when exact handle-relative inspection is unavailable.
-Destructive offline maintenance is intentionally deferred. Ordinary per-export
-cleanup still runs when the exporting process exits normally. (llama.cpp's converter
+Destructive offline maintenance is intentionally deferred. POSIX lease files are
+intentionally persistent and reusable because portable POSIX APIs cannot safely
+unlink only a previously verified inode; an unlocked lease does not mean an
+export is active. Windows removes only leases owned through its exact open handle,
+and otherwise preserves them. Ordinary per-export payload cleanup still runs when
+the exporting process exits normally. (llama.cpp's converter
 may need extra pip packages for some tokenizers, e.g. `sentencepiece` for
 Gemma - the error shows up in the UI if so.)
 
