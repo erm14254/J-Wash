@@ -122,15 +122,20 @@ def validate_forward_provenance(module, expected_class, label):
         raise ValueError(f"{label} Accelerate wrapper shape is not audited")
     wrapper = current.func
     if (getattr(wrapper, "__module__", None) != "accelerate.hooks"
-            or getattr(wrapper, "__name__", None) != "new_forward"
-            or not _bound_matches(getattr(wrapper, "__wrapped__", None), module,
+            or not getattr(wrapper, "__qualname__", "").endswith(
+                "add_hook_to_module.<locals>.new_forward")
+            or getattr(current, "__name__", None) != getattr(old, "__name__", None)
+            or not _bound_matches(getattr(current, "__wrapped__", None), module,
                                   expected)):
         raise ValueError(f"{label} Accelerate wrapper provenance is not audited")
 
 
 def _validate_direct_inventory(module, modules, parameters, label):
     if set(module._modules) != set(modules) or set(module._parameters) != set(parameters):
-        raise ValueError(f"{label} child inventory is not audited")
+        raise ValueError(
+            f"{label} child inventory is not audited: modules={tuple(module._modules)}, "
+            f"parameters={tuple(module._parameters)}"
+        )
 
 
 @dataclass(frozen=True)

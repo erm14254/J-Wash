@@ -73,7 +73,9 @@ def test_audited_decoder_class_and_alias_contracts_fail_closed():
         with pytest.raises(ValueError, match="not audited"):
             rebase.model_preflight(SimpleNamespace(
                 layers=[unknown], _lm_head=nn.Linear(8, 17, False),
-                _final_norm=unknown.post_attention_layernorm))
+                _final_norm=unknown.post_attention_layernorm,
+                _embed_tokens=nn.Embedding(17, 8),
+                layout=SimpleNamespace(lm_head="lm_head")))
     finally:
         rebase.AUDITED_DECODER_SPECS[(type(unknown).__module__, type(unknown).__name__)] = (
             SYNTHETIC_DENSE_SPEC)
@@ -134,11 +136,11 @@ def test_final_head_contract_and_explicit_embedding_tie():
 @pytest.mark.parametrize("layer", [0, 1, 2])
 def test_packed_exact_is_model_wide_and_live_rejection_is_clean(tiny, layer):
     jl = lens(tiny); rules = rule_at(tiny, layer)
-    with pytest.raises(ValueError, match="exact mode is unavailable for this model"):
+    with pytest.raises(ValueError, match="exact mode is unavailable for packed"):
         rebase.build_plan(rules, jl, 1.0, exact=True)
     before = [len(module._forward_hooks) for module in tiny.modules()]
     iv = Interventions(); iv._rules = rules; iv.set_mode("exact")
-    with pytest.raises(ValueError, match="exact mode is unavailable for this model"):
+    with pytest.raises(ValueError, match="exact mode is unavailable for packed"):
         iv.attach(jl)
     assert before == [len(module._forward_hooks) for module in tiny.modules()]
     assert iv._handles == []
@@ -281,13 +283,13 @@ def test_exact_writer_contract_is_linear_tensor_only(kind):
     cap = rebase.block_capabilities(dense)
     assert cap.exact_supported is (kind == "tensor")
     if kind != "tensor":
-        assert "unsupported" in cap.exact_reason
+        assert "not audited" in cap.exact_reason
         direction = torch.randn(8); direction /= direction.norm()
         iv = Interventions(); iv._rules = [{"id": 1, "token_id": 1, "token": "x",
             "mode": "scale", "factor": .8, "replacement_id": None, "replacement": None,
             "layers": [0], "dirs_a": {0: direction}, "dirs_b": None}]
         iv.set_mode("exact"); before = [len(module._forward_hooks) for module in jl._hf_model.modules()]
-        with pytest.raises(ValueError, match="unsupported"): iv.attach(jl)
+        with pytest.raises(ValueError, match="not audited"): iv.attach(jl)
         assert before == [len(module._forward_hooks) for module in jl._hf_model.modules()]
         assert iv._handles == []
 
@@ -340,7 +342,7 @@ def test_live_read_hook_uses_bf16_output_not_fp32_gain(tiny):
     assert iv._handles == [] and all(len(module._forward_hooks) == 0 for module in model.modules())
 
 
-def test_exact_writer_hook_uses_runtime_output_dtype():
+def test_exact_writer_forward_override_is_rejected():
     jl = dense_lens(); direction = torch.randn(8); direction /= direction.norm()
     rules = [{"id": 1, "token_id": 1, "token": "x", "mode": "scale", "factor": 0.8,
               "replacement_id": None, "replacement": None, "layers": [0],
@@ -348,18 +350,9 @@ def test_exact_writer_hook_uses_runtime_output_dtype():
     writer = jl.layers[1].self_attn.o_proj
     original_forward = writer.forward
     writer.forward = lambda x: original_forward(x.float()).to(torch.bfloat16)
-    iv = Interventions(); iv._rules = rules; iv.set_mode("exact"); iv.attach(jl)
-    try:
-        x = torch.randn(2, 8)
-        raw = original_forward(x).to(torch.bfloat16)
-        U, V = rebase.cumulative(rules, 1.0, 2)[1]
-        U_inv, Vw, _ = rebase.inverse_uv(U, V)
-        expected = raw - (raw @ Vw.to(raw)) @ U_inv.to(raw).T
-        got = writer(x)
-        assert got.dtype == torch.bfloat16
-        torch.testing.assert_close(got, expected, rtol=4e-3, atol=4e-3)
-    finally:
-        iv.detach()
+    iv = Interventions(); iv._rules = rules; iv.set_mode("exact")
+    with pytest.raises(ValueError, match="forward provenance"):
+        iv.attach(jl)
     assert iv._handles == [] and len(writer._forward_hooks) == 0
 
 

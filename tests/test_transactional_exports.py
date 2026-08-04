@@ -70,7 +70,7 @@ def test_packed_export_rejections_are_early_and_clean(tiny, tmp_path, monkeypatc
         with pytest.raises(ValueError, match=phrase):
             editing.export_rebase(rules, jl, {"dtype": "fp16"}, fmt=fmt, name=fmt)
         assert not (tmp_path / fmt).exists()
-    with pytest.raises(ValueError, match="packed residual"):
+    with pytest.raises(ValueError, match="exact mode is unavailable for packed"):
         editing.export_rebase(rules, jl, {"dtype": "fp16"}, fmt="full", name="exact", exact=True)
     assert not (tmp_path / "exact").exists()
 
