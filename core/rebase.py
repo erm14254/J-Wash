@@ -207,6 +207,7 @@ class ModelInventory:
 
 _LLAMA = "transformers.models.llama.modeling_llama"
 _QWEN_MOE = "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe"
+_SILU = ("transformers.activations", "SiLUActivation")
 
 AUDITED_DECODER_SPECS = {
     (_LLAMA, "LlamaDecoderLayer"): TopologySpec(
@@ -389,7 +390,7 @@ def _block_inventory(block, index, hidden, validated_norms):
         elif child_name == "conv1d":
             child_class = (torch.nn.Conv1d.__module__, torch.nn.Conv1d.__name__)
         elif child_name == "act":
-            child_class = (torch.nn.SiLU.__module__, torch.nn.SiLU.__name__)
+            child_class = _SILU
         else:
             child_class = (torch.nn.Linear.__module__, torch.nn.Linear.__name__)
         validate_forward_provenance(
@@ -413,7 +414,7 @@ def _block_inventory(block, index, hidden, validated_norms):
                                f"layer {index} mlp")
     if not spec.packed and "act_fn" in spec.mlp_modules:
         validate_forward_provenance(
-            mlp.act_fn, (torch.nn.SiLU.__module__, torch.nn.SiLU.__name__),
+            mlp.act_fn, _SILU,
             f"layer {index} mlp.act_fn"
         )
     if spec.packed:
@@ -441,7 +442,7 @@ def _block_inventory(block, index, hidden, validated_norms):
             )
         if "act_fn" in shared_modules:
             validate_forward_provenance(
-                shared.act_fn, (torch.nn.SiLU.__module__, torch.nn.SiLU.__name__),
+                shared.act_fn, _SILU,
                 f"layer {index} shared expert.act_fn"
             )
         validate_forward_provenance(mlp.shared_expert_gate,
