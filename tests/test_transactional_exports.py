@@ -111,7 +111,7 @@ def test_nested_gguf_style_export_is_transactional(tiny, tmp_path, monkeypatch):
                                    fmt="full", name="job/hf", source_dir=source)
     final = edits / "job" / "hf"
     assert Path(result["out_dir"]) == final.resolve() and (final / "edit_meta.json").exists()
-    assert not list(final.parent.glob(".hf.tmp-*"))
+    assert not [p for p in final.parent.glob(".hf.tmp-*") if not p.name.endswith(".lease")]
     with pytest.raises(ValueError, match="already exists"):
         editing.export_rebase(rules_for(tiny), lens(tiny), {"dtype": "fp32"},
                               fmt="full", name="job/hf", source_dir=source)
@@ -146,7 +146,8 @@ def test_nested_gguf_style_failures_leave_no_partial(tiny, tmp_path, monkeypatch
         editing.export_rebase(rules_for(tiny), lens(tiny), {"dtype": "fp32"},
                               fmt="full", name="job/hf", source_dir=source)
     parent = edits / "job"
-    assert not (parent / "hf").exists() and not list(parent.glob(".hf.tmp-*"))
+    assert not (parent / "hf").exists()
+    assert not [p for p in parent.glob(".hf.tmp-*") if not p.name.endswith(".lease")]
 
 
 @pytest.mark.parametrize("failure", ["second_shard", "config", "auxiliary", "metadata"])
@@ -174,7 +175,7 @@ def test_full_export_staging_rolls_back_every_failure(tiny, tmp_path, monkeypatc
         editing.export_rebase(rules_for(tiny), lens(tiny), {"dtype": "fp32"},
                               fmt="full", name="failed", source_dir=source)
     assert not (edits / "failed").exists()
-    assert not list(edits.glob(".failed.tmp-*"))
+    assert not [p for p in edits.glob(".failed.tmp-*") if not p.name.endswith(".lease")]
 
 
 def test_bf16_live_bake_and_direct_reload(tiny, tmp_path, monkeypatch):

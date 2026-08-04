@@ -337,7 +337,42 @@ folder (one that has `convert_hf_to_gguf.py`; `llama-quantize` too for quantized
 types), a **GGUF** entry appears in the export formats: J-Wash bakes the full
 checkpoint into a local cache, converts it, and quantizes if asked
 (`q4_k_m`, `q8_0`, …). The cached checkpoint is reused when exporting several
-GGUF types - a *clean cache* button reclaims the space. (llama.cpp's converter
+GGUF types - a *clean cache* button reclaims the space. Interrupted exports may
+leave hidden transaction artifacts. At startup J-Wash non-destructively inspects
+only its precisely recognized staging directories and GGUF temporary files. It
+reports legacy artifacts inactive for at least 24 hours as abandoned, while
+preserving them, active leased exports, completed exports, and cached HF
+checkpoints. Structural inconsistencies detected during inspection are reported
+as changed or unsafe; Windows also preserves candidates when exact
+handle-relative inspection is unavailable. A held lease is reported as active
+when each ordered no-follow check of the parent chain, candidate, lease entry,
+and retained lease descriptor succeeds at the time that check runs. These checks
+are not an atomic filesystem snapshot: another process may change an earlier
+entry between checks or before the result is returned, so `active` is advisory
+and may already be stale. An inconsistency actually observed by a check is
+reported as changed or unsafe. Neither classification authorizes deletion,
+movement, quarantine, overwrite, or any other destructive action. Directory
+timestamps are not treated as reliable namespace generation counters. Ordinary
+in-place writes may change an active artifact's contents, size, and timestamps
+without changing its structural identity. Inspection therefore checks only
+structural identity before lease state is known. A safely observed held lease
+uses the ordered advisory checks and permits those ordinary mutable updates;
+an absent or unlocked lease requires the complete discovery identity before the
+artifact can be classified as completed, recent, or abandoned.
+On supported POSIX systems, traversal and marker/lease reads are performed with
+descriptor-relative `O_NOATIME` opens. There is no fallback to ordinary traversal
+or reads that may advance access times. If this strict metadata-preserving mode is
+unavailable or denied, inspection fails closed and startup continues; Windows
+therefore does not enumerate the edits tree unless an equivalent strict mechanism
+is available. This guarantee relies on the kernel and filesystem honoring a
+successfully opened `O_NOATIME` descriptor. Inspection never restores timestamps
+or intentionally changes artifact, cache, marker, lease, or directory metadata.
+Destructive offline maintenance is intentionally deferred. POSIX lease files are
+intentionally persistent and reusable because portable POSIX APIs cannot safely
+unlink only a previously verified inode; an unlocked lease does not mean an
+export is active. Windows removes only leases owned through its exact open handle,
+and otherwise preserves them. Ordinary per-export payload cleanup still runs when
+the exporting process exits normally. (llama.cpp's converter
 may need extra pip packages for some tokenizers, e.g. `sentencepiece` for
 Gemma - the error shows up in the UI if so.)
 

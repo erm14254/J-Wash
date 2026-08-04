@@ -1,7 +1,12 @@
+import errno
 import json
+import os
 import re
 import shutil
+import stat
+import time
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
@@ -15,6 +20,1022 @@ from core.ablation import abliteration_direction, effective_coeffs
 
 EDITS_DIR = config.DATA_DIR / "edits"
 PRESETS_DIR = config.DATA_DIR / "presets"
+
+DEFAULT_TEMP_STALE_AGE = 24 * 60 * 60
+_TEMP_STAGE_RE = re.compile(r"^\..+\.tmp-[0-9a-f]{32}$")
+_TEMP_GGUF_RE = re.compile(r"^\..+\.tmp-[0-9a-f]{32}\.gguf$")
+_OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
+_STAT_SUPPORTS_DIR_FD = os.stat in os.supports_dir_fd
+_STAT_SUPPORTS_NOFOLLOW = os.stat in os.supports_follow_symlinks
+
+
+def _mark_windows_file_for_deletion(file):
+    """Mark the exact open Windows file handle for deletion on close."""
+    import ctypes
+    import msvcrt
+
+    class FILE_DISPOSITION_INFO(ctypes.Structure):
+        _fields_ = [("DeleteFile", ctypes.c_ubyte)]
+
+    info = FILE_DISPOSITION_INFO(1)
+    handle = msvcrt.get_osfhandle(file.fileno())
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    if not kernel32.SetFileInformationByHandle(
+        ctypes.c_void_p(handle), 4, ctypes.byref(info), ctypes.sizeof(info)
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _open_windows_lease(path, *, create):
+    """Open a lease with DELETE access so disposal stays handle-bound."""
+    import ctypes
+    import msvcrt
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.restype = ctypes.c_void_p
+    access = 0x80000000 | 0x40000000 | 0x00010000  # read, write, delete
+    sharing = 0x1 | 0x2 | 0x4
+    flags = 0x00200000  # FILE_FLAG_OPEN_REPARSE_POINT
+
+    def open_handle(disposition):
+        handle = kernel32.CreateFileW(
+            str(path), access, sharing, None, disposition, flags, None,
+        )
+        if handle == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        return msvcrt.open_osfhandle(handle, os.O_RDWR)
+
+    if create:
+        try:
+            return open_handle(1), True  # CREATE_NEW
+        except FileExistsError:
+            pass
+    return open_handle(3), False  # OPEN_EXISTING
+
+
+def _validate_windows_lease_file(file):
+    """Return the structural identity of an ordinary disk-file handle."""
+    import ctypes
+    import msvcrt
+
+    class BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", ctypes.c_uint32),
+            ("ftCreationTimeLow", ctypes.c_uint32),
+            ("ftCreationTimeHigh", ctypes.c_uint32),
+            ("ftLastAccessTimeLow", ctypes.c_uint32),
+            ("ftLastAccessTimeHigh", ctypes.c_uint32),
+            ("ftLastWriteTimeLow", ctypes.c_uint32),
+            ("ftLastWriteTimeHigh", ctypes.c_uint32),
+            ("dwVolumeSerialNumber", ctypes.c_uint32),
+            ("nFileSizeHigh", ctypes.c_uint32),
+            ("nFileSizeLow", ctypes.c_uint32),
+            ("nNumberOfLinks", ctypes.c_uint32),
+            ("nFileIndexHigh", ctypes.c_uint32),
+            ("nFileIndexLow", ctypes.c_uint32),
+        ]
+
+    handle = msvcrt.get_osfhandle(file.fileno())
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    if kernel32.GetFileType(ctypes.c_void_p(handle)) != 1:  # FILE_TYPE_DISK
+        raise RuntimeError("temporary artifact lease is not a normal disk file")
+    info = BY_HANDLE_FILE_INFORMATION()
+    if not kernel32.GetFileInformationByHandle(
+        ctypes.c_void_p(handle), ctypes.byref(info)
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    unsafe = 0x10 | 0x400  # FILE_ATTRIBUTE_DIRECTORY | REPARSE_POINT
+    if info.dwFileAttributes & unsafe:
+        raise RuntimeError("temporary artifact lease is a directory or reparse point")
+    return (
+        info.dwVolumeSerialNumber,
+        (info.nFileIndexHigh << 32) | info.nFileIndexLow,
+        info.dwFileAttributes & unsafe,
+    )
+
+
+def _validate_acquired_lease_file(file):
+    """Final fallible lease validation, kept separate for deterministic tests."""
+    if os.name == "nt":
+        return _validate_windows_lease_file(file)
+    current = os.fstat(file.fileno())
+    if _stat_is_link_or_reparse(current) or not stat.S_ISREG(current.st_mode):
+        raise RuntimeError("temporary artifact lease is not a safe regular file")
+    return _stat_identity(current)
+
+
+def internal_temp_leaf_kind(name):
+    """Classify exact J-Wash temporary/lease leaf names."""
+    artifact_name = name[:-6] if name.endswith(".lease") else name
+    if _TEMP_STAGE_RE.fullmatch(artifact_name):
+        return "directory-lease" if name.endswith(".lease") else "directory"
+    if _TEMP_GGUF_RE.fullmatch(artifact_name):
+        return "file-lease" if name.endswith(".lease") else "file"
+    return None
+
+
+class ArtifactLease:
+    """Exclusive advisory lease for one temporary export artifact.
+
+    POSIX lease files are deliberately persistent.  Portable POSIX APIs cannot
+    condition an unlink on the inode previously inspected, so removing a lease
+    during release could delete an unrelated replacement.  Unlocked retained
+    leases are safe and reusable.
+    """
+
+    def __init__(self, artifact, *, create=True):
+        self.artifact = Path(artifact)
+        self.path = self.artifact.with_name(self.artifact.name + ".lease")
+        self.create = create
+        self._file = None
+        self._parent_fd = None
+        self._identity = None
+        self._created = False
+
+    def acquire(self, *, blocking=True):
+        created = False
+        parent_fd = None
+        fd = None
+        file = None
+        try:
+            if os.name == "nt":
+                fd, created = _open_windows_lease(self.path, create=self.create)
+            else:
+                if not hasattr(os, "O_NOFOLLOW"):
+                    raise RuntimeError("safe no-follow POSIX lease acquisition is unavailable")
+                parent_chain = _snapshot_directory_chain(_absolute_no_follow(self.path.parent))
+                parent_fd = _open_verified_directory_chain(parent_chain)
+                open_path = self.path.name
+                common_flags = os.O_RDWR | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+                if self.create:
+                    try:
+                        fd = os.open(
+                            open_path, common_flags | os.O_CREAT | os.O_EXCL,
+                            0o600, dir_fd=parent_fd,
+                        )
+                        created = True
+                        created_stat = os.fstat(fd)
+                        if (
+                            _stat_is_link_or_reparse(created_stat)
+                            or not stat.S_ISREG(created_stat.st_mode)
+                        ):
+                            raise RuntimeError(
+                                "new temporary artifact lease is not a safe regular file"
+                            )
+                    except FileExistsError:
+                        before = os.stat(
+                            open_path, dir_fd=parent_fd, follow_symlinks=False,
+                        )
+                        if _stat_is_link_or_reparse(before) or not stat.S_ISREG(before.st_mode):
+                            raise RuntimeError("temporary artifact lease is not a safe regular file")
+                        fd = os.open(open_path, common_flags, dir_fd=parent_fd)
+                        opened = os.fstat(fd)
+                        if (
+                            _stat_is_link_or_reparse(opened)
+                            or not stat.S_ISREG(opened.st_mode)
+                            or _candidate_identity(opened) != _candidate_identity(before)
+                        ):
+                            raise RuntimeError("temporary artifact lease changed during acquisition")
+                else:
+                    before = os.stat(
+                        open_path, dir_fd=parent_fd, follow_symlinks=False,
+                    )
+                    if _stat_is_link_or_reparse(before) or not stat.S_ISREG(before.st_mode):
+                        raise RuntimeError("temporary artifact lease is not a safe regular file")
+                    fd = os.open(open_path, common_flags, dir_fd=parent_fd)
+                    opened = os.fstat(fd)
+                    if (
+                        _stat_is_link_or_reparse(opened)
+                        or not stat.S_ISREG(opened.st_mode)
+                        or _candidate_identity(opened) != _candidate_identity(before)
+                    ):
+                        raise RuntimeError("temporary artifact lease changed during acquisition")
+            file = os.fdopen(fd, "r+b")
+            fd = None
+            if os.name == "nt":
+                _validate_windows_lease_file(file)
+            if os.name == "nt":
+                file.seek(0, os.SEEK_END)
+            if os.name == "nt" and file.tell() == 0:
+                file.write(b"0")
+                file.flush()
+            if os.name == "nt":
+                file.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                flag = msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK
+                try:
+                    msvcrt.locking(file.fileno(), flag, 1)
+                except OSError as exc:
+                    if not blocking and exc.errno in (
+                        errno.EACCES, errno.EAGAIN, errno.EDEADLK,
+                    ):
+                        file.close()
+                        file = None
+                        return False
+                    raise
+            else:
+                import fcntl
+                flag = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+                try:
+                    fcntl.flock(file.fileno(), flag)
+                except BlockingIOError:
+                    file.close()
+                    file = None
+                    return False
+            identity = _validate_acquired_lease_file(file)
+            # POSIX release never removes the persistent lease, so it does not
+            # retain a parent descriptor for the export lifetime.
+            if parent_fd is not None:
+                os.close(parent_fd)
+                parent_fd = None
+            self._parent_fd = None
+            # Publish object state only after every fallible validation succeeds.
+            self._file = file
+            self._identity = identity
+            self._created = created
+            return True
+        except Exception:
+            if file is not None and not file.closed:
+                if created and os.name == "nt":
+                    try:
+                        _mark_windows_file_for_deletion(file)
+                    except OSError:
+                        pass
+                file.close()
+            elif fd is not None:
+                os.close(fd)
+            raise
+        finally:
+            if parent_fd is not None:
+                os.close(parent_fd)
+
+    def release(self, *, remove=True):
+        file, self._file = self._file, None
+        parent_fd, self._parent_fd = self._parent_fd, None
+        _, self._identity = self._identity, None
+        created, self._created = self._created, False
+        unlock_error = None
+        try:
+            if file is not None:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+                        file.seek(0)
+                        msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(file.fileno(), fcntl.LOCK_UN)
+                except Exception as exc:
+                    unlock_error = exc
+                try:
+                    if remove and created and os.name == "nt":
+                        # Windows deletion is bound to the owned open handle.
+                        _mark_windows_file_for_deletion(file)
+                except OSError:
+                    pass
+                finally:
+                    file.close()
+        finally:
+            if parent_fd is not None:
+                try:
+                    os.close(parent_fd)
+                except OSError:
+                    pass
+        if unlock_error is not None:
+            raise unlock_error
+
+    def __enter__(self):
+        if not self.acquire():
+            raise RuntimeError(f"temporary artifact lease is already held: {self.path}")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            self.release()
+        except Exception:
+            if exc is None:
+                raise
+        return False
+
+
+def artifact_lease(artifact):
+    return ArtifactLease(artifact)
+
+
+def _is_link_or_reparse(path, path_stat=None):
+    path_stat = path.lstat() if path_stat is None else path_stat
+    return (
+        _stat_is_link_or_reparse(path_stat)
+        or getattr(path, "is_junction", lambda: False)()
+    )
+
+
+def _stat_is_link_or_reparse(path_stat):
+    """Classify links from no-follow stat data without another path lookup."""
+    return stat.S_ISLNK(path_stat.st_mode) or bool(
+        getattr(path_stat, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    )
+
+
+def _recognized_temp(path):
+    """Return the owned temporary kind without following a symlink."""
+    try:
+        if _is_link_or_reparse(path):
+            return None
+        if internal_temp_leaf_kind(path.name) == "directory" and path.is_dir():
+            return "directory"
+        if internal_temp_leaf_kind(path.name) == "file" and path.is_file():
+            return "file"
+    except OSError:
+        raise
+    return None
+
+
+def _stat_identity(value):
+    return (
+        value.st_dev, value.st_ino, stat.S_IFMT(value.st_mode),
+        getattr(value, "st_file_attributes", 0),
+        getattr(value, "st_reparse_tag", 0),
+    )
+
+
+def _candidate_identity(value):
+    return _stat_identity(value) + (
+        getattr(value, "st_ctime_ns", None), getattr(value, "st_mtime_ns", None),
+        value.st_size,
+    )
+
+
+def _candidate_structural_identity(value):
+    """Return identity fields that ordinary in-place export writes cannot change."""
+    return _stat_identity(value)
+
+
+def _candidate_identity_matches(value, expected, *, full):
+    """Compare either structural-only or complete discovery identity."""
+    if full:
+        return _candidate_identity(value) == expected
+    return _candidate_structural_identity(value) == expected[:5]
+
+
+def _absolute_no_follow(path):
+    """Return an absolute normalized spelling without resolving any links."""
+    return Path(os.path.abspath(os.path.normpath(os.fspath(path))))
+
+
+def _path_chain(path):
+    anchor = Path(path.anchor)
+    current = anchor
+    chain = [anchor]
+    for part in path.parts[1:]:
+        current = current / part
+        chain.append(current)
+    return chain
+
+
+def _snapshot_directory_chain(path, *, missing_ok=False):
+    snapshots = []
+    for component in _path_chain(path):
+        try:
+            component_stat = component.lstat()
+        except FileNotFoundError:
+            if missing_ok:
+                return None
+            raise
+        if _is_link_or_reparse(component, component_stat):
+            raise ValueError(
+                f"cleanup root chain contains a symlink or junction/reparse point: {component}"
+            )
+        if not stat.S_ISDIR(component_stat.st_mode):
+            raise ValueError(f"cleanup path component is not a directory: {component}")
+        snapshots.append((component, _stat_identity(component_stat)))
+    return tuple(snapshots)
+
+
+def _revalidate_directory_chain(snapshots):
+    for component, expected in snapshots:
+        current = component.lstat()
+        if _is_link_or_reparse(component, current) or _stat_identity(current) != expected:
+            raise ValueError(f"cleanup path component changed: {component}")
+
+
+def _open_verified_directory_chain(snapshots):
+    """Open a POSIX directory chain without following links."""
+    if os.name == "nt":
+        raise _UnsafeAnchoredInspection(
+            "safe handle-relative temporary inspection is unavailable on Windows"
+        )
+    flags = (
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    )
+    opened = []
+    try:
+        fd = os.open(snapshots[0][0], flags)
+        opened.append(fd)
+        for index, (component, expected) in enumerate(snapshots):
+            if index:
+                fd = os.open(component.name, flags, dir_fd=fd)
+                opened.append(fd)
+            current = os.fstat(fd)
+            if _stat_identity(current) != expected or not stat.S_ISDIR(current.st_mode):
+                raise _UnsafeAnchoredInspection(f"inspection parent changed: {component}")
+        keep = opened.pop()
+        return keep
+    finally:
+        for fd in reversed(opened):
+            os.close(fd)
+
+
+def _strict_inspection_capability():
+    """Return whether metadata-preserving startup inspection is available."""
+    required_flags = ("O_NOATIME", "O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC")
+    if os.name != "posix":
+        return False
+    for name in required_flags:
+        value = getattr(os, name, 0)
+        if not isinstance(value, int) or isinstance(value, bool) or value == 0:
+            return False
+    if os.scandir not in getattr(os, "supports_fd", ()):
+        return False
+    if not _OPEN_SUPPORTS_DIR_FD:
+        return False
+    if not _STAT_SUPPORTS_DIR_FD or not _STAT_SUPPORTS_NOFOLLOW:
+        return False
+    # CPython's POSIX scandir accepts an open directory descriptor.  Windows
+    # does not, and is rejected above before any tree access.
+    return True
+
+
+def _scandir_inspection_fd(directory_fd):
+    """Open an fd-based iterator or fail closed without a pathname fallback."""
+    try:
+        return os.scandir(directory_fd)
+    except (TypeError, NotImplementedError) as exc:
+        raise _UnsafeAnchoredInspection(
+            "strict metadata-preserving temporary inspection is unavailable: "
+            "fd-based os.scandir is not supported at runtime"
+        ) from exc
+
+
+def _inspection_directory_flags():
+    if not _strict_inspection_capability():
+        raise _UnsafeAnchoredInspection(
+            "strict metadata-preserving temporary inspection is unavailable on this platform"
+        )
+    return (
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NOATIME
+    )
+
+
+@dataclass(frozen=True)
+class _TempCandidate:
+    path: Path
+    kind: str
+    identity: tuple
+    parent_chain: tuple
+    anchor_index: int = 0
+
+
+class _UnsafeAnchoredInspection(RuntimeError):
+    """Raised when a no-follow inspection cannot establish the required safety."""
+
+
+class _AnchoredInspectionParent:
+    """Descriptor-relative, no-follow inspector for a temporary candidate."""
+
+    def __init__(self, candidate):
+        self.candidate = candidate
+        self.parent_fd = None
+        self._fds = []
+
+    def __enter__(self):
+        flags = _inspection_directory_flags()
+        # The complete lexical chain is revalidated separately. Descriptor
+        # traversal begins at the configured edits root so O_NOATIME does not
+        # require ownership of unrelated ancestors such as ``/``.
+        snapshots = self.candidate.parent_chain[self.candidate.anchor_index:]
+        try:
+            if not snapshots:
+                raise _UnsafeAnchoredInspection("candidate has no validated parent chain")
+            anchor, expected = snapshots[0]
+            fd = os.open(anchor, flags)
+            self._fds.append(fd)
+            self._verify_fd(fd, expected, anchor)
+            for component, expected in snapshots[1:]:
+                next_fd = os.open(component.name, flags, dir_fd=fd)
+                self._fds.append(next_fd)
+                self._verify_fd(next_fd, expected, component)
+                fd = next_fd
+            self.parent_fd = fd
+            self.stat_leaf(self.candidate.path.name, self.candidate.identity)
+            return self
+        except Exception as exc:
+            self.__exit__(None, None, None)
+            if isinstance(exc, _UnsafeAnchoredInspection):
+                raise
+            raise _UnsafeAnchoredInspection(
+                f"cannot safely anchor inspection parent: {exc}"
+            ) from exc
+
+    @staticmethod
+    def _verify_fd(fd, expected, display):
+        current = os.fstat(fd)
+        if _stat_identity(current) != expected or not stat.S_ISDIR(current.st_mode):
+            raise _UnsafeAnchoredInspection(f"inspection parent changed: {display}")
+
+    def stat_leaf(self, leaf, expected_identity=None, *, full=False):
+        current = os.stat(leaf, dir_fd=self.parent_fd, follow_symlinks=False)
+        if _stat_is_link_or_reparse(current):
+            raise _UnsafeAnchoredInspection(
+                "temporary artifact changed or became a link/reparse point"
+            )
+        expected_type = stat.S_ISDIR if self.candidate.kind == "directory" else stat.S_ISREG
+        if not expected_type(current.st_mode):
+            raise _UnsafeAnchoredInspection("temporary artifact type changed")
+        if expected_identity is not None:
+            if not _candidate_identity_matches(current, expected_identity, full=full):
+                detail = " changed after discovery" if full else " identity changed"
+                raise _UnsafeAnchoredInspection("temporary artifact" + detail)
+        return current
+
+    def read_completion_marker(self, observer=None):
+        """Read ``edit_meta.json`` through the retained candidate-parent fd."""
+        if self.candidate.kind != "directory":
+            raise _UnsafeAnchoredInspection("completion marker requires a directory artifact")
+        flags = _inspection_directory_flags()
+        candidate_fd = os.open(self.candidate.path.name, flags, dir_fd=self.parent_fd)
+        try:
+            candidate_stat = os.fstat(candidate_fd)
+            if (
+                _stat_is_link_or_reparse(candidate_stat)
+                or _candidate_identity(candidate_stat) != self.candidate.identity
+                or not stat.S_ISDIR(candidate_stat.st_mode)
+            ):
+                raise _UnsafeAnchoredInspection(
+                    "temporary artifact changed during completion marker inspection"
+                )
+            if observer:
+                observer("before_marker_open", self.candidate.path)
+            marker_stat = os.stat(
+                "edit_meta.json", dir_fd=candidate_fd, follow_symlinks=False,
+            )
+            if _stat_is_link_or_reparse(marker_stat) or not stat.S_ISREG(marker_stat.st_mode):
+                raise ValueError("possible completion marker is not a safe regular file")
+            marker_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NOATIME
+            marker_fd = os.open("edit_meta.json", marker_flags, dir_fd=candidate_fd)
+            try:
+                opened = os.fstat(marker_fd)
+                marker_identity = _candidate_identity(marker_stat)
+                if _candidate_identity(opened) != marker_identity:
+                    raise ValueError("possible completion marker changed during inspection")
+                if observer:
+                    observer("after_marker_open", self.candidate.path)
+                with os.fdopen(marker_fd, "r", encoding="utf-8") as stream:
+                    marker_fd = None
+                    metadata = json.load(stream)
+                    if _candidate_identity(os.fstat(stream.fileno())) != marker_identity:
+                        raise ValueError(
+                            "possible completion marker changed while being read"
+                        )
+                    return metadata
+            finally:
+                if marker_fd is not None:
+                    os.close(marker_fd)
+        finally:
+            os.close(candidate_fd)
+
+    def newest_mtime(self):
+        """Return newest lstat mtime using only no-atime descriptor traversal."""
+        current = self.stat_leaf(
+            self.candidate.path.name, self.candidate.identity, full=True,
+        )
+        newest = current.st_mtime
+        if self.candidate.kind == "file":
+            return newest
+        candidate_fd = os.open(
+            self.candidate.path.name, _inspection_directory_flags(),
+            dir_fd=self.parent_fd,
+        )
+        try:
+            return max(newest, _newest_mtime_from_fd(candidate_fd, self.candidate.path))
+        finally:
+            os.close(candidate_fd)
+
+    def __exit__(self, exc_type, exc, tb):
+        for fd in reversed(self._fds):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self._fds.clear()
+        self.parent_fd = None
+        return False
+
+
+def _revalidate_candidate_structural(candidate):
+    """Revalidate link/type and stable identity before lease state is known."""
+    _revalidate_directory_chain(candidate.parent_chain)
+    current = candidate.path.lstat()
+    if _is_link_or_reparse(candidate.path, current):
+        raise ValueError("temporary artifact changed or became a link/reparse point")
+    expected = stat.S_ISDIR if candidate.kind == "directory" else stat.S_ISREG
+    if not expected(current.st_mode):
+        raise ValueError("temporary artifact type changed after discovery")
+    if not _candidate_identity_matches(current, candidate.identity, full=False):
+        raise ValueError("temporary artifact structural identity changed after discovery")
+    return current
+
+
+def _revalidate_candidate_full(candidate):
+    """Require structural and mutable fields to match the discovery snapshot."""
+    current = _revalidate_candidate_structural(candidate)
+    if not _candidate_identity_matches(current, candidate.identity, full=True):
+        raise ValueError("temporary artifact changed after discovery")
+    return current
+
+
+def _newest_mtime_from_fd(directory_fd, display):
+    """Walk one opened directory without following names or updating atime."""
+    newest = os.fstat(directory_fd).st_mtime
+    with _scandir_inspection_fd(directory_fd) as entries:
+        for entry in entries:
+            entry_stat = os.stat(
+                entry.name, dir_fd=directory_fd, follow_symlinks=False,
+            )
+            newest = max(newest, entry_stat.st_mtime)
+            if _stat_is_link_or_reparse(entry_stat) or not stat.S_ISDIR(entry_stat.st_mode):
+                continue
+            child_fd = os.open(
+                entry.name, _inspection_directory_flags(), dir_fd=directory_fd,
+            )
+            try:
+                opened = os.fstat(child_fd)
+                if _candidate_identity(opened) != _candidate_identity(entry_stat):
+                    raise _UnsafeAnchoredInspection(
+                        f"inspection directory changed: {display / entry.name}"
+                    )
+                newest = max(
+                    newest, _newest_mtime_from_fd(child_fd, display / entry.name),
+                )
+            finally:
+                os.close(child_fd)
+    return newest
+
+
+def _discover_temp_candidates(root, root_chain, result):
+    """Discover candidates by descriptor-relative, no-atime traversal."""
+    candidates = []
+    root_fd = _open_inspection_root(root_chain)
+
+    def walk(directory_fd, display, relative_chain):
+        with _scandir_inspection_fd(directory_fd) as entries:
+            for entry in entries:
+                path = display / entry.name
+                try:
+                    entry_stat = os.stat(
+                        entry.name, dir_fd=directory_fd, follow_symlinks=False,
+                    )
+                    if _stat_is_link_or_reparse(entry_stat):
+                        continue
+                    kind = None
+                    leaf_kind = internal_temp_leaf_kind(entry.name)
+                    if leaf_kind == "directory" and stat.S_ISDIR(entry_stat.st_mode):
+                        kind = "directory"
+                    elif leaf_kind == "file" and stat.S_ISREG(entry_stat.st_mode):
+                        kind = "file"
+                    if kind:
+                        candidates.append(_TempCandidate(
+                            path, kind, _candidate_identity(entry_stat),
+                            root_chain + relative_chain,
+                            len(root_chain) - 1,
+                        ))
+                        continue
+                    if not stat.S_ISDIR(entry_stat.st_mode):
+                        continue
+                    child_fd = os.open(
+                        entry.name, _inspection_directory_flags(), dir_fd=directory_fd,
+                    )
+                    try:
+                        opened = os.fstat(child_fd)
+                        if _candidate_identity(opened) != _candidate_identity(entry_stat):
+                            raise _UnsafeAnchoredInspection(
+                                f"inspection directory changed: {path}"
+                            )
+                        walk(
+                            child_fd, path,
+                            relative_chain + ((path, _stat_identity(opened)),),
+                        )
+                    finally:
+                        os.close(child_fd)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    result["errors"].append({"path": str(path), "error": str(exc)})
+
+    try:
+        walk(root_fd, root, ())
+    finally:
+        os.close(root_fd)
+    return candidates
+
+
+def _open_inspection_root(root_chain):
+    """Open the verified root itself without permitting access-time updates."""
+    flags = _inspection_directory_flags()
+    root, expected = root_chain[-1]
+    fd = os.open(root, flags)
+    try:
+        current = os.fstat(fd)
+        if _stat_identity(current) != expected or not stat.S_ISDIR(current.st_mode):
+            raise _UnsafeAnchoredInspection(f"inspection root changed: {root}")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+@dataclass
+class _LeaseProbe:
+    """Descriptor-backed proof returned by a safe existing-lease probe."""
+
+    held: bool
+    fd: int
+    identity: tuple
+    locked_by_us: bool = False
+
+    def close(self):
+        if self.fd is None:
+            return
+        fd, self.fd = self.fd, None
+        try:
+            if self.locked_by_us:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+
+def _inspect_existing_lease(anchored, lease_leaf):
+    """Return a retained descriptor proof for an existing POSIX lease."""
+    if os.name == "nt":
+        raise _UnsafeAnchoredInspection(
+            "safe handle-relative lease inspection is unavailable on Windows"
+        )
+    lease_stat = os.stat(lease_leaf, dir_fd=anchored.parent_fd, follow_symlinks=False)
+    if _stat_is_link_or_reparse(lease_stat) or not stat.S_ISREG(lease_stat.st_mode):
+        raise _UnsafeAnchoredInspection("temporary artifact lease is not a safe regular file")
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NOATIME
+    fd = os.open(lease_leaf, flags, dir_fd=anchored.parent_fd)
+    try:
+        opened = os.fstat(fd)
+        if _stat_identity(opened) != _stat_identity(lease_stat):
+            raise _UnsafeAnchoredInspection("temporary artifact lease changed during inspection")
+        import fcntl
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            proof = _LeaseProbe(True, fd, _stat_identity(opened))
+        else:
+            proof = _LeaseProbe(False, fd, _stat_identity(opened), locked_by_us=True)
+        fd = None
+        return proof
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _check_held_lease_advisory(
+    *, root_chain, candidate, anchored, lease_leaf, proof, observer=None
+):
+    """Run ordered, descriptor-backed safety checks for a held lease.
+
+    These checks are deliberately not an atomic filesystem snapshot. A
+    successful return means only that every check succeeded when it ran and no
+    inconsistency was observed before the result was produced. Entries checked
+    earlier may already have changed, so the resulting ``active`` classification
+    is advisory and must never authorize a destructive operation.
+    """
+    _revalidate_directory_chain(root_chain)
+    _revalidate_directory_chain(candidate.parent_chain)
+
+    parent_start = os.fstat(anchored.parent_fd)
+    expected_parent = candidate.parent_chain[-1][1]
+    if (
+        _stat_identity(parent_start) != expected_parent
+        or not stat.S_ISDIR(parent_start.st_mode)
+    ):
+        raise _UnsafeAnchoredInspection(
+            "temporary artifact parent changed during active checks"
+        )
+
+    candidate_first = anchored.stat_leaf(candidate.path.name)
+    if not _candidate_identity_matches(candidate_first, candidate.identity, full=False):
+        raise _UnsafeAnchoredInspection(
+            "temporary artifact structural identity changed during active checks"
+        )
+    if observer:
+        observer("after_active_candidate_check_1", candidate.path)
+
+    lease_first = os.stat(
+        lease_leaf, dir_fd=anchored.parent_fd, follow_symlinks=False,
+    )
+    if (
+        _stat_is_link_or_reparse(lease_first)
+        or not stat.S_ISREG(lease_first.st_mode)
+        or _stat_identity(lease_first) != proof.identity
+        or _stat_identity(os.fstat(proof.fd)) != proof.identity
+    ):
+        raise _UnsafeAnchoredInspection(
+            "temporary artifact lease changed during active checks"
+        )
+    if observer:
+        observer("after_active_lease_entry_check_1", candidate.path)
+
+    candidate_second = anchored.stat_leaf(candidate.path.name)
+    if not _candidate_identity_matches(candidate_second, candidate.identity, full=False):
+        raise _UnsafeAnchoredInspection(
+            "temporary artifact structural identity changed during active checks"
+        )
+    if observer:
+        observer("after_active_candidate_check_2", candidate.path)
+    lease_second = os.stat(
+        lease_leaf, dir_fd=anchored.parent_fd, follow_symlinks=False,
+    )
+    if (
+        _stat_is_link_or_reparse(lease_second)
+        or not stat.S_ISREG(lease_second.st_mode)
+        or _stat_identity(lease_second) != proof.identity
+        or _stat_identity(os.fstat(proof.fd)) != proof.identity
+    ):
+        raise _UnsafeAnchoredInspection(
+            "temporary artifact lease changed during active checks"
+        )
+    if observer:
+        observer("after_active_lease_entry_check_2", candidate.path)
+
+    parent_end = os.fstat(anchored.parent_fd)
+    if (
+        _stat_identity(parent_end) != expected_parent
+    ):
+        raise _UnsafeAnchoredInspection(
+            "temporary artifact parent changed during active checks"
+        )
+    _revalidate_directory_chain(root_chain)
+    _revalidate_directory_chain(candidate.parent_chain)
+
+    # This is merely the end of the ordered checks, not a filesystem
+    # linearization point. A previously checked name may change before this
+    # callback or before the caller receives the advisory result.
+    if observer:
+        observer("before_active_result", candidate.path)
+
+
+def inspect_abandoned_export_temps(
+    *, root=None, now=None, stale_age=DEFAULT_TEMP_STALE_AGE, observer=None
+):
+    """Non-destructively classify J-Wash temporary export artifacts.
+
+    On supported POSIX systems, all traversal and reads use descriptor-relative
+    ``O_NOATIME`` opens; inspection never falls back to an operation that may
+    advance access times. Unsupported or denied strict inspection fails closed.
+    Startup inspection deliberately never renames, removes, or modifies an
+    artifact or lease. Structural inconsistencies detected during inspection
+    are ``changed_or_unsafe``. ``active`` means a held lease was observed and
+    each ordered no-follow safety check succeeded when performed. The checks are
+    not an atomic snapshot: an inter-check change may go undetected and the
+    result may already be stale. It must never authorize a destructive action.
+    """
+    root = _absolute_no_follow(root if root is not None else EDITS_DIR)
+    current_time = time.time() if now is None else float(now)
+    result = {
+        "active": [], "recent": [], "completed": [], "abandoned": [],
+        "changed_or_unsafe": [], "errors": [],
+        # Deprecated compatibility fields. Startup inspection never deletes.
+        "removed": [], "removed_count": 0,
+        "skipped_active": [], "skipped_recent": [],
+        "skipped_completed": [], "skipped_changed": [],
+    }
+    if not _strict_inspection_capability():
+        result["errors"].append({
+            "path": str(root),
+            "error": "strict metadata-preserving temporary inspection is unavailable on this platform",
+        })
+        return result
+    try:
+        root_chain = _snapshot_directory_chain(root, missing_ok=True)
+        if root_chain is None:
+            return result
+    except (OSError, RuntimeError, ValueError) as exc:
+        result["errors"].append({"path": str(root), "error": str(exc)})
+        return result
+
+    try:
+        candidates = _discover_temp_candidates(root, root_chain, result)
+    except (OSError, RuntimeError, ValueError) as exc:
+        result["errors"].append({"path": str(root), "error": str(exc)})
+        return result
+
+    if observer:
+        observer("discovered", tuple(candidate.path for candidate in candidates))
+
+    def classify(key, path):
+        result[key].append(str(path))
+        legacy = {
+            "active": "skipped_active", "recent": "skipped_recent",
+            "completed": "skipped_completed", "changed_or_unsafe": "skipped_changed",
+        }.get(key)
+        if legacy:
+            result[legacy].append(str(path))
+
+    for candidate in candidates:
+        path, kind = candidate.path, candidate.kind
+        try:
+            _revalidate_directory_chain(root_chain)
+            path.relative_to(root)
+            # Before lease state is known, allow only structural continuity.
+            # A held exporter may legitimately mutate contents and timestamps.
+            _revalidate_candidate_structural(candidate)
+            if observer:
+                observer("before_inspect", path)
+            if os.name == "nt":
+                raise _UnsafeAnchoredInspection(
+                    "safe handle-relative temporary inspection is unavailable on Windows"
+                )
+            with _AnchoredInspectionParent(candidate) as anchored:
+                lease_leaf = path.name + ".lease"
+                try:
+                    os.stat(lease_leaf, dir_fd=anchored.parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    has_lease = False
+                else:
+                    has_lease = True
+                    with _inspect_existing_lease(anchored, lease_leaf) as lease_proof:
+                        if lease_proof.held:
+                            if observer:
+                                observer("after_held_lease_probe", path)
+                            _check_held_lease_advisory(
+                                root_chain=root_chain,
+                                candidate=candidate,
+                                anchored=anchored,
+                                lease_leaf=lease_leaf,
+                                proof=lease_proof,
+                                observer=observer,
+                            )
+                            classify("active", path)
+                            continue
+
+                # An active writer may legitimately change size/timestamps.
+                # Once an existing lease is known to be unlocked (or absent),
+                # require the complete discovery identity before classification.
+                anchored.stat_leaf(path.name, candidate.identity, full=True)
+
+                if not has_lease and kind == "directory":
+                    try:
+                        metadata = anchored.read_completion_marker(observer)
+                    except FileNotFoundError:
+                        metadata = None
+                    except Exception as exc:
+                        raise _UnsafeAnchoredInspection(
+                            f"cannot safely inspect possible completion marker: {exc}"
+                        ) from exc
+                    if metadata is not None:
+                        _revalidate_candidate_full(candidate)
+                        relative_name = path.relative_to(root).as_posix()
+                        if not isinstance(metadata, dict) or not isinstance(metadata.get("name"), str):
+                            raise _UnsafeAnchoredInspection(
+                                "possible completion marker has invalid metadata"
+                            )
+                        if metadata["name"] == relative_name:
+                            classify("completed", path)
+                            continue
+
+                newest = anchored.newest_mtime()
+                if observer:
+                    observer("after_activity", path)
+                anchored.stat_leaf(path.name, candidate.identity, full=True)
+            _revalidate_directory_chain(root_chain)
+            if current_time - newest < stale_age:
+                classify("recent", path)
+            else:
+                classify("abandoned", path)
+        except Exception as exc:
+            classify("changed_or_unsafe", path)
+            result["errors"].append({"path": str(path), "error": str(exc)})
+    return result
+
+
+def cleanup_abandoned_export_temps(**kwargs):
+    """Deprecated non-destructive alias for startup inspection."""
+    return inspect_abandoned_export_temps(**kwargs)
+
 
 # Residual writes edited by the global abliteration (embed aside)
 TARGET_SUFFIXES = ("self_attn.o_proj", "mlp.down_proj")
@@ -167,6 +1188,9 @@ def export_abliteration(rules, jl, model_meta, *, fmt, name, source_dir=None, sc
     ``lora`` (exact PEFT adapter, rank = n_rules; embed omitted if embeddings
     are tied). Unties ``lm_head`` (full/layers) if the model has tied embeddings,
     to preserve the original un-embedding."""
+    parts = validate_export_name(name)
+    name = "/".join(parts)
+    out_dir = EDITS_DIR.joinpath(*parts)
     rules = [r for r in rules if r["layers"]]  # layers=[] = disabled rule
     if not rules:
         raise ValueError("no active intervention to export")
@@ -179,7 +1203,6 @@ def export_abliteration(rules, jl, model_meta, *, fmt, name, source_dir=None, sc
             "the bake changes no weight (neutral factors, scale=0 or null "
             "directions) — the export would be identical to the original model"
         )
-    out_dir = EDITS_DIR / name
     out_dir.mkdir(parents=True, exist_ok=True)
     dtype = torch.bfloat16 if model_meta.get("dtype") == "bf16" else torch.float16
     lm_head_key = info["lm_head_key"]
@@ -478,6 +1501,10 @@ def validate_export_name(name):
     if any(part in ("", ".", "..") for part in raw):
         raise ValueError("export name contains an empty, '.', or '..' component")
     for part in raw:
+        if internal_temp_leaf_kind(part) is not None:
+            raise ValueError(
+                f"export name component {part!r} is reserved for internal temporary export use"
+            )
         if part.endswith((" ", ".")) or part.split(".", 1)[0].upper() in _WINDOWS_RESERVED:
             raise ValueError(f"export name contains Windows-reserved component {part!r}")
         if any(ord(char) < 32 or char in '<>:"|?*' for char in part):
@@ -541,18 +1568,18 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
         raise ValueError(f"export destination already exists: {final_dir}")
     final_dir.parent.mkdir(parents=True, exist_ok=True)
     stage = final_dir.parent / f".{final_dir.name}.tmp-{uuid.uuid4().hex}"
-    stage.mkdir()
-    try:
-        result = _export_rebase_impl(
-            rules, jl, model_meta, fmt=fmt, name=name, source_dir=source_dir,
-            scale=scale, exact=exact, out_dir=stage,
-        )
-        stage.replace(final_dir)
-        result["out_dir"] = str(final_dir)
-        return result
-    except Exception:
-        shutil.rmtree(stage, ignore_errors=True)
-        raise
+    with artifact_lease(stage):
+        stage.mkdir()
+        try:
+            result = _export_rebase_impl(
+                rules, jl, model_meta, fmt=fmt, name=name, source_dir=source_dir,
+                scale=scale, exact=exact, out_dir=stage,
+            )
+            stage.replace(final_dir)
+            result["out_dir"] = str(final_dir)
+            return result
+        finally:
+            shutil.rmtree(stage, ignore_errors=True)
 
 
 def _export_rebase_impl(rules, jl, model_meta, *, fmt, name, source_dir=None,
