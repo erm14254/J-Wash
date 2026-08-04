@@ -10,7 +10,7 @@ from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from torch import nn
 
-from core import editing, rebase
+from core import capabilities, editing, rebase
 from core.ablation import Interventions
 from core.model_manager import _rebase_capability_meta
 from helpers import *
@@ -21,7 +21,7 @@ def test_meta_norm_without_accelerate_hook_fails_closed():
     jl.layers[0].input_layernorm = bad
     meta = _rebase_capability_meta(jl)
     assert not meta["readthrough_supported"] and not meta["exact_supported"]
-    assert "no supported Accelerate weights_map" in meta["readthrough_reason"]
+    assert meta["readthrough_reason"] == capabilities.PUBLIC_REASONS["architecture_unsupported"]
 
 
 def test_actual_auto_disk_offload_norm_inspection(tmp_path):

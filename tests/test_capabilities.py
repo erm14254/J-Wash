@@ -10,7 +10,7 @@ from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from torch import nn
 
-from core import editing, rebase
+from core import capabilities, editing, rebase
 from core.ablation import Interventions
 from core.model_manager import _rebase_capability_meta
 from helpers import *
@@ -82,12 +82,13 @@ def test_packed_exact_is_model_wide_and_live_rejection_is_clean(tiny, layer):
 def test_api_and_legacy_capability_fields(tiny):
     meta = _rebase_capability_meta(lens(tiny))
     assert meta["readthrough_supported"] and meta["rebase_supported"]
-    assert not meta["exact_supported"] and "aggregate-MoE" in meta["exact_reason"]
+    assert not meta["exact_supported"]
+    assert meta["exact_reason"] == capabilities.PUBLIC_REASONS["packed_moe_exact_unsupported"]
     bad = lens(tiny); bad.layers[0].pre_feedforward_layernorm = RMS(32)
     try:
         rejected = _rebase_capability_meta(bad)
         assert not rejected["readthrough_supported"] and not rejected["rebase_supported"]
-        assert "unsupported residual branch" in rejected["readthrough_reason"]
+        assert rejected["readthrough_reason"] == capabilities.PUBLIC_REASONS["architecture_unsupported"]
     finally:
         del bad.layers[0].pre_feedforward_layernorm
 

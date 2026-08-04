@@ -1092,8 +1092,9 @@ def compute_abliteration(rules, jl, scale=1.0):
         as per-rule rank-1 factors (delta = B·A), exact, for the LoRA export.
         For the embed, delta = (B·A)ᵀ (PEFT lookup convention).
     """
-    from core import rebase
-    rebase.global_projection_preflight(jl)
+    from core.capabilities import ensure_unquantized, PUBLIC_REASONS
+    ensure_unquantized(jl)
+    raise ValueError(PUBLIC_REASONS["global_projection_unvalidated"])
     # layers=[] = disabled rule, in this mode too (consistent with the preview)
     rules = [r for r in rules if r["layers"]]
     if not rules:
@@ -1190,8 +1191,9 @@ def export_abliteration(rules, jl, model_meta, *, fmt, name, source_dir=None, sc
     ``lora`` (exact PEFT adapter, rank = n_rules; embed omitted if embeddings
     are tied). Unties ``lm_head`` (full/layers) if the model has tied embeddings,
     to preserve the original un-embedding."""
-    if model_meta.get("quant") in ("int8", "nf4"):
-        raise ValueError("editing quantized model loads is not supported")
+    from core.capabilities import ensure_unquantized, PUBLIC_REASONS
+    ensure_unquantized(jl, model_meta)
+    raise ValueError(PUBLIC_REASONS["global_projection_unvalidated"])
     parts = validate_export_name(name)
     name = "/".join(parts)
     out_dir = EDITS_DIR.joinpath(*parts)
@@ -1559,6 +1561,8 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
     rejected and never modified.  All construction occurs in a unique sibling
     staging directory which is removed on every failure.
     """
+    from core.capabilities import ensure_unquantized
+    ensure_unquantized(jl, model_meta)
     parts = validate_export_name(name)
     root = EDITS_DIR.resolve()
     final_dir = root.joinpath(*parts).resolve()
@@ -1598,8 +1602,8 @@ def _export_rebase_impl(rules, jl, model_meta, *, fmt, name, source_dir=None,
     time, so tied embeddings need no untying). The bake is done streaming, one
     float32 CPU matrix at a time. Tied-embeddings model (full/layers): the embed
     stays INTACT, it's lm_head (untied) that receives the final read transform."""
-    if model_meta.get("quant") in ("int8", "nf4"):
-        raise ValueError("editing quantized model loads is not supported")
+    from core.capabilities import ensure_unquantized
+    ensure_unquantized(jl, model_meta)
     method = "rebase-exact" if exact else "rebase-readthrough"
     if fmt not in ("full", "layers", "lora"):
         raise ValueError(f"unknown format for {method}: {fmt}")

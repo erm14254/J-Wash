@@ -25,14 +25,15 @@ def _mock_loaded_readthrough(app, monkeypatch):
     monkeypatch.setattr(app.manager, "jl", object())
     monkeypatch.setattr(app.manager, "meta", {"model_id": "local", "quant": None})
     monkeypatch.setattr(app.manager, "capability_profile", {
-        "model_session_id": "gguf-test-session",
         "declared_quantization": None,
         "has_packed_read_parameters": False,
         "modes": {
             "standard": dict(supported),
             "readthrough": dict(supported),
             "exact": dict(supported),
-            "abliteration": dict(supported),
+            "abliteration": capabilities.decision(
+                False, "global_projection_unvalidated"
+            ),
         },
     })
     monkeypatch.setattr(app.interventions, "active_rules_full", lambda: [{"layers": [0]}])

@@ -437,25 +437,10 @@ def _sample(logits, temperature, top_p, top_k, generator=None, penalty=1.0, pena
 
 
 def _rebase_capability_meta(jl):
-    """Public metadata contract, kept testable without loading a checkpoint."""
-    from core import rebase
-    try:
-        rebase.model_preflight(jl, exact=False)
-        readthrough_supported, readthrough_reason = True, "supported"
-    except ValueError as exc:
-        readthrough_supported, readthrough_reason = False, str(exc)
-    try:
-        rebase.model_preflight(jl, exact=True)
-        exact_supported, exact_reason = True, "supported"
-    except ValueError as exc:
-        exact_supported, exact_reason = False, str(exc)
-    return {
-        "rebase_supported": readthrough_supported,
-        "readthrough_supported": readthrough_supported,
-        "readthrough_reason": readthrough_reason,
-        "exact_supported": exact_supported,
-        "exact_reason": exact_reason,
-    }
+    """Compatibility wrapper around the single production policy."""
+    from core import capabilities
+    profile = capabilities.build_profile(jl, None)
+    return capabilities.legacy(profile, loaded=True)
 
 
 class ModelManager:
@@ -522,19 +507,12 @@ class ModelManager:
                 self.tokenizer = tokenizer
                 self.jl = jlens.from_hf(hf_model, tokenizer)
                 self.jl._jwash_declared_quant = quant
-                # Read-projection support: write-norm architectures (Gemma
-                # style) can't take the reads change of basis — the UI falls
-                # back to the global abliteration for pure-weights edits.
+                # Cache the authoritative fail-closed editing policy once.  In
+                # particular, global projection remains disabled for every topology.
                 from core.capabilities import build_profile
                 self.capability_profile = build_profile(self.jl, quant)
-                modes = self.capability_profile["modes"]
-                capability_meta = {
-                    "rebase_supported": modes["readthrough"]["supported"],
-                    "readthrough_supported": modes["readthrough"]["supported"],
-                    "readthrough_reason": modes["readthrough"]["reason"],
-                    "exact_supported": modes["exact"]["supported"],
-                    "exact_reason": modes["exact"]["reason"],
-                }
+                from core.capabilities import legacy
+                capability_meta = legacy(self.capability_profile, loaded=True)
                 self.meta = {
                     "model_id": model_id,
                     "revision": _resolve_revision(source),
@@ -543,7 +521,6 @@ class ModelManager:
                     "device": device,
                     "n_layers": text_config.num_hidden_layers,
                     "d_model": text_config.hidden_size,
-                    "model_session_id": self.capability_profile["model_session_id"],
                     "has_packed_read_parameters": self.capability_profile["has_packed_read_parameters"],
                     # Includes legacy rebase_supported = safe readthrough support.
                     **capability_meta,
