@@ -511,6 +511,16 @@ def _block_inventory(block, index, hidden, validated_norms):
                 f"block={block_discriminator!r}, mixer={mixer_discriminator!r}, "
                 f"expected={discriminator!r}"
             )
+    if kind == "self_attn" and spec.decoder.cls in (
+            llama_modeling.LlamaDecoderLayer, qwen_moe_modeling.Qwen3_5MoeDecoderLayer):
+        q, k, v, o = (mixer_module.q_proj.weight, mixer_module.k_proj.weight,
+                      mixer_module.v_proj.weight, mixer_module.o_proj.weight)
+        q_multiplier = (2 if spec.decoder.cls is qwen_moe_modeling.Qwen3_5MoeDecoderLayer
+                        else 1)
+        if (q.shape[0] != q_multiplier * o.shape[1] or k.shape != v.shape
+                or o.shape[0] != hidden or any(weight.shape[1] != hidden
+                                               for weight in (q, k, v))):
+            raise ValueError(f"layer {index} attention projection dimensions are modified")
     if (kind == "linear_attn" and spec.packed
             and mixer_class.cls is qwen_moe_modeling.Qwen3_5MoeGatedDeltaNet):
         dt_bias, a_log = mixer_module.dt_bias, mixer_module.A_log
@@ -536,6 +546,9 @@ def _block_inventory(block, index, hidden, validated_norms):
             f"layer {index} mlp.act_fn"
         )
         _validate_direct_inventory(mlp.act_fn, (), (), f"layer {index} mlp.act_fn")
+        if (mlp.gate_proj.weight.shape != mlp.up_proj.weight.shape
+                or mlp.down_proj.weight.shape != mlp.gate_proj.weight.T.shape):
+            raise ValueError(f"layer {index} dense MLP dimensions are modified")
     if spec.packed:
         router, experts, shared = mlp.gate, mlp.experts, mlp.shared_expert
         validate_forward_provenance(router, spec.router_class, f"layer {index} router")
@@ -568,6 +581,9 @@ def _block_inventory(block, index, hidden, validated_norms):
                           else ("gate_proj", "up_proj", "down_proj"))
         _validate_direct_inventory(shared, shared_modules, (),
                                    f"layer {index} shared expert")
+        if (shared.gate_proj.weight.shape != shared.up_proj.weight.shape
+                or shared.down_proj.weight.shape != shared.gate_proj.weight.T.shape):
+            raise ValueError(f"layer {index} shared expert dimensions are modified")
         for child_name in ("gate_proj", "up_proj", "down_proj"):
             validate_forward_provenance(
                 getattr(shared, child_name),
