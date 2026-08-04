@@ -299,7 +299,10 @@ def validate_rms_norm(norm, hidden, name="RMSNorm"):
 def _block_inventory(block, index, hidden, validated_norms):
     key = (type(block).__module__, type(block).__name__)
     spec = AUDITED_DECODER_SPECS.get(key)
-    if spec is None or "forward" in getattr(block, "__dict__", {}):
+    instance_forward = "forward" in getattr(block, "__dict__", {})
+    accelerate_wrapped = (getattr(block, "_hf_hook", None) is not None
+                          and getattr(block, "_old_forward", None) is not None)
+    if spec is None or (instance_forward and not accelerate_wrapped):
         raise ValueError(f"layer {index} decoder class or forward is not audited")
     for marker in _UNSUPPORTED_MARKERS:
         if getattr(block, marker, None) is not None:
