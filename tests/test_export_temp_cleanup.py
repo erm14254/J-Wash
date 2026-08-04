@@ -2,6 +2,7 @@ import multiprocessing
 import os
 import shutil
 import socket
+import stat
 from pathlib import Path
 
 import pytest
@@ -416,6 +417,100 @@ def test_child_held_lease_allows_mutable_candidate_metadata(tmp_path):
     assert result["active"] == [str(path)]
     assert result["changed_or_unsafe"] == []
     assert path.read_bytes() == b"updated-with-same-inode-and-new-size"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX active lease classification")
+def test_held_gguf_mutation_at_discovery_is_active(tmp_path):
+    path = _gguf(tmp_path)
+    discovered = path.lstat()
+
+    def observer(phase, _value):
+        if phase == "discovered":
+            path.write_bytes(b"active-write-after-discovery-with-new-size")
+
+    result = _inspect_while_child_holds(tmp_path, path, observer)
+    current = path.lstat()
+    assert (current.st_dev, current.st_ino, stat.S_IFMT(current.st_mode)) == (
+        discovered.st_dev, discovered.st_ino, stat.S_IFMT(discovered.st_mode),
+    )
+    assert current.st_size != discovered.st_size
+    assert result["active"] == [str(path)]
+    assert result["changed_or_unsafe"] == []
+    assert not [error for error in result["errors"] if error["path"] == str(path)]
+    assert path.read_bytes() == b"active-write-after-discovery-with-new-size"
+    assert path.with_name(path.name + ".lease").is_file()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX active lease classification")
+def test_held_stage_content_mutation_at_discovery_is_active(tmp_path):
+    path = _stage(tmp_path)
+    discovered = path.lstat()
+
+    def observer(phase, _value):
+        if phase == "discovered":
+            (path / "new-child").write_bytes(b"active-child")
+
+    result = _inspect_while_child_holds(tmp_path, path, observer)
+    current = path.lstat()
+    assert (current.st_dev, current.st_ino, stat.S_IFMT(current.st_mode)) == (
+        discovered.st_dev, discovered.st_ino, stat.S_IFMT(discovered.st_mode),
+    )
+    assert result["active"] == [str(path)]
+    assert result["changed_or_unsafe"] == []
+    assert (path / "new-child").read_bytes() == b"active-child"
+    assert path.with_name(path.name + ".lease").is_file()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX inactive identity classification")
+def test_unleased_gguf_mutation_at_discovery_is_unsafe(tmp_path):
+    path = _gguf(tmp_path)
+
+    def observer(phase, _value):
+        if phase == "discovered":
+            path.write_bytes(b"inactive-write-after-discovery")
+
+    result = _inspect(tmp_path, observer=observer)
+    assert result["active"] == []
+    assert result["changed_or_unsafe"] == [str(path)]
+    assert "changed after discovery" in result["errors"][0]["error"]
+    assert path.read_bytes() == b"inactive-write-after-discovery"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX inactive identity classification")
+def test_unlocked_lease_gguf_mutation_at_discovery_is_unsafe(tmp_path):
+    path = _gguf(tmp_path)
+    lease = editing.ArtifactLease(path)
+    lease.acquire()
+    lease.release()
+    lease_path = path.with_name(path.name + ".lease")
+
+    def observer(phase, _value):
+        if phase == "discovered":
+            path.write_bytes(b"unlocked-write-after-discovery")
+
+    result = _inspect(tmp_path, observer=observer)
+    assert result["active"] == []
+    assert result["changed_or_unsafe"] == [str(path)]
+    assert "identity changed" in result["errors"][0]["error"]
+    assert path.read_bytes() == b"unlocked-write-after-discovery"
+    assert lease_path.is_file()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX inactive identity classification")
+def test_unleased_stage_content_mutation_at_discovery_is_unsafe(tmp_path):
+    path = _stage(tmp_path)
+
+    def observer(phase, _value):
+        if phase == "discovered":
+            (path / "new-child").write_bytes(b"inactive-child")
+            forced = int((NOW + 100) * 1_000_000_000)
+            os.utime(path, ns=(forced, forced))
+
+    result = _inspect(tmp_path, observer=observer)
+    assert result["active"] == []
+    assert result["changed_or_unsafe"] == [str(path)]
+    assert "identity changed" in result["errors"][0]["error"]
+    assert (path / "new-child").read_bytes() == b"inactive-child"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX advisory active checks")

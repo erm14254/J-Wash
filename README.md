@@ -354,7 +354,11 @@ reported as changed or unsafe. Neither classification authorizes deletion,
 movement, quarantine, overwrite, or any other destructive action. Directory
 timestamps are not treated as reliable namespace generation counters. Ordinary
 in-place writes may change an active artifact's contents, size, and timestamps
-without changing its structural identity.
+without changing its structural identity. Inspection therefore checks only
+structural identity before lease state is known. A safely observed held lease
+uses the ordered advisory checks and permits those ordinary mutable updates;
+an absent or unlocked lease requires the complete discovery identity before the
+artifact can be classified as completed, recent, or abandoned.
 Destructive offline maintenance is intentionally deferred. POSIX lease files are
 intentionally persistent and reusable because portable POSIX APIs cannot safely
 unlink only a previously verified inode; an unlocked lease does not mean an

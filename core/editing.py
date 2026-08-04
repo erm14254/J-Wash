@@ -365,6 +365,18 @@ def _candidate_identity(value):
     )
 
 
+def _candidate_structural_identity(value):
+    """Return identity fields that ordinary in-place export writes cannot change."""
+    return _stat_identity(value)
+
+
+def _candidate_identity_matches(value, expected, *, full):
+    """Compare either structural-only or complete discovery identity."""
+    if full:
+        return _candidate_identity(value) == expected
+    return _candidate_structural_identity(value) == expected[:5]
+
+
 def _absolute_no_follow(path):
     """Return an absolute normalized spelling without resolving any links."""
     return Path(os.path.abspath(os.path.normpath(os.fspath(path))))
@@ -503,9 +515,7 @@ class _AnchoredInspectionParent:
         if not expected_type(current.st_mode):
             raise _UnsafeAnchoredInspection("temporary artifact type changed")
         if expected_identity is not None:
-            actual = _candidate_identity(current) if full else _stat_identity(current)
-            expected = expected_identity if full else expected_identity[:5]
-            if actual != expected:
+            if not _candidate_identity_matches(current, expected_identity, full=full):
                 raise _UnsafeAnchoredInspection("temporary artifact identity changed")
         return current
 
@@ -569,16 +579,25 @@ class _AnchoredInspectionParent:
         return False
 
 
-def _revalidate_candidate(candidate):
+def _revalidate_candidate_structural(candidate):
+    """Revalidate link/type and stable identity before lease state is known."""
     _revalidate_directory_chain(candidate.parent_chain)
     current = candidate.path.lstat()
     if _is_link_or_reparse(candidate.path, current):
         raise ValueError("temporary artifact changed or became a link/reparse point")
-    if _candidate_identity(current) != candidate.identity:
-        raise ValueError("temporary artifact changed after discovery")
     expected = stat.S_ISDIR if candidate.kind == "directory" else stat.S_ISREG
     if not expected(current.st_mode):
         raise ValueError("temporary artifact type changed after discovery")
+    if not _candidate_identity_matches(current, candidate.identity, full=False):
+        raise ValueError("temporary artifact structural identity changed after discovery")
+    return current
+
+
+def _revalidate_candidate_full(candidate):
+    """Require structural and mutable fields to match the discovery snapshot."""
+    current = _revalidate_candidate_structural(candidate)
+    if not _candidate_identity_matches(current, candidate.identity, full=True):
+        raise ValueError("temporary artifact changed after discovery")
     return current
 
 
@@ -831,7 +850,9 @@ def inspect_abandoned_export_temps(
         try:
             _revalidate_directory_chain(root_chain)
             path.relative_to(root)
-            _revalidate_candidate(candidate)
+            # Before lease state is known, allow only structural continuity.
+            # A held exporter may legitimately mutate contents and timestamps.
+            _revalidate_candidate_structural(candidate)
             if observer:
                 observer("before_inspect", path)
             if os.name == "nt":
@@ -876,7 +897,7 @@ def inspect_abandoned_export_temps(
                             f"cannot safely inspect possible completion marker: {exc}"
                         ) from exc
                     if metadata is not None:
-                        _revalidate_candidate(candidate)
+                        _revalidate_candidate_full(candidate)
                         relative_name = path.relative_to(root).as_posix()
                         if not isinstance(metadata, dict) or not isinstance(metadata.get("name"), str):
                             raise _UnsafeAnchoredInspection(
@@ -888,11 +909,11 @@ def inspect_abandoned_export_temps(
 
             # Activity inspection is advisory and path based, so validate both
             # before and after it. Any concurrent mutation is preserved.
-            _revalidate_candidate(candidate)
+            _revalidate_candidate_full(candidate)
             newest = _newest_lstat_mtime(path, kind)
             if observer:
                 observer("after_activity", path)
-            _revalidate_candidate(candidate)
+            _revalidate_candidate_full(candidate)
             _revalidate_directory_chain(root_chain)
             if current_time - newest < stale_age:
                 classify("recent", path)
