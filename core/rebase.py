@@ -212,14 +212,14 @@ AUDITED_DECODER_SPECS = {
     (_LLAMA, "LlamaDecoderLayer"): TopologySpec(
         (("self_attn", (_LLAMA, "LlamaAttention"),
           ("q_proj", "k_proj", "v_proj", "o_proj"), (), None),),
-        (_LLAMA, "LlamaMLP"), ("gate_proj", "up_proj", "down_proj"),
+        (_LLAMA, "LlamaMLP"), ("gate_proj", "up_proj", "down_proj", "act_fn"),
     ),
     (_QWEN_MOE, "Qwen3_5MoeDecoderLayer"): TopologySpec(
         (("self_attn", (_QWEN_MOE, "Qwen3_5MoeAttention"),
           ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm"),
           (), "full_attention"),
          ("linear_attn", (_QWEN_MOE, "Qwen3_5MoeGatedDeltaNet"),
-          ("conv1d", "norm", "out_proj", "in_proj_qkv", "in_proj_z",
+          ("act", "conv1d", "norm", "out_proj", "in_proj_qkv", "in_proj_z",
            "in_proj_b", "in_proj_a"), ("dt_bias", "A_log"), "linear_attention")),
         (_QWEN_MOE, "Qwen3_5MoeSparseMoeBlock"),
         ("gate", "experts", "shared_expert", "shared_expert_gate"), packed=True,
@@ -388,6 +388,8 @@ def _block_inventory(block, index, hidden, validated_norms):
             child_class = (_QWEN_MOE, "Qwen3_5MoeRMSNormGated")
         elif child_name == "conv1d":
             child_class = (torch.nn.Conv1d.__module__, torch.nn.Conv1d.__name__)
+        elif child_name == "act":
+            child_class = (torch.nn.SiLU.__module__, torch.nn.SiLU.__name__)
         else:
             child_class = (torch.nn.Linear.__module__, torch.nn.Linear.__name__)
         validate_forward_provenance(
@@ -409,6 +411,11 @@ def _block_inventory(block, index, hidden, validated_norms):
     validate_forward_provenance(mlp, spec.mlp_class, f"layer {index} mlp")
     _validate_direct_inventory(mlp, spec.mlp_modules, spec.mlp_parameters,
                                f"layer {index} mlp")
+    if not spec.packed and "act_fn" in spec.mlp_modules:
+        validate_forward_provenance(
+            mlp.act_fn, (torch.nn.SiLU.__module__, torch.nn.SiLU.__name__),
+            f"layer {index} mlp.act_fn"
+        )
     if spec.packed:
         router, experts, shared = mlp.gate, mlp.experts, mlp.shared_expert
         validate_forward_provenance(router, spec.router_class, f"layer {index} router")
@@ -421,13 +428,21 @@ def _block_inventory(block, index, hidden, validated_norms):
         _validate_direct_inventory(router, (), router_parameters, f"layer {index} router")
         _validate_direct_inventory(experts, (), ("gate_up_proj", "down_proj"),
                                    f"layer {index} experts")
-        _validate_direct_inventory(shared, ("gate_proj", "up_proj", "down_proj"), (),
+        shared_modules = (("gate_proj", "up_proj", "down_proj", "act_fn")
+                          if spec.shared_expert_class == (_QWEN_MOE, "Qwen3_5MoeMLP")
+                          else ("gate_proj", "up_proj", "down_proj"))
+        _validate_direct_inventory(shared, shared_modules, (),
                                    f"layer {index} shared expert")
         for child_name in ("gate_proj", "up_proj", "down_proj"):
             validate_forward_provenance(
                 getattr(shared, child_name),
                 (torch.nn.Linear.__module__, torch.nn.Linear.__name__),
                 f"layer {index} shared expert.{child_name}"
+            )
+        if "act_fn" in shared_modules:
+            validate_forward_provenance(
+                shared.act_fn, (torch.nn.SiLU.__module__, torch.nn.SiLU.__name__),
+                f"layer {index} shared expert.act_fn"
             )
         validate_forward_provenance(mlp.shared_expert_gate,
                                     (torch.nn.Linear.__module__, torch.nn.Linear.__name__),
