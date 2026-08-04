@@ -101,6 +101,30 @@ def display_token_mask(tokenizer, vocab_size):
     return mask
 
 
+class LensGenerationView:
+    def __init__(self, manager):
+        self._manager = manager
+        self.lens = manager.lens
+        self.meta = dict(manager.meta) if manager.meta else None
+        self.layers = list(manager.layers)
+        self.k = manager.k
+        self.mask = manager.mask
+        self._J = manager._J
+        self.binding_id = manager.binding_id
+        self.model_session_id = manager.model_session_id
+
+    def start_gen(self):
+        return self._manager.start_gen()
+
+    def compute_frames(self, acts, positions, phase, jl, token_ids, gen_id=None, abs_positions=None, chunk=None):
+        old_layers, old_k, old_mask, old_J = self._manager.layers, self._manager.k, self._manager.mask, self._manager._J
+        try:
+            self._manager.layers, self._manager.k, self._manager.mask, self._manager._J = self.layers, self.k, self.mask, self._J
+            return self._manager.compute_frames(acts, positions, phase, jl, token_ids, gen_id=gen_id, abs_positions=abs_positions, chunk=chunk)
+        finally:
+            self._manager.layers, self._manager.k, self._manager.mask, self._manager._J = old_layers, old_k, old_mask, old_J
+
+
 class LensManager:
     def __init__(self):
         self._lock = threading.Lock()
@@ -116,6 +140,10 @@ class LensManager:
         self._pref_key = None
         self.binding_id = 0
         self.model_session_id = None
+
+    def snapshot_for_generation(self):
+        with self._lock:
+            return LensGenerationView(self) if self.lens is not None else None
 
     def load(self, model_manager, *, repo_id=None, filename="lens.pt", revision=None,
              path=None, layers=None, k=8):

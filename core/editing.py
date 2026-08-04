@@ -1554,7 +1554,7 @@ def apply_transform_bounded(entry, tensor, *, row_budget=REBASE_EXPORT_ROW_BUDGE
     return destination, delta_max
 
 
-def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.0, exact=False):
+def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.0, exact=False, publication_guard=None):
     """Transactionally construct and atomically publish a rebase export.
 
     Overwrite policy is deliberately conservative: an existing destination is
@@ -1589,6 +1589,8 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
                 rules, jl, model_meta, fmt=fmt, name=name, source_dir=source_dir,
                 scale=scale, exact=exact, out_dir=stage, inventory=inventory,
             )
+            if publication_guard is not None:
+                publication_guard()
             stage.replace(final_dir)
             result["out_dir"] = str(final_dir)
             return result

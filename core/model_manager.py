@@ -12,7 +12,7 @@ from huggingface_hub import scan_cache_dir, try_to_load_from_cache
 import config
 import jlens
 from core.lens_manager import ActivationCatcher
-from core.model_session import LoadedModelBundle, ModelSessionCoordinator, OperationConflict, OperationType
+from core.model_session import GenerationContext, LoadedModelBundle, ModelSessionCoordinator, OperationConflict, OperationType
 
 SKIP_LOCAL_DIRS = {"vendor", "ui", "data", "hf_cache", "lenses", "core", "api", "scripts"}
 
@@ -455,6 +455,7 @@ class ModelManager:
         self.meta = None
         self.capability_profile = None
         self.coordinator = ModelSessionCoordinator()
+        self.on_model_withdraw = None
 
     @property
     def busy(self):
@@ -489,6 +490,8 @@ class ModelManager:
                 with self._lock:
                     self._sync_from_bundle(None)
                 old_bundle = None
+                if self.on_model_withdraw is not None:
+                    self.on_model_withdraw(expected_session)
                 _free_cuda()
             torch_dtype = torch.bfloat16 if dtype == "bf16" else torch.float16
             source = resolve_source(model_id)
@@ -560,12 +563,14 @@ class ModelManager:
                 self.coordinator.release(token)
 
     def _unload_locked(self, token=None):
-        old, _session, changed = self.coordinator.withdraw_loaded(token)
+        old, session_id, changed = self.coordinator.withdraw_loaded(token)
         if not changed:
             with self._lock:
                 self._sync_from_bundle(None)
             return {"unloaded": False, "vram_allocated": _torch_allocated()}
         before = _torch_allocated()
+        if self.on_model_withdraw is not None:
+            self.on_model_withdraw(session_id)
         with self._lock:
             self._sync_from_bundle(None)
         _free_cuda()
@@ -582,14 +587,27 @@ class ModelManager:
         """``continue_final=True``: the last message is an assistant reply to
         EXTEND — the template leaves its turn open instead of starting a new
         one, and the model picks up where it stopped."""
-        hf_model, tokenizer = self.hf_model, self.tokenizer
+        if isinstance(lens, GenerationContext):
+            context = lens
+            hf_model, tokenizer = context.hf_model, context.tokenizer
+            jl = context.jl
+            meta = dict(context.meta)
+            lens = context.lens
+            ablator_snapshot = context.intervention_snapshot
+            stop_event = context.stop_event
+        else:
+            context = None
+            hf_model, tokenizer = self.hf_model, self.tokenizer
+            jl = self.jl
+            meta = self.meta or {}
+            ablator_snapshot = None
         reader = None
         attachment = None
         ok = False
         try:
             if ablator is not None:
-                attachment = ablator.attach(self.jl)
-            is_gpt_oss = "gpt-oss" in (self.meta or {}).get("model_id", "").lower()
+                attachment = ablator.attach(jl, snapshot=ablator_snapshot)
+            is_gpt_oss = "gpt-oss" in (meta or {}).get("model_id", "").lower()
             template_kwargs = {}
             if is_gpt_oss:
                 # harmony format: the system slot always carries an identity —
@@ -629,7 +647,7 @@ class ModelManager:
             read_from = 0
             gen_id = None
             if lens is not None and lens.lens is not None:
-                reader = ActivationCatcher(self.jl.layers, lens.layers)
+                reader = ActivationCatcher(jl.layers, lens.layers)
                 gen_id = lens.start_gen()
                 if len(messages) > 1 and any(m["role"] != "system" for m in messages[:-1]):
                     prev = tokenizer.apply_chat_template(
@@ -656,7 +674,7 @@ class ModelManager:
             # turns, so we cut as soon as it reopens one (User: or a new Assistant:)
             stop_seqs = (
                 ["\nUser:", "\nAssistant:"]
-                if (self.meta or {}).get("chat_template_fallback")
+                if (meta or {}).get("chat_template_fallback")
                 else []
             )
 
@@ -697,7 +715,7 @@ class ModelManager:
                     reader.acts,
                     positions,
                     "reading",
-                    self.jl,
+                    jl,
                     input_ids[0, read_from:].tolist(),
                     gen_id=gen_id,
                 )
@@ -741,7 +759,7 @@ class ModelManager:
                         reader.acts,
                         [-1],
                         "thinking",
-                        self.jl,
+                        jl,
                         [next_id],
                         gen_id=gen_id,
                         abs_positions=[input_ids.shape[1] + len(reply_ids) - 1],
@@ -766,11 +784,12 @@ class ModelManager:
                         "tok_per_s": round(len(reply_ids) / elapsed, 2) if reply_ids and elapsed > 0 else 0.0,
                     },
                     "meta": dict(
-                        self.meta or {},
+                        meta or {},
                         sampling=sampling,
                         lens=dict(lens.meta) if lens is not None and lens.meta else None,
-                        interventions=ablator.summary() if ablator is not None else None,
-                        interventions_scale=ablator.global_scale if ablator is not None else None,
+                        interventions=ablator_snapshot.get("summary") if isinstance(ablator_snapshot, dict) else (ablator.summary() if ablator is not None else None),
+                        interventions_scale=ablator_snapshot.get("scale") if isinstance(ablator_snapshot, dict) else (ablator.global_scale if ablator is not None else None),
+                        model_session_id=context.model_session_id if context is not None else None,
                     ),
                 }
             )
@@ -780,7 +799,6 @@ class ModelManager:
                 attachment.close()
             if reader is not None:
                 reader.close()
-            self.coordinator = ModelSessionCoordinator()
             # aborted generation (OOM/error/hard stop): the KV cache and captured
             # activations are now dereferenced — return the blocks
             if not ok:

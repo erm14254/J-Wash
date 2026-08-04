@@ -226,9 +226,9 @@ def capture_moe(model):
 
 
 def run_variant(model, ids, rules=None, kind="base", past=None):
-    handles = []; iv = None
+    handles = []; iv = None; attachment = None
     if rules and kind == "production":
-        iv = Interventions(); iv._rules = rules; iv.set_mode("readthrough"); iv.attach(lens(model))
+        iv = Interventions(); iv._rules = rules; iv.set_mode("readthrough"); attachment = iv.attach(lens(model))
     captures, capture_handles = capture_moe(model)
     if rules and kind == "oracle": handles = oracle_handles(model, rules)
     try:
@@ -237,7 +237,7 @@ def run_variant(model, ids, rules=None, kind="base", past=None):
         return captures, out.past_key_values
     finally:
         for h in handles + capture_handles: h.remove()
-        if iv: iv.detach()
+        if attachment: attachment.close()
 
 
 class ContainerWriter(nn.Module):

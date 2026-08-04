@@ -76,6 +76,58 @@ class ModelStateError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class GenerationContext:
+    token: OperationToken
+    model_session_id: int
+    bundle: LoadedModelBundle
+    hf_model: Any
+    tokenizer: Any
+    jl: Any
+    meta: MappingProxyType
+    capability_profile: Any
+    lens: Any
+    intervention_snapshot: Any
+    stop_event: Any
+
+
+class WorkerDispatch:
+    """Ownership handoff for async handlers that dispatch synchronous workers."""
+
+    def __init__(self, coordinator: "ModelSessionCoordinator", token: OperationToken, stop_event: Any = None):
+        self.coordinator = coordinator
+        self.token = token
+        self.stop_event = stop_event
+        self._lock = threading.Lock()
+        self._claimed = False
+        self._released_before_claim = False
+
+    @property
+    def claimed(self):
+        with self._lock:
+            return self._claimed
+
+    def claim(self) -> bool:
+        with self._lock:
+            if self._released_before_claim:
+                return False
+            self._claimed = True
+            return True
+
+    def cancel_from_awaiter(self) -> bool:
+        with self._lock:
+            if not self._claimed:
+                self._released_before_claim = True
+                return self.coordinator.release(self.token)
+            self.coordinator.request_cancel(self.token)
+            if self.stop_event is not None:
+                self.stop_event.set()
+            return False
+
+    def release_from_worker(self) -> bool:
+        return self.coordinator.release(self.token)
+
+
 class ModelSessionCoordinator:
     def __init__(self):
         self._lock = threading.Lock()

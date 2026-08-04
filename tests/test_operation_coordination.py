@@ -81,3 +81,38 @@ def test_hook_attachment_attempts_every_removal():
     except RuntimeError as exc:
         assert str(exc) == "first"
     assert seen == ["first", "second"]
+
+
+def test_generation_cleanup_preserves_coordinator_and_successor_owner():
+    c = ModelSessionCoordinator()
+    before = c
+    token, _ = c.acquire(OperationType.GENERATE)
+    assert c.release(token)
+    successor, _ = c.acquire(OperationType.UNLOAD)
+    # A stale generation finalizer must not clear a successor or replace the coordinator.
+    assert c.release(token) is False
+    assert before is c
+    assert c.snapshot().operation.id == successor.id
+    assert c.release(successor)
+
+
+def test_dispatch_cancellation_before_claim_releases_without_worker_ownership():
+    from core.model_session import WorkerDispatch
+    c = ModelSessionCoordinator()
+    token, _ = c.acquire(OperationType.GENERATE)
+    dispatch = WorkerDispatch(c, token)
+    assert dispatch.cancel_from_awaiter() is True
+    assert dispatch.claim() is False
+    assert c.snapshot().operation is None
+
+
+def test_dispatch_cancellation_after_claim_leaves_release_to_worker():
+    from core.model_session import WorkerDispatch
+    c = ModelSessionCoordinator()
+    token, _ = c.acquire(OperationType.GENERATE)
+    dispatch = WorkerDispatch(c, token)
+    assert dispatch.claim() is True
+    assert dispatch.cancel_from_awaiter() is False
+    assert c.snapshot().operation.id == token.id
+    assert c.snapshot().operation.cancellation_requested is True
+    assert dispatch.release_from_worker() is True

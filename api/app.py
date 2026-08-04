@@ -6,6 +6,7 @@ import mimetypes
 import os
 import re
 import threading
+from threading import Event as ThreadingEvent
 import uuid
 from pathlib import Path
 
@@ -26,7 +27,7 @@ from core import fitting
 from core.fitting import FitManager
 from core.gpus import gpu_stats
 from core.lens_manager import LensManager
-from core.model_session import OperationConflict, OperationType, ModelStateError
+from core.model_session import GenerationContext, LoadedModelBundle, OperationConflict, OperationType, ModelStateError, WorkerDispatch
 from core.model_manager import (
     ModelManager,
     _resolve_revision,
@@ -42,8 +43,18 @@ fit_manager = FitManager()
 interventions = Interventions()
 neighbors = TokenNeighbors()
 
+
+def _cleanup_model_bound_state(_session_id=None):
+    lens_manager.unload()
+    neighbors.reset()
+    interventions.clear_for_model_transition()
+
+
+manager.on_model_withdraw = _cleanup_model_bound_state
+
 _ws_locks = {}
 _loop_holder = {}
+_deferred_worker_tasks = set()
 
 
 def _valid_devices():
@@ -231,7 +242,7 @@ def api_models():
 def api_status():
     coord = manager.session_snapshot()
     scale, mode = interventions.state_snapshot()
-    loaded = coord.loaded
+    loaded = coord.loaded or manager.hf_model is not None or manager.meta is not None
     bundle = coord.bundle
     profile = bundle.capability_profile if bundle is not None else manager.capability_profile
     meta = dict(bundle.meta) if bundle is not None else (manager.meta if isinstance(manager.meta, dict) else {})
@@ -275,8 +286,6 @@ async def api_load(req: LoadRequest):
         raise HTTPException(422, f"invalid quant: {req.quant}")
     if req.device not in _valid_devices():
         raise HTTPException(422, f"invalid device: {req.device}")
-    if manager.busy:
-        raise HTTPException(409, f"busy: {manager.busy}")
     try:
         return await asyncio.to_thread(
             manager.load, req.model_id, req.dtype, req.quant, req.device
@@ -289,9 +298,13 @@ async def api_load(req: LoadRequest):
 
 @app.post("/api/models/delete")
 async def api_delete_model(req: DeleteModelRequest):
-    if manager.busy:
-        raise HTTPException(409, f"busy: {manager.busy}")
+    token = None
+    try:
+        token, _ = manager.coordinator.acquire(OperationType.MODEL_DELETE)
+    except OperationConflict as exc:
+        raise _conflict(exc)
     if manager.meta and manager.meta.get("model_id") == req.model_id:
+        manager.coordinator.release(token)
         raise HTTPException(409, "unload this model before deleting it")
     from core.model_manager import delete_model
     try:
@@ -300,6 +313,9 @@ async def api_delete_model(req: DeleteModelRequest):
         raise HTTPException(400, str(exc))
     except Exception as exc:
         raise HTTPException(500, str(exc))
+    finally:
+        if token is not None:
+            manager.coordinator.release(token)
 
 
 # --- user settings (Options tab) --------------------------------------------
@@ -376,13 +392,10 @@ def api_models_unregister(req: RegisterModelRequest):
 
 @app.post("/api/unload")
 async def api_unload():
-    if manager.busy:
-        raise HTTPException(409, f"busy: {manager.busy}")
-    result = await asyncio.to_thread(manager.unload)
-    lens_manager.unload()
-    neighbors.reset()
-    interventions.clear_for_model_transition()
-    return result
+    try:
+        return await asyncio.to_thread(manager.unload)
+    except OperationConflict as exc:
+        raise _conflict(exc)
 
 
 @app.post("/api/lens/load")
@@ -417,17 +430,36 @@ async def api_lens_load(req: LensLoadRequest):
 
 @app.post("/api/lens/unload")
 def api_lens_unload():
-    return lens_manager.unload()
+    token = None
+    try:
+        token, _ = manager.coordinator.acquire(OperationType.LENS_UPDATE)
+        result = lens_manager.unload()
+        manager.coordinator.clear_lens_binding()
+        return result
+    except OperationConflict as exc:
+        raise _conflict(exc)
+    finally:
+        if token is not None:
+            manager.coordinator.release(token)
 
 
 @app.post("/api/lens/layers")
 def api_lens_layers(req: LensLayersRequest):
-    if manager.busy:
-        raise HTTPException(409, f"busy: {manager.busy}")
+    token = None
     try:
-        return lens_manager.set_layers(manager, req.layers, k=req.k)
+        token, _ = manager.coordinator.acquire(OperationType.LENS_UPDATE, requires_loaded=True)
+        result = lens_manager.set_layers(manager, req.layers, k=req.k)
+        manager.coordinator.update_lens_binding(token, result)
+        return result
+    except OperationConflict as exc:
+        raise _conflict(exc)
+    except ModelStateError as exc:
+        raise HTTPException(422, str(exc))
     except ValueError as exc:
         raise HTTPException(422, str(exc))
+    finally:
+        if token is not None:
+            manager.coordinator.release(token)
 
 
 @app.get("/api/interventions")
@@ -573,55 +605,86 @@ def api_presets_delete(name: str):
 @app.post("/api/edit/export")
 async def api_edit_export(req: ExportRequest):
     req.name = _safe_name(req.name)
-    if manager.hf_model is None:
-        raise HTTPException(422, "no model loaded")
-    rules = interventions.active_rules_full()
-    if not rules:
-        raise HTTPException(422, "no active intervention to export (rules disabled or without layers?)")
     if req.format not in ("layers", "lora", "full"):
         raise HTTPException(422, f"unknown format: {req.format}")
-    source_dir = resolve_local_dir(manager.meta["model_id"])
-    scale, mode = interventions.state_snapshot()
+    token = None
+    stop_event = ThreadingEvent()
     try:
-        capabilities.ensure_unquantized(manager.jl, manager.meta)
-        capabilities.require(manager.capability_profile, "exports", req.format, mode,
-                             loaded=True)
-    except ValueError as exc:
+        token, snap = manager.coordinator.acquire(OperationType.EXPORT, requires_loaded=True)
+        bundle = snap.bundle
+        meta = dict(bundle.meta)
+        rules = interventions.active_rules_full()
+        if not rules:
+            raise HTTPException(422, "no active intervention to export (rules disabled or without layers?)")
+        source_dir = resolve_local_dir(meta["model_id"])
+        scale, mode = interventions.state_snapshot()
+        capabilities.ensure_unquantized(bundle.jl, meta)
+        capabilities.require(bundle.capability_profile, "exports", req.format, mode, loaded=True)
+        kwargs = {}
+        if mode in ("readthrough", "exact"):
+            export_fn = editing.export_rebase
+            kwargs["exact"] = mode == "exact"
+        elif mode == "abliteration":
+            export_fn = editing.export_abliteration
+        else:
+            raise HTTPException(
+                422,
+                "export requires a pure-weights mode: switch to \"read projection\" "
+                "(or \"global projection\" on write-norm architectures) — per-layer "
+                "steering does not bake faithfully",
+            )
+    except OperationConflict as exc:
+        raise _conflict(exc)
+    except ModelStateError as exc:
         raise HTTPException(422, str(exc))
-    kwargs = {}
-    if mode in ("readthrough", "exact"):
-        export_fn = editing.export_rebase
-        kwargs["exact"] = mode == "exact"
-    elif mode == "abliteration":
-        export_fn = editing.export_abliteration
-    else:
-        raise HTTPException(
-            422,
-            "export requires a pure-weights mode: switch to \"read projection\" "
-            "(or \"global projection\" on write-norm architectures) — per-layer "
-            "steering does not bake faithfully",
-        )
+    except ValueError as exc:
+        if token is not None:
+            manager.coordinator.release(token)
+        raise HTTPException(422, str(exc))
+    except HTTPException:
+        if token is not None:
+            manager.coordinator.release(token)
+        raise
+    except Exception:
+        if token is not None:
+            manager.coordinator.release(token)
+        raise
+
+    dispatch = WorkerDispatch(manager.coordinator, token, stop_event)
+
+    def guard():
+        if manager.coordinator.is_cancelled(token) or not manager.coordinator.is_current(token):
+            raise RuntimeError("export ownership was cancelled or superseded before publication")
+
+    def worker():
+        if not dispatch.claim():
+            return None
+        try:
+            call_kwargs = dict(kwargs)
+            if export_fn is editing.export_rebase:
+                call_kwargs["publication_guard"] = guard
+            return export_fn(
+                rules, bundle.jl, meta, fmt=req.format, name=req.name,
+                source_dir=source_dir, scale=scale, **call_kwargs,
+            )
+        finally:
+            import gc
+            gc.collect()
+            dispatch.release_from_worker()
+
+    task = asyncio.create_task(asyncio.to_thread(worker))
     try:
-        return await asyncio.to_thread(
-            export_fn,
-            rules,
-            manager.jl,
-            manager.meta,
-            fmt=req.format,
-            name=req.name,
-            source_dir=source_dir,
-            scale=scale,
-            **kwargs,
-        )
+        result = await task
+        return result
+    except asyncio.CancelledError:
+        dispatch.cancel_from_awaiter()
+        _deferred_worker_tasks.add(task)
+        task.add_done_callback(lambda t: (_deferred_worker_tasks.discard(t), None if t.cancelled() else t.exception()))
+        raise
     except ValueError as exc:
         raise HTTPException(422, str(exc))
     except Exception as exc:
         raise HTTPException(500, str(exc))
-    finally:
-        # a full export builds ~2× the model in RAM (source + edited tensors);
-        # on failure, force a collection so those copies don't linger
-        import gc
-        gc.collect()
 
 
 # --- direct GGUF export (via a user-provided llama.cpp folder) ---------------
@@ -767,33 +830,68 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
     hf_dir = job_dir / "hf"
     baked = "reused"
     if not (hf_dir / "config.json").exists():
-        # no cached checkpoint: bake one from the ACTIVE rules (same path as a
-        # plain full export)
-        if manager.hf_model is None:
-            raise HTTPException(422, "no model loaded (and no cached checkpoint for this name)")
-        rules = interventions.active_rules_full()
-        if not rules:
-            raise HTTPException(422, "no active intervention to export")
-        scale, mode = interventions.state_snapshot()
+        token = None
+        stop_event = ThreadingEvent()
         try:
-            capabilities.ensure_unquantized(manager.jl, manager.meta)
-            capabilities.require(manager.capability_profile, "exports", "gguf", mode,
-                                 loaded=True)
+            token, snap = manager.coordinator.acquire(OperationType.GGUF_BAKE, requires_loaded=True)
+            bundle = _bundle_from_snapshot_or_legacy(snap)
+            meta = dict(bundle.meta)
+            rules = interventions.active_rules_full()
+            if not rules:
+                raise HTTPException(422, "no active intervention to export")
+            scale, mode = interventions.state_snapshot()
+            capabilities.ensure_unquantized(bundle.jl, meta)
+            capabilities.require(bundle.capability_profile, "exports", "gguf", mode, loaded=True)
+            if mode in ("readthrough", "exact"):
+                export_fn, kwargs = editing.export_rebase, {"exact": mode == "exact"}
+            elif mode == "abliteration":
+                export_fn, kwargs = editing.export_abliteration, {}
+            else:
+                raise HTTPException(422, "export requires a pure-weights mode")
+            source_dir = resolve_local_dir(meta["model_id"])
+        except OperationConflict as exc:
+            raise _conflict(exc)
+        except ModelStateError as exc:
+            raise HTTPException(422, "no model loaded (and no cached checkpoint for this name)") from exc
         except ValueError as exc:
+            if token is not None:
+                manager.coordinator.release(token)
             raise HTTPException(422, str(exc))
-        if mode in ("readthrough", "exact"):
-            export_fn, kwargs = editing.export_rebase, {"exact": mode == "exact"}
-        elif mode == "abliteration":
-            export_fn, kwargs = editing.export_abliteration, {}
-        else:
-            raise HTTPException(422, "export requires a pure-weights mode")
-        source_dir = resolve_local_dir(manager.meta["model_id"])
+        except HTTPException:
+            if token is not None:
+                manager.coordinator.release(token)
+            raise
+        except Exception:
+            if token is not None:
+                manager.coordinator.release(token)
+            raise
+        dispatch = WorkerDispatch(manager.coordinator, token, stop_event)
+
+        def guard():
+            if manager.coordinator.is_cancelled(token) or not manager.coordinator.is_current(token):
+                raise RuntimeError("GGUF bake ownership was cancelled or superseded before publication")
+
+        def bake_worker():
+            if not dispatch.claim():
+                return
+            try:
+                call_kwargs = dict(kwargs)
+                if export_fn is editing.export_rebase:
+                    call_kwargs["publication_guard"] = guard
+                return export_fn(
+                    rules, bundle.jl, meta, fmt="full", name="/".join((*name_parts, "hf")),
+                    source_dir=source_dir, scale=scale, **call_kwargs,
+                )
+            finally:
+                dispatch.release_from_worker()
+        task = asyncio.create_task(asyncio.to_thread(bake_worker))
         try:
-            await asyncio.to_thread(
-                export_fn, rules, manager.jl, manager.meta,
-                fmt="full", name="/".join((*name_parts, "hf")), source_dir=source_dir,
-                scale=scale, **kwargs,
-            )
+            await task
+        except asyncio.CancelledError:
+            dispatch.cancel_from_awaiter()
+            _deferred_worker_tasks.add(task)
+            task.add_done_callback(lambda t: (_deferred_worker_tasks.discard(t), None if t.cancelled() else t.exception()))
+            raise
         except ValueError as exc:
             raise HTTPException(422, str(exc))
         except Exception as exc:
@@ -838,19 +936,42 @@ class GenerateSyncRequest(BaseModel):
     sampling: dict = {}
 
 
+def _bundle_from_snapshot_or_legacy(snap):
+    if snap.bundle is None:
+        raise ModelStateError("no model loaded")
+    return snap.bundle
+
+
+def _captured_generation_context(token, snap, stop_event):
+    bundle = _bundle_from_snapshot_or_legacy(snap)
+    return GenerationContext(
+        token=token,
+        model_session_id=snap.model_session_id,
+        bundle=bundle,
+        hf_model=bundle.hf_model,
+        tokenizer=bundle.tokenizer,
+        jl=bundle.jl,
+        meta=bundle.meta,
+        capability_profile=bundle.capability_profile,
+        lens=lens_manager.snapshot_for_generation(),
+        intervention_snapshot=interventions.snapshot(),
+        stop_event=stop_event,
+    )
+
+
 @app.post("/api/generate")
 async def api_generate_sync(req: GenerateSyncRequest):
     global _last_generation
-    """Synchronous generation, no persistence or lens frames: for the CLI tools
-    (scripts/jlab.py). Active interventions apply just like in the chat."""
     token = None
-    stop_event = threading.Event()
+    stop_event = ThreadingEvent()
     try:
         token, snap = manager.coordinator.acquire(OperationType.GENERATE, requires_loaded=True)
+        context = _captured_generation_context(token, snap, stop_event)
     except OperationConflict as exc:
         raise _conflict(exc)
     except ModelStateError as exc:
         raise HTTPException(422, str(exc))
+    dispatch = WorkerDispatch(manager.coordinator, token, stop_event)
     done = {}
 
     def emit(frame):
@@ -859,41 +980,42 @@ async def api_generate_sync(req: GenerateSyncRequest):
         elif frame["type"] == "error":
             done["error"] = frame.get("message")
 
-    released = False
+    def worker():
+        if not dispatch.claim():
+            return
+        try:
+            manager.generate(
+                req.messages, req.sampling, stop_event, emit,
+                lens=context, ablator=interventions if context.intervention_snapshot.get("rules") else None,
+            )
+            if done.get("error"):
+                return
+            last = {
+                "n": ((_last_generation or {}).get("n", 0) + 1),
+                "prompt": next((m.get("content", "") for m in reversed(req.messages) if m.get("role") == "user"), ""),
+                "text": done.get("text", ""),
+                "stats": done.get("stats"),
+            }
+            manager.coordinator.publish_last_generation(token, context.model_session_id, last)
+            done["last_generation"] = last
+        finally:
+            dispatch.release_from_worker()
+
+    task = asyncio.create_task(asyncio.to_thread(worker))
     try:
-        await asyncio.to_thread(
-            manager.generate, req.messages, req.sampling, stop_event, emit,
-            lens=None, ablator=interventions if interventions.active else None,
-        )
+        await task
     except asyncio.CancelledError:
-        if token is not None:
-            manager.coordinator.request_cancel(token)
-            manager.coordinator.release(token)
-            released = True
-        stop_event.set()
+        dispatch.cancel_from_awaiter()
+        _deferred_worker_tasks.add(task)
+        task.add_done_callback(lambda t: (_deferred_worker_tasks.discard(t), None if t.cancelled() else t.exception()))
         raise
     except Exception as exc:
-        if token is not None and not released:
-            manager.coordinator.release(token)
-            released = True
         raise HTTPException(500, str(exc))
-    finally:
-        pass
     if done.get("error"):
-        if token is not None and not released:
-            manager.coordinator.release(token)
         raise HTTPException(500, done["error"])
-    last = {
-        "n": ((_last_generation or {}).get("n", 0) + 1),
-        "prompt": next((m.get("content", "") for m in reversed(req.messages) if m.get("role") == "user"), ""),
-        "text": done.get("text", ""),
-        "stats": done.get("stats"),
-    }
-    manager.coordinator.publish_last_generation(token, snap.model_session_id, last)
-    if token is not None:
-        manager.coordinator.release(token)
-        released = True
-    _last_generation = last
+    last = done.get("last_generation")
+    if last is not None:
+        _last_generation = last
     for ws in list(_ws_locks):
         try:
             await _ws_send(ws, json.dumps({"type": "api_generation"}))
@@ -909,31 +1031,46 @@ class NeighborsRequest(BaseModel):
 
 @app.post("/api/token-neighbors")
 async def api_token_neighbors(req: NeighborsRequest):
-    if manager.hf_model is None:
-        raise HTTPException(422, "no model loaded")
-    key = ((manager.meta or {}).get("model_id"), (manager.meta or {}).get("revision"))
+    token = None
     try:
+        token, snap = manager.coordinator.acquire(OperationType.MODEL_READ, requires_loaded=True)
+        bundle = snap.bundle
+        key = (snap.model_session_id, dict(bundle.meta).get("model_id"), dict(bundle.meta).get("revision"))
         result = await asyncio.to_thread(
-            neighbors.lookup, manager.jl, manager.tokenizer, key,
-            req.token_ids[:64], req.k,
+            neighbors.lookup, bundle.jl, bundle.tokenizer, key, req.token_ids[:64], req.k,
         )
+    except OperationConflict as exc:
+        raise _conflict(exc)
+    except ModelStateError as exc:
+        raise HTTPException(422, str(exc))
     except ValueError as exc:
         raise HTTPException(422, str(exc))
+    finally:
+        if token is not None:
+            manager.coordinator.release(token)
     return {"neighbors": {str(tid): entries for tid, entries in result.items()}}
 
 
 @app.get("/api/token-lookup")
 def api_token_lookup(q: str):
-    if manager.tokenizer is None:
-        raise HTTPException(422, "no model loaded")
-    tokenizer = manager.tokenizer
-    candidates = {}
-    for variant in (q, " " + q, q.lower(), " " + q.lower(),
-                    q.capitalize(), " " + q.capitalize(), q.upper(), " " + q.upper()):
-        ids = tokenizer.encode(variant, add_special_tokens=False)
-        if len(ids) == 1 and ids[0] not in candidates:
-            candidates[ids[0]] = tokenizer.decode([ids[0]])
-    return {"candidates": [{"id": tid, "str": s} for tid, s in candidates.items()]}
+    token = None
+    try:
+        token, snap = manager.coordinator.acquire(OperationType.MODEL_READ, requires_loaded=True)
+        tokenizer = snap.bundle.tokenizer
+        candidates = {}
+        for variant in (q, " " + q, q.lower(), " " + q.lower(),
+                        q.capitalize(), " " + q.capitalize(), q.upper(), " " + q.upper()):
+            ids = tokenizer.encode(variant, add_special_tokens=False)
+            if len(ids) == 1 and ids[0] not in candidates:
+                candidates[ids[0]] = tokenizer.decode([ids[0]])
+        return {"candidates": [{"id": tid, "str": s} for tid, s in candidates.items()]}
+    except OperationConflict as exc:
+        raise _conflict(exc)
+    except ModelStateError as exc:
+        raise HTTPException(422, str(exc))
+    finally:
+        if token is not None:
+            manager.coordinator.release(token)
 
 
 @app.get("/api/registry/local")
@@ -953,15 +1090,23 @@ def api_registry_resolve(path: str | None = None, repo_id: str | None = None, fi
 
 @app.post("/api/fit")
 def api_fit(req: FitRequest):
-    if manager.hf_model is not None:
-        raise HTTPException(
-            409, "unload the model first: fitting needs all the VRAM"
-        )
+    token = None
+    try:
+        token, _ = manager.coordinator.acquire(OperationType.FIT, requires_loaded=False)
+    except OperationConflict as exc:
+        raise _conflict(exc)
+    except ModelStateError:
+        raise HTTPException(409, "unload the model first: fitting needs all the VRAM")
     valid = _valid_devices()
     bad = [d for d in req.devices if d not in valid]
     if bad:
+        manager.coordinator.release(token)
         raise HTTPException(422, f"invalid device(s): {', '.join(bad)}")
     source = resolve_source(req.model_id)
+
+    def release_fit():
+        manager.coordinator.release(token)
+
     try:
         return fit_manager.start(
             model_id=req.model_id,
@@ -977,9 +1122,14 @@ def api_fit(req: FitRequest):
             max_seq_len=req.max_seq_len,
             source_layers=req.source_layers,
             continue_from=req.continue_from,
+            reservation_release=release_fit,
         )
     except ValueError as exc:
+        manager.coordinator.release(token)
         raise HTTPException(409, str(exc))
+    except Exception:
+        manager.coordinator.release(token)
+        raise
 
 
 @app.get("/api/fit/status")
@@ -994,14 +1144,19 @@ def api_fit_stop():
 
 @app.post("/api/lens/pin")
 async def api_lens_pin(req: PinRequest):
-    if manager.busy:
-        raise HTTPException(409, f"busy: {manager.busy}")
+    token = None
     try:
-        return await asyncio.to_thread(
-            lens_manager.pin_ranks, req.gen_id, req.token_ids, manager.jl
-        )
+        token, _ = manager.coordinator.acquire(OperationType.MODEL_READ, requires_loaded=True)
+        return await asyncio.to_thread(lens_manager.pin_ranks, req.gen_id, req.token_ids, manager.jl)
+    except OperationConflict as exc:
+        raise _conflict(exc)
+    except ModelStateError as exc:
+        raise HTTPException(422, str(exc))
     except ValueError as exc:
         raise HTTPException(422, str(exc))
+    finally:
+        if token is not None:
+            manager.coordinator.release(token)
 
 
 # Alternative/duplicate weight folders, never needed for transformers inference
@@ -1124,7 +1279,7 @@ def _download_worker(repo_id):
         # .incomplete files) and compare to the planned total.
         total_bytes = (plan or {}).get("size_bytes") or 0
         _blobs = config.HF_CACHE / "hub" / f"models--{repo_id.replace('/', '--')}" / "blobs"
-        stop_poll = threading.Event()
+        stop_poll = ThreadingEvent()
 
         def _poll_progress():
             while not stop_poll.is_set():
@@ -1337,21 +1492,21 @@ def api_conversation_export(cid: int, format: str = "json", frames: int = 0):
     )
 
 
-def _generate_safely(messages, sampling, stop_event, emit, lens):
+def _generate_safely(messages, sampling, stop_event, emit, context):
     try:
         manager.generate(
-            messages, sampling, stop_event, emit, lens=lens,
-            ablator=interventions if interventions.active else None,
+            messages, sampling, stop_event, emit, lens=context,
+            ablator=interventions if context.intervention_snapshot.get("rules") else None,
         )
     except Exception as exc:
         emit({"type": "error", "message": str(exc)})
 
 
-def _persisted_generate(req, stop_event, emit, lens):
+def _persisted_generate(req, stop_event, emit, gen_context):
     try:
         continue_id = req.get("continue_message_id")
         if continue_id is not None:
-            _persisted_continue(req, continue_id, stop_event, emit, lens)
+            _persisted_continue(req, continue_id, stop_event, emit, gen_context)
             return
         conversation_id = req.get("conversation_id")
         parent_id = req.get("parent_id")
@@ -1374,7 +1529,8 @@ def _persisted_generate(req, stop_event, emit, lens):
             "conversation_id": conversation_id,
             "user_message_id": parent_id,
         })
-        context = store.path_to_root(parent_id)
+        messages = store.path_to_root(parent_id)
+        lens = gen_context.lens
         layers_used = list(lens.layers) if lens is not None else []
         k_used = lens.k if lens is not None else 0
         frames_acc = []
@@ -1389,8 +1545,8 @@ def _persisted_generate(req, stop_event, emit, lens):
                 emit(frame)
 
         manager.generate(
-            context, req.get("sampling", {}), stop_event, emit_inner, lens=lens,
-            ablator=interventions if interventions.active else None,
+            messages=messages, sampling=req.get("sampling", {}), stop_event=stop_event, emit=emit_inner, lens=gen_context,
+            ablator=interventions if gen_context.intervention_snapshot.get("rules") else None,
         )
         meta = dict(
             done_holder.get("meta") or {},
@@ -1407,7 +1563,7 @@ def _persisted_generate(req, stop_event, emit, lens):
         emit({"type": "error", "message": str(exc)})
 
 
-def _persisted_continue(req, message_id, stop_event, emit, lens):
+def _persisted_continue(req, message_id, stop_event, emit, gen_context):
     """Extend an existing assistant reply: generate with the turn left open,
     append the text to the message, and merge the new lens frames into its
     stored blob (positions keep increasing, so both parts stay coherent)."""
@@ -1415,7 +1571,8 @@ def _persisted_continue(req, message_id, stop_event, emit, lens):
     if msg["role"] != "assistant":
         emit({"type": "error", "message": "only an assistant reply can be continued"})
         return
-    context = store.path_to_root(message_id)
+    messages = store.path_to_root(message_id)
+    lens = gen_context.lens
     layers_used = list(lens.layers) if lens is not None else []
     k_used = lens.k if lens is not None else 0
     frames_acc = []
@@ -1430,8 +1587,8 @@ def _persisted_continue(req, message_id, stop_event, emit, lens):
             emit(frame)
 
     manager.generate(
-        context, req.get("sampling", {}), stop_event, emit_inner, lens=lens,
-        ablator=interventions if interventions.active else None,
+        messages=messages, sampling=req.get("sampling", {}), stop_event=stop_event, emit=emit_inner, lens=gen_context,
+        ablator=interventions if gen_context.intervention_snapshot.get("rules") else None,
         continue_final=True,
     )
     new_content = msg["content"] + done_holder.get("text", "")
@@ -1470,22 +1627,42 @@ async def _watch_stop(ws, stop_event):
 async def _run_chat(ws, req):
     loop = asyncio.get_running_loop()
     queue = asyncio.Queue()
-    stop_event = threading.Event()
+    stop_event = ThreadingEvent()
 
     def emit(frame):
         loop.call_soon_threadsafe(queue.put_nowait, frame)
 
-    lens = lens_manager if req.get("lens") and lens_manager.lens is not None else None
-    if "messages" in req:
-        worker = asyncio.create_task(
-            asyncio.to_thread(
-                _generate_safely, req["messages"], req.get("sampling", {}), stop_event, emit, lens
+    try:
+        token, snap = manager.coordinator.acquire(OperationType.GENERATE, requires_loaded=True)
+        context = _captured_generation_context(token, snap, stop_event)
+        if not req.get("lens"):
+            context = GenerationContext(
+                token=context.token, model_session_id=context.model_session_id, bundle=context.bundle,
+                hf_model=context.hf_model, tokenizer=context.tokenizer, jl=context.jl, meta=context.meta,
+                capability_profile=context.capability_profile, lens=None,
+                intervention_snapshot=context.intervention_snapshot, stop_event=context.stop_event,
             )
-        )
-    else:
-        worker = asyncio.create_task(
-            asyncio.to_thread(_persisted_generate, req, stop_event, emit, lens)
-        )
+    except OperationConflict as exc:
+        await _ws_send(ws, json.dumps({"type": "error", "message": str(exc)}))
+        return
+    except ModelStateError as exc:
+        await _ws_send(ws, json.dumps({"type": "error", "message": str(exc)}))
+        return
+
+    dispatch = WorkerDispatch(manager.coordinator, token, stop_event)
+
+    def worker_body():
+        if not dispatch.claim():
+            return
+        try:
+            if "messages" in req:
+                _generate_safely(req["messages"], req.get("sampling", {}), stop_event, emit, context)
+            else:
+                _persisted_generate(req, stop_event, emit, context)
+        finally:
+            dispatch.release_from_worker()
+
+    worker = asyncio.create_task(asyncio.to_thread(worker_body))
     receiver = asyncio.create_task(_watch_stop(ws, stop_event))
     try:
         while True:
@@ -1495,6 +1672,8 @@ async def _run_chat(ws, req):
                 break
     finally:
         stop_event.set()
+        if not worker.done():
+            dispatch.cancel_from_awaiter()
         receiver.cancel()
         await asyncio.gather(worker, receiver, return_exceptions=True)
 
@@ -1507,16 +1686,6 @@ async def ws_endpoint(ws: WebSocket):
         while True:
             req = json.loads(await ws.receive_text())
             if req.get("type") != "chat":
-                continue
-            if manager.hf_model is None:
-                await _ws_send(
-                    ws, json.dumps({"type": "error", "message": "no model loaded"})
-                )
-                continue
-            if manager.busy:
-                await _ws_send(
-                    ws, json.dumps({"type": "error", "message": f"busy: {manager.busy}"})
-                )
                 continue
             await _run_chat(ws, req)
     except (WebSocketDisconnect, RuntimeError):

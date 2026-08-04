@@ -14,28 +14,44 @@ from torch import nn
 from core import capabilities, editing, rebase
 from core.ablation import Interventions
 from core.model_manager import _rebase_capability_meta
+from core.model_session import LoadedModelBundle, ModelSessionCoordinator, OperationType
 from helpers import *
 from helpers import _deferred_threads, _gguf_test_tools
 
 
-def _mock_loaded_readthrough(app, monkeypatch):
-    """Install the complete invariant produced by a successful unquantized load."""
+def _install_loaded_bundle(app, monkeypatch, *, jl=None, profile="__default__", meta=None):
     supported = capabilities.decision(True, "supported")
-    monkeypatch.setattr(app.manager, "hf_model", object())
-    monkeypatch.setattr(app.manager, "jl", object())
-    monkeypatch.setattr(app.manager, "meta", {"model_id": "local", "quant": None})
-    monkeypatch.setattr(app.manager, "capability_profile", {
-        "declared_quantization": None,
-        "has_packed_read_parameters": False,
-        "modes": {
-            "standard": dict(supported),
-            "readthrough": dict(supported),
-            "exact": dict(supported),
-            "abliteration": capabilities.decision(
-                False, "global_projection_unvalidated"
-            ),
-        },
-    })
+    if profile == "__default__":
+        profile = {
+            "declared_quantization": None,
+            "has_packed_read_parameters": False,
+            "modes": {
+                "standard": dict(supported),
+                "readthrough": dict(supported),
+                "exact": dict(supported),
+                "abliteration": capabilities.decision(False, "global_projection_unvalidated"),
+            },
+        }
+    meta = dict({"model_id": "local", "quant": None}, **(meta or {}))
+    coordinator = ModelSessionCoordinator()
+    monkeypatch.setattr(app.manager, "coordinator", coordinator)
+    hf_model = object()
+    tokenizer = object()
+    jl = jl if jl is not None else object()
+    token, snap = coordinator.acquire(OperationType.LOAD)
+    bundle = LoadedModelBundle.from_parts(hf_model, tokenizer, jl, meta, profile)
+    coordinator.publish_loaded(token, bundle, expected_unloaded_session=snap.model_session_id)
+    coordinator.release(token)
+    monkeypatch.setattr(app.manager, "hf_model", hf_model)
+    monkeypatch.setattr(app.manager, "tokenizer", tokenizer)
+    monkeypatch.setattr(app.manager, "jl", jl)
+    monkeypatch.setattr(app.manager, "meta", meta)
+    monkeypatch.setattr(app.manager, "capability_profile", profile)
+    return bundle
+
+
+def _mock_loaded_readthrough(app, monkeypatch):
+    _install_loaded_bundle(app, monkeypatch)
     monkeypatch.setattr(app.interventions, "active_rules_full", lambda: [{"layers": [0]}])
     monkeypatch.setattr(app.interventions, "_mode", "readthrough")
     monkeypatch.setattr(app.interventions, "_scale", 1.0)
@@ -78,10 +94,7 @@ def test_fresh_gguf_bake_requires_capability_profile(tmp_path, monkeypatch):
     import api.app as app
     monkeypatch.setattr(app.editing, "EDITS_DIR", tmp_path / "edits")
     monkeypatch.setattr(app, "_llamacpp_paths", lambda: (tmp_path / "convert.py", None, None))
-    monkeypatch.setattr(app.manager, "hf_model", object())
-    monkeypatch.setattr(app.manager, "jl", object())
-    monkeypatch.setattr(app.manager, "meta", {"model_id": "local", "quant": None})
-    monkeypatch.setattr(app.manager, "capability_profile", None)
+    _install_loaded_bundle(app, monkeypatch, profile=None)
     monkeypatch.setattr(app.interventions, "active_rules_full", lambda: [{"layers": [0]}])
     monkeypatch.setattr(app.interventions, "_mode", "readthrough")
     forbidden = lambda *_args, **_kwargs: (_ for _ in ()).throw(
@@ -95,6 +108,49 @@ def test_fresh_gguf_bake_requires_capability_profile(tmp_path, monkeypatch):
         ))
     assert exc.value.status_code == 422
     assert exc.value.detail == "Capability data is unavailable for this model."
+
+
+def test_fresh_gguf_predispatch_failure_releases_bake_owner(tmp_path, monkeypatch):
+    import api.app as app
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(app.editing, "EDITS_DIR", tmp_path / "edits")
+    monkeypatch.setattr(app, "_llamacpp_paths", lambda: (tmp_path / "convert.py", None, None))
+    _install_loaded_bundle(app, monkeypatch)
+    monkeypatch.setattr(app.interventions, "active_rules_full", lambda: [])
+    monkeypatch.setattr(app.interventions, "_mode", "readthrough")
+    monkeypatch.setattr(app.interventions, "_scale", 1.0)
+    monkeypatch.setattr(app.editing, "export_rebase",
+                        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                            AssertionError("pre-dispatch validation should reject first")))
+    app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
+
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(app.api_edit_export_gguf(SimpleNamespace(name="job", gguf_type="bf16")))
+
+    assert exc.value.status_code == 422
+    assert app.manager.coordinator.snapshot().operation is None
+
+    cached = app.editing.EDITS_DIR / "job" / "hf"
+    cached.mkdir(parents=True)
+    (cached / "config.json").write_text("{}")
+    started = []
+
+    class FakeThread:
+        def __init__(self, *args, **kwargs):
+            started.append((args, kwargs))
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(app, "threading", SimpleNamespace(Thread=FakeThread))
+    response = TestClient(app.app).post(
+        "/api/edit/export-gguf", json={"name": "job", "gguf_type": "bf16"})
+
+    assert response.status_code == 200
+    assert response.json()["checkpoint"] == "reused"
+    assert started
+    assert app.manager.coordinator.snapshot().operation is None
 
 
 def test_fresh_gguf_abliteration_rejected_before_dispatch_or_state(tmp_path, monkeypatch):

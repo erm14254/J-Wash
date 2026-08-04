@@ -185,6 +185,7 @@ class _FitRun:
     helper_error: tuple | None = None
     helper_error_lock: threading.Lock = field(default_factory=threading.Lock)
     heartbeat_thread: threading.Thread | None = None
+    reservation_release: object | None = None
 
 
 class FitManager:
@@ -203,7 +204,7 @@ class FitManager:
     def start(self, *, model_id, source, n_prompts=100, dtype="bf16", quant=None,
               devices=("cuda:0",), name=None, dim_batch=None,
               max_seq_len=128, source_layers=None, model_revision=None,
-              continue_from=None, datasets=(DATASET_WIKITEXT,)):
+              continue_from=None, datasets=(DATASET_WIKITEXT,), reservation_release=None):
         with self._lock:
             if self._active_run is not None:
                 raise ValueError("a fitting is already in progress")
@@ -256,6 +257,7 @@ class FitManager:
                 "error": None,
             }
             run = _FitRun()
+            run.reservation_release = reservation_release
             self._active_run = run
         threading.Thread(target=self._run, args=(run, name, params), daemon=True).start()
         return dict(self.state)
@@ -651,6 +653,12 @@ class FitManager:
             with self._lock:
                 if self._active_run is run:
                     self._active_run = None
+            release = run.reservation_release
+            if release is not None:
+                try:
+                    release()
+                except Exception:
+                    pass
             run.done.set()
 
     def _heartbeat(self, run, started):

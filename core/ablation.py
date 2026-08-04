@@ -1,3 +1,4 @@
+import copy
 import itertools
 import threading
 
@@ -103,20 +104,53 @@ class Interventions:
         self._lock = threading.Lock()
         self._counter = itertools.count(1)
         self._rules = []
+        self._handles = []  # non-authoritative legacy inspection only
         self._scale = 1.0
         self._mode = "standard"
 
     @property
     def active(self):
-        return bool(self._rules)
+        with self._lock:
+            return bool(self._rules)
 
     @property
     def global_scale(self):
-        return self._scale
+        with self._lock:
+            return self._scale
 
     @property
     def mode(self):
-        return self._mode
+        with self._lock:
+            return self._mode
+
+    def _clone_rule_locked(self, rule):
+        cloned = dict(rule)
+        if "layers" in cloned:
+            cloned["layers"] = list(cloned["layers"])
+        if "dirs_a" in cloned and cloned["dirs_a"] is not None:
+            cloned["dirs_a"] = dict(cloned["dirs_a"])
+        if "dirs_b" in cloned and cloned["dirs_b"] is not None:
+            cloned["dirs_b"] = dict(cloned["dirs_b"])
+        return cloned
+
+    def _active_rules_locked(self):
+        return [self._clone_rule_locked(r) for r in self._rules if r["layers"] and r.get("enabled", True)]
+
+    def _summary_locked(self):
+        return [
+            {
+                "id": rule["id"],
+                "token_id": rule["token_id"],
+                "token": rule["token"],
+                "mode": rule["mode"],
+                "factor": rule["factor"],
+                "replacement_id": rule["replacement_id"],
+                "replacement": rule["replacement"],
+                "layers": list(rule["layers"]),
+                "enabled": rule.get("enabled", True),
+            }
+            for rule in self._rules
+        ]
 
     def set_scale(self, scale):
         with self._lock:
@@ -148,18 +182,19 @@ class Interventions:
 
     def rules_full(self):
         with self._lock:
-            return [dict(r) for r in self._rules]
+            return [self._clone_rule_locked(r) for r in self._rules]
 
     def clear_for_model_transition(self):
         with self._lock:
             self._rules = []
             self._mode = "standard"
-            return self.summary()
+            return self._summary_locked()
 
     def active_rules_full(self):
         """Full rules (with directions) actually applied — for export: a disabled
         rule or one without layers must not be baked."""
-        return list(self._active_rules())
+        with self._lock:
+            return self._active_rules_locked()
 
     def _active_rules(self):
         """Rules actually applied: non-empty layers AND not disabled. The
@@ -168,20 +203,8 @@ class Interventions:
         return [r for r in self._rules if r["layers"] and r.get("enabled", True)]
 
     def summary(self):
-        return [
-            {
-                "id": rule["id"],
-                "token_id": rule["token_id"],
-                "token": rule["token"],
-                "mode": rule["mode"],
-                "factor": rule["factor"],
-                "replacement_id": rule["replacement_id"],
-                "replacement": rule["replacement"],
-                "layers": rule["layers"],
-                "enabled": rule.get("enabled", True),
-            }
-            for rule in self._rules
-        ]
+        with self._lock:
+            return self._summary_locked()
 
     def _direction(self, lens, weight, token_id, layers):
         row = weight[token_id].float()
@@ -234,7 +257,7 @@ class Interventions:
                 else None,
             }
             self._rules.append(rule)
-            return self.summary()
+            return self._summary_locked()
 
     def update(self, rule_id, *, factor=None, layers=None, enabled=None,
                token_id=None, replacement_id=None, mode=None,
@@ -254,7 +277,7 @@ class Interventions:
                 # token / replacement / mode / layers change the directions →
                 # the lens and model are required to re-resolve them
                 if not needs_dirs:
-                    return self.summary()
+                    return self._summary_locked()
                 if lens_manager is None or jl is None:
                     raise ValueError("model and lens required to edit the rule")
                 lens = lens_manager.lens
@@ -287,7 +310,7 @@ class Interventions:
                     if rule["replacement_id"] is not None
                     else None
                 )
-                return self.summary()
+                return self._summary_locked()
             raise ValueError(f"unknown rule {rule_id}")
 
     def remove(self, rule_id=None):
@@ -296,20 +319,21 @@ class Interventions:
                 self._rules = []
             else:
                 self._rules = [r for r in self._rules if r["id"] != rule_id]
-            return self.summary()
+            return self._summary_locked()
 
     def snapshot(self):
         with self._lock:
             return {
                 "scale": self._scale,
                 "mode": self._mode,
-                "rules": [dict(r) for r in self._rules],
+                "rules": [self._clone_rule_locked(r) for r in self._rules],
+                "summary": self._summary_locked(),
             }
 
-    def attach(self, jl):
+    def attach(self, jl, *, snapshot=None):
         from core.capabilities import ensure_unquantized, PUBLIC_REASONS
         ensure_unquantized(jl)
-        snap = self.snapshot()
+        snap = copy.deepcopy(snapshot) if snapshot is not None else self.snapshot()
         mode = snap["mode"]
         if mode == "abliteration":
             raise ValueError(PUBLIC_REASONS["global_projection_unvalidated"])
@@ -364,7 +388,7 @@ class Interventions:
         active = active if active is not None else self._active_rules()
         scale = self._scale if scale is None else scale
         if not active:
-            return
+            return HookAttachment([])
         n_layers = len(jl.layers)
         # Model-wide Phase-1 contract: capability does not depend on which rule
         # happens to be last.  This also validates the final norm before any
@@ -372,7 +396,7 @@ class Interventions:
         inventory = rebase.model_preflight(jl, exact=exact)
         cums = rebase.cumulative(active, scale, n_layers)
         if not cums:
-            return
+            return HookAttachment([])
 
         def read_hook_for(norm, U, V):
             Ug, Vg = rebase.gamma_pair(norm, U, V)
@@ -427,4 +451,5 @@ class Interventions:
         return HookAttachment(handles)
 
     def detach(self):
+        # Compatibility shim: operation-local attachments are authoritative.
         return None
