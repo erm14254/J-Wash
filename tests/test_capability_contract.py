@@ -172,10 +172,11 @@ def test_profile_construction_conflicting_quantization_is_unavailable():
         "reason_code"] == "capability_data_unavailable"
 
 
-def test_model_wide_packed_fact_uses_validated_reader_rank():
+def test_noncanonical_rank3_dense_reader_is_not_reclassified_as_packed():
     jl = dense_lens()
     jl.layers[0].mlp.gate_proj.weight = torch.nn.Parameter(torch.randn(2, 3, 8))
-    assert rebase.has_packed_read_parameters(jl)
+    with pytest.raises(ValueError, match="audited Linear"):
+        rebase.has_packed_read_parameters(jl)
 
 
 def test_legacy_fields_are_derived_from_validated_profile():
