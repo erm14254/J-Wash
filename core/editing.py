@@ -24,6 +24,9 @@ PRESETS_DIR = config.DATA_DIR / "presets"
 DEFAULT_TEMP_STALE_AGE = 24 * 60 * 60
 _TEMP_STAGE_RE = re.compile(r"^\..+\.tmp-[0-9a-f]{32}$")
 _TEMP_GGUF_RE = re.compile(r"^\..+\.tmp-[0-9a-f]{32}\.gguf$")
+_OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
+_STAT_SUPPORTS_DIR_FD = os.stat in os.supports_dir_fd
+_STAT_SUPPORTS_NOFOLLOW = os.stat in os.supports_follow_symlinks
 
 
 def _mark_windows_file_for_deletion(file):
@@ -446,12 +449,37 @@ def _open_verified_directory_chain(snapshots):
             os.close(fd)
 
 
+def _strict_inspection_capability():
+    """Return whether metadata-preserving startup inspection is available."""
+    required_flags = ("O_NOATIME", "O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC")
+    if os.name != "posix" or any(not hasattr(os, name) for name in required_flags):
+        return False
+    if not _OPEN_SUPPORTS_DIR_FD:
+        return False
+    if not _STAT_SUPPORTS_DIR_FD or not _STAT_SUPPORTS_NOFOLLOW:
+        return False
+    # CPython's POSIX scandir accepts an open directory descriptor.  Windows
+    # does not, and is rejected above before any tree access.
+    return True
+
+
+def _inspection_directory_flags():
+    if not _strict_inspection_capability():
+        raise _UnsafeAnchoredInspection(
+            "strict metadata-preserving temporary inspection is unavailable on this platform"
+        )
+    return (
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NOATIME
+    )
+
+
 @dataclass(frozen=True)
 class _TempCandidate:
     path: Path
     kind: str
     identity: tuple
     parent_chain: tuple
+    anchor_index: int = 0
 
 
 class _UnsafeAnchoredInspection(RuntimeError):
@@ -467,15 +495,11 @@ class _AnchoredInspectionParent:
         self._fds = []
 
     def __enter__(self):
-        if os.name == "nt":
-            raise _UnsafeAnchoredInspection(
-                "safe handle-relative temporary inspection is unavailable on Windows"
-            )
-        flags = (
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-        )
-        snapshots = self.candidate.parent_chain
+        flags = _inspection_directory_flags()
+        # The complete lexical chain is revalidated separately. Descriptor
+        # traversal begins at the configured edits root so O_NOATIME does not
+        # require ownership of unrelated ancestors such as ``/``.
+        snapshots = self.candidate.parent_chain[self.candidate.anchor_index:]
         try:
             if not snapshots:
                 raise _UnsafeAnchoredInspection("candidate has no validated parent chain")
@@ -524,10 +548,7 @@ class _AnchoredInspectionParent:
         """Read ``edit_meta.json`` through the retained candidate-parent fd."""
         if self.candidate.kind != "directory":
             raise _UnsafeAnchoredInspection("completion marker requires a directory artifact")
-        flags = (
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
-        )
+        flags = _inspection_directory_flags()
         candidate_fd = os.open(self.candidate.path.name, flags, dir_fd=self.parent_fd)
         try:
             candidate_stat = os.fstat(candidate_fd)
@@ -546,7 +567,7 @@ class _AnchoredInspectionParent:
             )
             if _stat_is_link_or_reparse(marker_stat) or not stat.S_ISREG(marker_stat.st_mode):
                 raise ValueError("possible completion marker is not a safe regular file")
-            marker_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+            marker_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NOATIME
             marker_fd = os.open("edit_meta.json", marker_flags, dir_fd=candidate_fd)
             try:
                 opened = os.fstat(marker_fd)
@@ -566,6 +587,23 @@ class _AnchoredInspectionParent:
             finally:
                 if marker_fd is not None:
                     os.close(marker_fd)
+        finally:
+            os.close(candidate_fd)
+
+    def newest_mtime(self):
+        """Return newest lstat mtime using only no-atime descriptor traversal."""
+        current = self.stat_leaf(
+            self.candidate.path.name, self.candidate.identity, full=True,
+        )
+        newest = current.st_mtime
+        if self.candidate.kind == "file":
+            return newest
+        candidate_fd = os.open(
+            self.candidate.path.name, _inspection_directory_flags(),
+            dir_fd=self.parent_fd,
+        )
+        try:
+            return max(newest, _newest_mtime_from_fd(candidate_fd, self.candidate.path))
         finally:
             os.close(candidate_fd)
 
@@ -602,29 +640,102 @@ def _revalidate_candidate_full(candidate):
     return current
 
 
-def _raise_walk_error(exc):
-    raise exc
-
-
-def _newest_lstat_mtime(path, kind):
-    newest = path.lstat().st_mtime
-    if kind == "file":
-        return newest
-    for current, dirs, files in os.walk(
-        path, followlinks=False, onerror=_raise_walk_error,
-    ):
-        base = Path(current)
-        # Never traverse directory symlinks, but include their own lstat time.
-        kept = []
-        for name in dirs:
-            child = base / name
-            newest = max(newest, child.lstat().st_mtime)
-            if not _is_link_or_reparse(child):
-                kept.append(name)
-        dirs[:] = kept
-        for name in files:
-            newest = max(newest, (base / name).lstat().st_mtime)
+def _newest_mtime_from_fd(directory_fd, display):
+    """Walk one opened directory without following names or updating atime."""
+    newest = os.fstat(directory_fd).st_mtime
+    with os.scandir(directory_fd) as entries:
+        for entry in entries:
+            entry_stat = os.stat(
+                entry.name, dir_fd=directory_fd, follow_symlinks=False,
+            )
+            newest = max(newest, entry_stat.st_mtime)
+            if _stat_is_link_or_reparse(entry_stat) or not stat.S_ISDIR(entry_stat.st_mode):
+                continue
+            child_fd = os.open(
+                entry.name, _inspection_directory_flags(), dir_fd=directory_fd,
+            )
+            try:
+                opened = os.fstat(child_fd)
+                if _candidate_identity(opened) != _candidate_identity(entry_stat):
+                    raise _UnsafeAnchoredInspection(
+                        f"inspection directory changed: {display / entry.name}"
+                    )
+                newest = max(
+                    newest, _newest_mtime_from_fd(child_fd, display / entry.name),
+                )
+            finally:
+                os.close(child_fd)
     return newest
+
+
+def _discover_temp_candidates(root, root_chain, result):
+    """Discover candidates by descriptor-relative, no-atime traversal."""
+    candidates = []
+    root_fd = _open_inspection_root(root_chain)
+
+    def walk(directory_fd, display, relative_chain):
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                path = display / entry.name
+                try:
+                    entry_stat = os.stat(
+                        entry.name, dir_fd=directory_fd, follow_symlinks=False,
+                    )
+                    if _stat_is_link_or_reparse(entry_stat):
+                        continue
+                    kind = None
+                    leaf_kind = internal_temp_leaf_kind(entry.name)
+                    if leaf_kind == "directory" and stat.S_ISDIR(entry_stat.st_mode):
+                        kind = "directory"
+                    elif leaf_kind == "file" and stat.S_ISREG(entry_stat.st_mode):
+                        kind = "file"
+                    if kind:
+                        candidates.append(_TempCandidate(
+                            path, kind, _candidate_identity(entry_stat),
+                            root_chain + relative_chain,
+                            len(root_chain) - 1,
+                        ))
+                        continue
+                    if not stat.S_ISDIR(entry_stat.st_mode):
+                        continue
+                    child_fd = os.open(
+                        entry.name, _inspection_directory_flags(), dir_fd=directory_fd,
+                    )
+                    try:
+                        opened = os.fstat(child_fd)
+                        if _candidate_identity(opened) != _candidate_identity(entry_stat):
+                            raise _UnsafeAnchoredInspection(
+                                f"inspection directory changed: {path}"
+                            )
+                        walk(
+                            child_fd, path,
+                            relative_chain + ((path, _stat_identity(opened)),),
+                        )
+                    finally:
+                        os.close(child_fd)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    result["errors"].append({"path": str(path), "error": str(exc)})
+
+    try:
+        walk(root_fd, root, ())
+    finally:
+        os.close(root_fd)
+    return candidates
+
+
+def _open_inspection_root(root_chain):
+    """Open the verified root itself without permitting access-time updates."""
+    flags = _inspection_directory_flags()
+    root, expected = root_chain[-1]
+    fd = os.open(root, flags)
+    try:
+        current = os.fstat(fd)
+        if _stat_identity(current) != expected or not stat.S_ISDIR(current.st_mode):
+            raise _UnsafeAnchoredInspection(f"inspection root changed: {root}")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
 
 
 @dataclass
@@ -664,7 +775,7 @@ def _inspect_existing_lease(anchored, lease_leaf):
     lease_stat = os.stat(lease_leaf, dir_fd=anchored.parent_fd, follow_symlinks=False)
     if _stat_is_link_or_reparse(lease_stat) or not stat.S_ISREG(lease_stat.st_mode):
         raise _UnsafeAnchoredInspection("temporary artifact lease is not a safe regular file")
-    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NOATIME
     fd = os.open(lease_leaf, flags, dir_fd=anchored.parent_fd)
     try:
         opened = os.fstat(fd)
@@ -709,7 +820,7 @@ def _check_held_lease_advisory(
         )
 
     candidate_first = anchored.stat_leaf(candidate.path.name)
-    if _stat_identity(candidate_first) != candidate.identity[:5]:
+    if not _candidate_identity_matches(candidate_first, candidate.identity, full=False):
         raise _UnsafeAnchoredInspection(
             "temporary artifact structural identity changed during active checks"
         )
@@ -732,7 +843,7 @@ def _check_held_lease_advisory(
         observer("after_active_lease_entry_check_1", candidate.path)
 
     candidate_second = anchored.stat_leaf(candidate.path.name)
-    if _stat_identity(candidate_second) != candidate.identity[:5]:
+    if not _candidate_identity_matches(candidate_second, candidate.identity, full=False):
         raise _UnsafeAnchoredInspection(
             "temporary artifact structural identity changed during active checks"
         )
@@ -775,6 +886,9 @@ def inspect_abandoned_export_temps(
 ):
     """Non-destructively classify J-Wash temporary export artifacts.
 
+    On supported POSIX systems, all traversal and reads use descriptor-relative
+    ``O_NOATIME`` opens; inspection never falls back to an operation that may
+    advance access times. Unsupported or denied strict inspection fails closed.
     Startup inspection deliberately never renames, removes, or modifies an
     artifact or lease. Structural inconsistencies detected during inspection
     are ``changed_or_unsafe``. ``active`` means a held lease was observed and
@@ -792,6 +906,12 @@ def inspect_abandoned_export_temps(
         "skipped_active": [], "skipped_recent": [],
         "skipped_completed": [], "skipped_changed": [],
     }
+    if not _strict_inspection_capability():
+        result["errors"].append({
+            "path": str(root),
+            "error": "strict metadata-preserving temporary inspection is unavailable on this platform",
+        })
+        return result
     try:
         root_chain = _snapshot_directory_chain(root, missing_ok=True)
         if root_chain is None:
@@ -800,39 +920,11 @@ def inspect_abandoned_export_temps(
         result["errors"].append({"path": str(root), "error": str(exc)})
         return result
 
-    candidates = []
-    def record_walk_error(exc):
-        result["errors"].append({
-            "path": str(getattr(exc, "filename", root)), "error": str(exc),
-        })
-
-    for current, dirs, files in os.walk(
-        root, topdown=True, followlinks=False, onerror=record_walk_error,
-    ):
-        base = Path(current)
-        kept_dirs = []
-        for name in dirs:
-            child = base / name
-            try:
-                if not _is_link_or_reparse(child):
-                    kept_dirs.append(name)
-            except OSError as exc:
-                result["errors"].append({"path": str(child), "error": str(exc)})
-        dirs[:] = kept_dirs
-        for name in list(dirs) + files:
-            path = base / name
-            try:
-                kind = _recognized_temp(path)
-                if kind:
-                    snapshot = _TempCandidate(
-                        path, kind, _candidate_identity(path.lstat()),
-                        _snapshot_directory_chain(path.parent),
-                    )
-                    candidates.append(snapshot)
-                    if kind == "directory" and name in dirs:
-                        dirs.remove(name)
-            except OSError as exc:
-                result["errors"].append({"path": str(path), "error": str(exc)})
+    try:
+        candidates = _discover_temp_candidates(root, root_chain, result)
+    except (OSError, RuntimeError, ValueError) as exc:
+        result["errors"].append({"path": str(root), "error": str(exc)})
+        return result
 
     if observer:
         observer("discovered", tuple(candidate.path for candidate in candidates))
@@ -908,13 +1000,10 @@ def inspect_abandoned_export_temps(
                             classify("completed", path)
                             continue
 
-            # Activity inspection is advisory and path based, so validate both
-            # before and after it. Any concurrent mutation is preserved.
-            _revalidate_candidate_full(candidate)
-            newest = _newest_lstat_mtime(path, kind)
-            if observer:
-                observer("after_activity", path)
-            _revalidate_candidate_full(candidate)
+                newest = anchored.newest_mtime()
+                if observer:
+                    observer("after_activity", path)
+                anchored.stat_leaf(path.name, candidate.identity, full=True)
             _revalidate_directory_chain(root_chain)
             if current_time - newest < stale_age:
                 classify("recent", path)

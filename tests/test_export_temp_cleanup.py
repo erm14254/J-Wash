@@ -1,4 +1,5 @@
 import multiprocessing
+import errno
 import os
 import shutil
 import socket
@@ -39,6 +40,13 @@ def _inspect(root, **kwargs):
     return editing.inspect_abandoned_export_temps(root=root, now=NOW, **kwargs)
 
 
+def _set_old_atime(path, *, mtime_ns=None):
+    current = path.stat()
+    old_atime_ns = 946_684_800_000_000_000
+    os.utime(path, ns=(old_atime_ns, current.st_mtime_ns if mtime_ns is None else mtime_ns))
+    return path.stat()
+
+
 def _hold(path, conn):
     lease = editing.ArtifactLease(path)
     lease.acquire()
@@ -65,8 +73,10 @@ def test_old_unlocked_temporary_is_reported_not_removed(tmp_path, maker):
     path = maker(tmp_path)
     before = (path / "payload").read_bytes() if path.is_dir() else path.read_bytes()
     result = _inspect(tmp_path)
-    category = "changed_or_unsafe" if os.name == "nt" else "abandoned"
-    assert result[category] == [str(path)]
+    if os.name == "nt":
+        assert result["errors"] and not result["abandoned"]
+    else:
+        assert result["abandoned"] == [str(path)]
     assert result["removed"] == [] and result["removed_count"] == 0
     assert path.exists()
     after = (path / "payload").read_bytes() if path.is_dir() else path.read_bytes()
@@ -76,8 +86,11 @@ def test_old_unlocked_temporary_is_reported_not_removed(tmp_path, maker):
 @pytest.mark.parametrize("maker", [_stage, _gguf])
 def test_recent_temporary_is_preserved(tmp_path, maker):
     path = maker(tmp_path, recent=True)
-    category = "changed_or_unsafe" if os.name == "nt" else "recent"
-    assert _inspect(tmp_path)[category] == [str(path)]
+    result = _inspect(tmp_path)
+    if os.name == "nt":
+        assert result["errors"] and not result["recent"]
+    else:
+        assert result["recent"] == [str(path)]
     assert path.exists()
 
 
@@ -89,19 +102,202 @@ def test_completed_collision_and_hf_cache_are_preserved(tmp_path):
         '{"name":".completed.tmp-' + HEX + '"}', encoding="utf-8"
     )
     result = _inspect(tmp_path)
-    category = "changed_or_unsafe" if os.name == "nt" else "completed"
-    assert result[category] == [str(path)]
+    if os.name == "nt":
+        assert result["errors"] and not result["completed"]
+    else:
+        assert result["completed"] == [str(path)]
     assert (path / "hf" / "config.json").read_bytes() == b"config"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="strict O_NOATIME inspection is POSIX-only")
+def test_completion_marker_and_directories_preserve_atime(tmp_path):
+    path = _stage(tmp_path, ".completed.tmp-" + HEX)
+    marker = path / "edit_meta.json"
+    marker.write_text('{"name":".completed.tmp-' + HEX + '"}', encoding="utf-8")
+    before_marker = _set_old_atime(marker)
+    before_stage = _set_old_atime(path)
+    before_root = _set_old_atime(tmp_path)
+
+    result = _inspect(tmp_path)
+
+    assert result["completed"] == [str(path)] and result["errors"] == []
+    after_marker, after_stage, after_root = marker.stat(), path.stat(), tmp_path.stat()
+    assert after_marker.st_atime_ns == before_marker.st_atime_ns
+    assert after_marker.st_mtime_ns == before_marker.st_mtime_ns
+    assert after_marker.st_ctime_ns == before_marker.st_ctime_ns
+    assert after_marker.st_size == before_marker.st_size
+    assert after_stage.st_atime_ns == before_stage.st_atime_ns
+    assert after_root.st_atime_ns == before_root.st_atime_ns
+
+
+@pytest.mark.skipif(os.name != "posix", reason="strict O_NOATIME inspection is POSIX-only")
+def test_abandoned_nested_stage_preserves_all_atimes(tmp_path):
+    path = _stage(tmp_path)
+    nested = path / "nested"
+    nested.mkdir()
+    payload = nested / "payload"
+    payload.write_bytes(b"nested")
+    _mtime(payload)
+    _mtime(nested)
+    _mtime(path)
+    watched = [tmp_path, path, path / "payload", nested, payload]
+    before = {item: _set_old_atime(item) for item in watched}
+
+    result = _inspect(tmp_path)
+
+    assert result["abandoned"] == [str(path)] and result["errors"] == []
+    for item in watched:
+        after = item.stat()
+        assert after.st_atime_ns == before[item].st_atime_ns
+        assert after.st_mtime_ns == before[item].st_mtime_ns
+        assert after.st_ctime_ns == before[item].st_ctime_ns
+        assert after.st_size == before[item].st_size
+    assert payload.read_bytes() == b"nested"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="strict O_NOATIME inspection is POSIX-only")
+def test_candidate_free_hierarchy_preserves_directory_atimes(tmp_path):
+    hf = tmp_path / "job" / "hf"
+    hf.mkdir(parents=True)
+    (hf / "config.json").write_bytes(b"cache")
+    watched = [tmp_path, tmp_path / "job", hf]
+    before = {item: _set_old_atime(item) for item in watched}
+
+    result = _inspect(tmp_path)
+
+    assert not any(result[key] for key in (
+        "active", "recent", "completed", "abandoned", "changed_or_unsafe",
+    ))
+    assert result["errors"] == []
+    assert all(item.stat().st_atime_ns == before[item].st_atime_ns for item in watched)
+
+
+def test_unavailable_strict_inspection_does_not_traverse(tmp_path, monkeypatch):
+    _gguf(tmp_path)
+    before = _set_old_atime(tmp_path)
+    monkeypatch.setattr(editing, "_strict_inspection_capability", lambda: False)
+    monkeypatch.setattr(os, "open", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(os, "scandir", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(os, "walk", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(Path, "iterdir", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(Path, "rglob", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
+
+    result = _inspect(tmp_path)
+
+    assert result["errors"] and "unavailable" in result["errors"][0]["error"]
+    assert tmp_path.stat().st_atime_ns == before.st_atime_ns
+
+
+@pytest.mark.skipif(os.name != "posix", reason="strict O_NOATIME inspection is POSIX-only")
+def test_root_noatime_denial_has_no_fallback(tmp_path, monkeypatch):
+    _gguf(tmp_path)
+    before = _set_old_atime(tmp_path)
+    real_open = os.open
+    calls = []
+
+    def deny_root(path, flags, *args, **kwargs):
+        calls.append(flags)
+        if Path(path) == tmp_path and flags & os.O_NOATIME:
+            raise PermissionError(errno.EPERM, "no-atime denied", str(path))
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", deny_root)
+    result = _inspect(tmp_path)
+    assert result["errors"] and "denied" in result["errors"][0]["error"]
+    assert calls and all(flags & os.O_NOATIME for flags in calls)
+    assert tmp_path.stat().st_atime_ns == before.st_atime_ns
+
+
+@pytest.mark.skipif(os.name != "posix", reason="strict O_NOATIME inspection is POSIX-only")
+@pytest.mark.parametrize("held", [False, True])
+def test_lease_probe_preserves_exact_atime(tmp_path, held):
+    path = _gguf(tmp_path)
+    lease = editing.ArtifactLease(path)
+    lease.acquire()
+    lease_path = lease.path
+    parent = child = proc = None
+    if held:
+        lease.release()
+        parent, child = multiprocessing.Pipe()
+        proc = multiprocessing.Process(target=_hold, args=(path, child))
+        proc.start()
+        assert parent.recv() == "ready"
+    else:
+        lease.release()
+    before = _set_old_atime(lease_path)
+    try:
+        result = _inspect(tmp_path)
+    finally:
+        if held:
+            parent.send("release")
+            proc.join(10)
+            assert proc.exitcode == 0
+    assert result["active" if held else "abandoned"] == [str(path)]
+    assert lease_path.stat().st_atime_ns == before.st_atime_ns
+
+
+@pytest.mark.skipif(os.name != "posix", reason="strict O_NOATIME inspection is POSIX-only")
+def test_nested_noatime_denial_has_no_normal_open_fallback(tmp_path, monkeypatch):
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    _gguf(blocked)
+    safe = _gguf(tmp_path / "safe", ".safe.tmp-" + HEX + ".gguf")
+    blocked_before = _set_old_atime(blocked)
+    real_open = os.open
+
+    def deny_nested(path, flags, *args, **kwargs):
+        if path == "blocked" and flags & os.O_NOATIME:
+            raise PermissionError(errno.EPERM, "nested no-atime denied", path)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", deny_nested)
+    result = _inspect(tmp_path)
+    assert result["abandoned"] == [str(safe)]
+    assert any("nested no-atime denied" in item["error"] for item in result["errors"])
+    assert blocked.stat().st_atime_ns == blocked_before.st_atime_ns
+
+
+@pytest.mark.skipif(os.name != "posix", reason="strict O_NOATIME inspection is POSIX-only")
+def test_marker_noatime_denial_preserves_marker_and_candidate(tmp_path, monkeypatch):
+    path = _stage(tmp_path, ".completed.tmp-" + HEX)
+    marker = path / "edit_meta.json"
+    marker.write_text('{"name":".completed.tmp-' + HEX + '"}', encoding="utf-8")
+    before = _set_old_atime(marker)
+    original = marker.read_bytes()
+    before = _set_old_atime(marker)  # reset after the test's own byte read
+    real_open = os.open
+
+    def deny_marker(name, flags, *args, **kwargs):
+        if name == "edit_meta.json" and flags & os.O_NOATIME:
+            raise PermissionError(errno.EPERM, "marker no-atime denied", name)
+        return real_open(name, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", deny_marker)
+    result = _inspect(tmp_path)
+    assert result["changed_or_unsafe"] == [str(path)]
+    assert any("marker no-atime denied" in item["error"] for item in result["errors"])
+    assert marker.stat().st_atime_ns == before.st_atime_ns
+    assert marker.read_bytes() == original
 
 
 def test_inspection_never_calls_destructive_operations(tmp_path, monkeypatch):
     path = _gguf(tmp_path)
-    monkeypatch.setattr(Path, "replace", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
-    monkeypatch.setattr(Path, "unlink", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
-    monkeypatch.setattr(os, "unlink", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
-    monkeypatch.setattr(shutil, "rmtree", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
-    category = "changed_or_unsafe" if os.name == "nt" else "abandoned"
-    assert _inspect(tmp_path)[category] == [str(path)]
+    forbidden = lambda *a, **k: (_ for _ in ()).throw(AssertionError())
+    monkeypatch.setattr(Path, "replace", forbidden)
+    monkeypatch.setattr(Path, "unlink", forbidden)
+    monkeypatch.setattr(Path, "touch", forbidden)
+    for name in (
+        "replace", "rename", "unlink", "remove", "rmdir", "utime", "chmod",
+        "chown", "fchmod", "fchown", "truncate", "ftruncate",
+    ):
+        if hasattr(os, name):
+            monkeypatch.setattr(os, name, forbidden)
+    monkeypatch.setattr(shutil, "rmtree", forbidden)
+    result = _inspect(tmp_path)
+    if os.name == "nt":
+        assert result["errors"] and not result["abandoned"]
+    else:
+        assert result["abandoned"] == [str(path)]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX advisory-lock integration")
@@ -687,7 +883,8 @@ def test_late_lease_validation_failure_clears_acquisition_state(tmp_path, monkey
 def test_windows_inspection_preserves_candidates(tmp_path):
     path = _gguf(tmp_path)
     result = _inspect(tmp_path)
-    assert result["changed_or_unsafe"] == [str(path)]
+    assert result["changed_or_unsafe"] == []
+    assert result["errors"] and "unavailable" in result["errors"][0]["error"]
     assert path.read_bytes() == b"file-bytes"
 
 

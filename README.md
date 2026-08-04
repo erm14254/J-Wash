@@ -359,6 +359,14 @@ structural identity before lease state is known. A safely observed held lease
 uses the ordered advisory checks and permits those ordinary mutable updates;
 an absent or unlocked lease requires the complete discovery identity before the
 artifact can be classified as completed, recent, or abandoned.
+On supported POSIX systems, traversal and marker/lease reads are performed with
+descriptor-relative `O_NOATIME` opens. There is no fallback to ordinary traversal
+or reads that may advance access times. If this strict metadata-preserving mode is
+unavailable or denied, inspection fails closed and startup continues; Windows
+therefore does not enumerate the edits tree unless an equivalent strict mechanism
+is available. This guarantee relies on the kernel and filesystem honoring a
+successfully opened `O_NOATIME` descriptor. Inspection never restores timestamps
+or intentionally changes artifact, cache, marker, lease, or directory metadata.
 Destructive offline maintenance is intentionally deferred. POSIX lease files are
 intentionally persistent and reusable because portable POSIX APIs cannot safely
 unlink only a previously verified inode; an unlocked lease does not mean an
