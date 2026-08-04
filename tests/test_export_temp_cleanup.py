@@ -491,7 +491,7 @@ def test_unlocked_lease_gguf_mutation_at_discovery_is_unsafe(tmp_path):
     result = _inspect(tmp_path, observer=observer)
     assert result["active"] == []
     assert result["changed_or_unsafe"] == [str(path)]
-    assert "identity changed" in result["errors"][0]["error"]
+    assert "changed after discovery" in result["errors"][0]["error"]
     assert path.read_bytes() == b"unlocked-write-after-discovery"
     assert lease_path.is_file()
 
@@ -509,7 +509,7 @@ def test_unleased_stage_content_mutation_at_discovery_is_unsafe(tmp_path):
     result = _inspect(tmp_path, observer=observer)
     assert result["active"] == []
     assert result["changed_or_unsafe"] == [str(path)]
-    assert "identity changed" in result["errors"][0]["error"]
+    assert "changed after discovery" in result["errors"][0]["error"]
     assert (path / "new-child").read_bytes() == b"inactive-child"
 
 

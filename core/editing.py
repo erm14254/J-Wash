@@ -516,7 +516,8 @@ class _AnchoredInspectionParent:
             raise _UnsafeAnchoredInspection("temporary artifact type changed")
         if expected_identity is not None:
             if not _candidate_identity_matches(current, expected_identity, full=full):
-                raise _UnsafeAnchoredInspection("temporary artifact identity changed")
+                detail = " changed after discovery" if full else " identity changed"
+                raise _UnsafeAnchoredInspection("temporary artifact" + detail)
         return current
 
     def read_completion_marker(self, observer=None):
