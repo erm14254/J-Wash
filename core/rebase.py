@@ -400,8 +400,7 @@ def _block_inventory(block, index, hidden, validated_norms):
         block_discriminator = getattr(block, "layer_type", None)
         mixer_discriminator = getattr(mixer_module, "layer_type", None)
         if (block_discriminator not in (None, discriminator) or
-                mixer_discriminator not in (None, discriminator) or
-                discriminator not in (block_discriminator, mixer_discriminator)):
+                mixer_discriminator not in (None, discriminator)):
             raise ValueError(
                 f"layer {index} mixer discriminator is inconsistent: "
                 f"block={block_discriminator!r}, mixer={mixer_discriminator!r}, "
