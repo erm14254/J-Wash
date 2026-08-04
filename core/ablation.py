@@ -75,12 +75,34 @@ def abliteration_direction(weight_u, rule):
 MODES = ("standard", "readthrough", "exact", "abliteration")
 
 
+class HookAttachment:
+    def __init__(self, handles):
+        self._handles = list(handles)
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def close(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            handles, self._handles = self._handles, []
+        first = None
+        for handle in handles:
+            try:
+                handle.remove()
+            except Exception as exc:
+                if first is None:
+                    first = exc
+        if first is not None:
+            raise first
+
+
 class Interventions:
     def __init__(self):
         self._lock = threading.Lock()
         self._counter = itertools.count(1)
         self._rules = []
-        self._handles = []
         self._scale = 1.0
         self._mode = "standard"
 
@@ -125,7 +147,14 @@ class Interventions:
             return self._scale, self._mode
 
     def rules_full(self):
-        return list(self._rules)
+        with self._lock:
+            return [dict(r) for r in self._rules]
+
+    def clear_for_model_transition(self):
+        with self._lock:
+            self._rules = []
+            self._mode = "standard"
+            return self.summary()
 
     def active_rules_full(self):
         """Full rules (with directions) actually applied — for export: a disabled
@@ -263,34 +292,44 @@ class Interventions:
 
     def remove(self, rule_id=None):
         with self._lock:
-            self.detach()
             if rule_id is None:
                 self._rules = []
             else:
                 self._rules = [r for r in self._rules if r["id"] != rule_id]
             return self.summary()
 
+    def snapshot(self):
+        with self._lock:
+            return {
+                "scale": self._scale,
+                "mode": self._mode,
+                "rules": [dict(r) for r in self._rules],
+            }
+
     def attach(self, jl):
         from core.capabilities import ensure_unquantized, PUBLIC_REASONS
         ensure_unquantized(jl)
-        if self._mode == "abliteration":
+        snap = self.snapshot()
+        mode = snap["mode"]
+        if mode == "abliteration":
             raise ValueError(PUBLIC_REASONS["global_projection_unvalidated"])
-        if not self._rules:
-            return
-        if self._mode in ("readthrough", "exact"):
-            self._attach_rebase(jl, exact=self._mode == "exact")
-            return
+        active = [r for r in snap["rules"] if r["layers"] and r.get("enabled", True)]
+        if not active:
+            return HookAttachment([])
+        if mode in ("readthrough", "exact"):
+            return self._attach_rebase(jl, exact=mode == "exact", active=active, scale=snap["scale"])
         by_layer = {}
-        for rule in self._active_rules():
+        for rule in active:
             for layer in rule["layers"]:
-                by_layer.setdefault(layer, []).append(rule)
+                by_layer.setdefault(layer, []).append(dict(rule))
+        scale = snap["scale"]
 
         def make_hook(layer, rules):
+            rules = [dict(r) for r in rules]
             def hook(module, inputs, output):
                 h = output[0] if isinstance(output, tuple) else output
-                g = self._scale
                 for rule in rules:
-                    alpha, beta = effective_coeffs(rule["mode"], rule["factor"], g)
+                    alpha, beta = effective_coeffs(rule["mode"], rule["factor"], scale)
                     vA = rule["dirs_a"][layer].to(h.device, h.dtype)
                     coef = (h * vA).sum(-1, keepdim=True)
                     h = h + alpha * coef * vA
@@ -300,26 +339,30 @@ class Interventions:
                 if isinstance(output, tuple):
                     return (h,) + tuple(output[1:])
                 return h
-
             return hook
 
-        self._handles = [
-            jl.layers[layer].register_forward_hook(make_hook(layer, rules))
-            for layer, rules in by_layer.items()
-        ]
+        handles = []
+        try:
+            for layer, rules in by_layer.items():
+                handles.append(jl.layers[layer].register_forward_hook(make_hook(layer, rules)))
+        except Exception:
+            HookAttachment(handles).close()
+            raise
+        return HookAttachment(handles)
 
     def _attach_abliteration(self, jl):
         from core.capabilities import PUBLIC_REASONS
         raise ValueError(PUBLIC_REASONS["global_projection_unvalidated"])
 
-    def _attach_rebase(self, jl, exact):
+    def _attach_rebase(self, jl, exact, active=None, scale=None):
         # readthrough/exact preview: the SAME transform as the bake (core/rebase),
         # applied by hooks on the OUTPUT of the reading RMSNorms (and, in exact
         # mode, on the downstream writes) — the preview and the exported
         # checkpoint differ only by rounding.
         from core import rebase  # local import (rebase imports effective_coeffs from here)
 
-        active = self._active_rules()
+        active = active if active is not None else self._active_rules()
+        scale = self._scale if scale is None else scale
         if not active:
             return
         n_layers = len(jl.layers)
@@ -327,7 +370,7 @@ class Interventions:
         # happens to be last.  This also validates the final norm before any
         # hook registration is attempted.
         inventory = rebase.model_preflight(jl, exact=exact)
-        cums = rebase.cumulative(active, self._scale, n_layers)
+        cums = rebase.cumulative(active, scale, n_layers)
         if not cums:
             return
 
@@ -379,12 +422,9 @@ class Interventions:
             for module, hook in sites:
                 handles.append(module.register_forward_hook(hook))
         except Exception:
-            for handle in handles:
-                handle.remove()
+            HookAttachment(handles).close()
             raise
-        self._handles = handles
+        return HookAttachment(handles)
 
     def detach(self):
-        for handle in self._handles:
-            handle.remove()
-        self._handles = []
+        return None

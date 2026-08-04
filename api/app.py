@@ -26,6 +26,7 @@ from core import fitting
 from core.fitting import FitManager
 from core.gpus import gpu_stats
 from core.lens_manager import LensManager
+from core.model_session import OperationConflict, OperationType, ModelStateError
 from core.model_manager import (
     ModelManager,
     _resolve_revision,
@@ -228,18 +229,28 @@ def api_models():
 
 @app.get("/api/status")
 def api_status():
+    coord = manager.session_snapshot()
     scale, mode = interventions.state_snapshot()
-    loaded = manager.hf_model is not None or manager.meta is not None
-    capability_snapshot = capabilities.snapshot(
-        manager.capability_profile, mode, loaded=loaded
-    )
-    loaded_meta = ({**(manager.meta if isinstance(manager.meta, dict) else {}),
-                    **capabilities.legacy(manager.capability_profile, loaded=True)}
-                   if loaded else None)
+    loaded = coord.loaded
+    bundle = coord.bundle
+    profile = bundle.capability_profile if bundle is not None else manager.capability_profile
+    meta = dict(bundle.meta) if bundle is not None else (manager.meta if isinstance(manager.meta, dict) else {})
+    capability_snapshot = capabilities.snapshot(profile, mode, loaded=loaded)
+    loaded_meta = ({**meta, **capabilities.legacy(profile, loaded=True)} if loaded else None)
     return {
         "loaded": loaded_meta,
         "capabilities": capability_snapshot,
         "busy": manager.busy,
+        "model_session_id": coord.model_session_id,
+        "model_state": coord.model_state,
+        "operation": None if coord.operation is None else {
+            "id": coord.operation.id,
+            "type": coord.operation.type,
+            "acquired_session": coord.operation.acquired_session,
+            "current_session": coord.operation.current_session,
+            "start_timestamp": coord.operation.start_timestamp,
+            "cancellation_requested": coord.operation.cancellation_requested,
+        },
         "lens": lens_manager.meta,
         "gpus": gpu_stats(),
         "downloads": list(_downloads.values()),
@@ -249,9 +260,12 @@ def api_status():
         "interventions": interventions.summary(),
         "interventions_scale": scale,
         "interventions_mode": mode,
-        "last_generation": _last_generation,
+        "last_generation": coord.last_generation if coord.last_generation is not None else _last_generation,
     }
 
+
+def _conflict(exc):
+    return HTTPException(409, str(exc))
 
 @app.post("/api/load")
 async def api_load(req: LoadRequest):
@@ -267,6 +281,8 @@ async def api_load(req: LoadRequest):
         return await asyncio.to_thread(
             manager.load, req.model_id, req.dtype, req.quant, req.device
         )
+    except OperationConflict as exc:
+        raise _conflict(exc)
     except Exception as exc:
         raise HTTPException(500, str(exc))
 
@@ -362,19 +378,21 @@ def api_models_unregister(req: RegisterModelRequest):
 async def api_unload():
     if manager.busy:
         raise HTTPException(409, f"busy: {manager.busy}")
+    result = await asyncio.to_thread(manager.unload)
     lens_manager.unload()
     neighbors.reset()
-    return await asyncio.to_thread(manager.unload)
+    interventions.clear_for_model_transition()
+    return result
 
 
 @app.post("/api/lens/load")
 async def api_lens_load(req: LensLoadRequest):
     if not req.repo_id and not req.path:
         raise HTTPException(422, "repo_id or path required")
-    if manager.busy:
-        raise HTTPException(409, f"busy: {manager.busy}")
+    token = None
     try:
-        return await asyncio.to_thread(
+        token, _ = manager.coordinator.acquire(OperationType.LENS_UPDATE, requires_loaded=True)
+        result = await asyncio.to_thread(
             lens_manager.load,
             manager,
             repo_id=req.repo_id,
@@ -384,8 +402,17 @@ async def api_lens_load(req: LensLoadRequest):
             layers=req.layers,
             k=req.k,
         )
+        manager.coordinator.update_lens_binding(token, result)
+        return result
+    except OperationConflict as exc:
+        raise _conflict(exc)
+    except ModelStateError as exc:
+        raise HTTPException(422, str(exc))
     except Exception as exc:
         raise HTTPException(500, str(exc))
+    finally:
+        if token is not None:
+            manager.coordinator.release(token)
 
 
 @app.post("/api/lens/unload")
@@ -813,12 +840,17 @@ class GenerateSyncRequest(BaseModel):
 
 @app.post("/api/generate")
 async def api_generate_sync(req: GenerateSyncRequest):
+    global _last_generation
     """Synchronous generation, no persistence or lens frames: for the CLI tools
     (scripts/jlab.py). Active interventions apply just like in the chat."""
-    if manager.hf_model is None:
-        raise HTTPException(422, "no model loaded")
-    if manager.busy:
-        raise HTTPException(409, f"busy: {manager.busy}")
+    token = None
+    stop_event = threading.Event()
+    try:
+        token, snap = manager.coordinator.acquire(OperationType.GENERATE, requires_loaded=True)
+    except OperationConflict as exc:
+        raise _conflict(exc)
+    except ModelStateError as exc:
+        raise HTTPException(422, str(exc))
     done = {}
 
     def emit(frame):
@@ -827,32 +859,41 @@ async def api_generate_sync(req: GenerateSyncRequest):
         elif frame["type"] == "error":
             done["error"] = frame.get("message")
 
+    released = False
     try:
         await asyncio.to_thread(
-            manager.generate,
-            req.messages,
-            req.sampling,
-            threading.Event(),
-            emit,
-            lens=None,
-            ablator=interventions if interventions.active else None,
+            manager.generate, req.messages, req.sampling, stop_event, emit,
+            lens=None, ablator=interventions if interventions.active else None,
         )
+    except asyncio.CancelledError:
+        if token is not None:
+            manager.coordinator.request_cancel(token)
+            manager.coordinator.release(token)
+            released = True
+        stop_event.set()
+        raise
     except Exception as exc:
+        if token is not None and not released:
+            manager.coordinator.release(token)
+            released = True
         raise HTTPException(500, str(exc))
+    finally:
+        pass
     if done.get("error"):
+        if token is not None and not released:
+            manager.coordinator.release(token)
         raise HTTPException(500, done["error"])
-    global _last_generation
-    _last_generation = {
-        "n": (_last_generation or {}).get("n", 0) + 1,
-        "prompt": next(
-            (m.get("content", "") for m in reversed(req.messages) if m.get("role") == "user"),
-            "",
-        ),
+    last = {
+        "n": ((_last_generation or {}).get("n", 0) + 1),
+        "prompt": next((m.get("content", "") for m in reversed(req.messages) if m.get("role") == "user"), ""),
         "text": done.get("text", ""),
         "stats": done.get("stats"),
     }
-    # nudge any watching UI to refresh once this API generation is done (used by
-    # the "API monitor" mode, which drops the 2s status poll for event-driven refresh)
+    manager.coordinator.publish_last_generation(token, snap.model_session_id, last)
+    if token is not None:
+        manager.coordinator.release(token)
+        released = True
+    _last_generation = last
     for ws in list(_ws_locks):
         try:
             await _ws_send(ws, json.dumps({"type": "api_generation"}))

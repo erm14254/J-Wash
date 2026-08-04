@@ -41,9 +41,14 @@ def _lens_pref_key(source):
 class ActivationCatcher:
     def __init__(self, layers, indices):
         self.acts = {}
-        self._handles = [
-            layers[i].register_forward_hook(self._make(i)) for i in indices
-        ]
+        self._closed = False
+        self._handles = []
+        try:
+            for i in indices:
+                self._handles.append(layers[i].register_forward_hook(self._make(i)))
+        except Exception:
+            self.close()
+            raise
 
     def _make(self, index):
         def hook(module, inputs, output):
@@ -53,9 +58,12 @@ class ActivationCatcher:
         return hook
 
     def close(self):
-        for handle in self._handles:
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        handles, self._handles = self._handles, []
+        for handle in handles:
             handle.remove()
-        self._handles = []
 
 
 def _vocab_fingerprint(tokenizer):
@@ -106,12 +114,16 @@ class LensManager:
         self.gen_store = OrderedDict()
         self._gen_counter = itertools.count(1)
         self._pref_key = None
+        self.binding_id = 0
+        self.model_session_id = None
 
     def load(self, model_manager, *, repo_id=None, filename="lens.pt", revision=None,
              path=None, layers=None, k=8):
         with self._lock:
+            snap = model_manager.session_snapshot() if hasattr(model_manager, "session_snapshot") else None
             if model_manager.hf_model is None:
                 raise ValueError("load a model first")
+            model_session_id = snap.model_session_id if snap is not None else None
             if path:
                 lens = JacobianLens.from_pretrained(path)
                 source = {"path": path, "repo_id": None, "filename": None, "revision": None}
@@ -165,6 +177,8 @@ class LensManager:
                     "local model: cannot verify that the lens matches these exact weights"
                 )
 
+            self.binding_id += 1
+            self.model_session_id = model_session_id
             self.lens = lens
             self.layers = tapped
             self.k = int(k)
@@ -173,6 +187,8 @@ class LensManager:
             self._tok_strs = {}
             self.meta = {
                 **source,
+                "model_session_id": model_session_id,
+                "lens_binding_id": self.binding_id,
                 "model_id": model_meta["model_id"],
                 "model_revision": model_meta.get("revision"),
                 "d_model": lens.d_model,
@@ -202,7 +218,8 @@ class LensManager:
             ).to(device)
             if k:
                 self.k = int(k)
-            self.meta = dict(self.meta, tapped_layers=[int(l) for l in tapped], k=self.k)
+            self.binding_id += 1
+            self.meta = dict(self.meta, lens_binding_id=self.binding_id, tapped_layers=[int(l) for l in tapped], k=self.k)
             if getattr(self, "_pref_key", None):
                 _save_lens_pref(self._pref_key, tapped)
             return self.meta
@@ -216,12 +233,15 @@ class LensManager:
             self._J = None
             self._tok_strs = {}
             self.gen_store.clear()
+            self.model_session_id = None
             torch.cuda.empty_cache()
             return {"unloaded": True}
 
     def start_gen(self):
         gen_id = next(self._gen_counter)
         self.gen_store[gen_id] = {
+            "model_session_id": self.model_session_id,
+            "lens_binding_id": self.binding_id,
             "layers": list(self.layers),
             "residuals": {l: [] for l in self.layers},
             "positions": [],
@@ -235,6 +255,8 @@ class LensManager:
     @torch.no_grad()
     def pin_ranks(self, gen_id, token_ids, jl, chunk=32):
         store = self.gen_store.get(gen_id)
+        if store is not None and (store.get("model_session_id") != self.model_session_id or store.get("lens_binding_id") != self.binding_id):
+            store = None
         if store is None:
             raise ValueError("unknown generation (residual store expired)")
         layers = store["layers"]

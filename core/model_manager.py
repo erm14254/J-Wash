@@ -12,6 +12,7 @@ from huggingface_hub import scan_cache_dir, try_to_load_from_cache
 import config
 import jlens
 from core.lens_manager import ActivationCatcher
+from core.model_session import LoadedModelBundle, ModelSessionCoordinator, OperationConflict, OperationType
 
 SKIP_LOCAL_DIRS = {"vendor", "ui", "data", "hf_cache", "lenses", "core", "api", "scripts"}
 
@@ -453,114 +454,120 @@ class ModelManager:
         self.jl = None
         self.meta = None
         self.capability_profile = None
-        self.busy = None
+        self.coordinator = ModelSessionCoordinator()
+
+    @property
+    def busy(self):
+        return self.coordinator.busy
+
+    def _sync_from_bundle(self, bundle):
+        if bundle is None:
+            self.hf_model = self.tokenizer = self.jl = self.meta = None
+            self.capability_profile = None
+            return
+        self.hf_model = bundle.hf_model
+        self.tokenizer = bundle.tokenizer
+        self.jl = bundle.jl
+        self.meta = dict(bundle.meta)
+        self.capability_profile = bundle.capability_profile
+
+    def session_snapshot(self):
+        return self.coordinator.snapshot()
 
     def list_models(self):
         return _local_models() + _registered_models() + _cached_models()
 
     def load(self, model_id, dtype, quant, device):
-        with self._lock:
-            self._unload_locked()
-            self.busy = "loading"
-            hf_model = tokenizer = None
-            try:
-                torch_dtype = torch.bfloat16 if dtype == "bf16" else torch.float16
-                source = resolve_source(model_id)
-                kwargs = {"dtype": torch_dtype}
-                if quant == "int8":
-                    kwargs["quantization_config"] = transformers.BitsAndBytesConfig(
-                        load_in_8bit=True
-                    )
-                elif quant == "nf4":
-                    kwargs["quantization_config"] = transformers.BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        bnb_4bit_quant_type="nf4",
-                        bnb_4bit_compute_dtype=torch_dtype,
-                        bnb_4bit_use_double_quant=True,
-                    )
-                kwargs["device_map"] = "auto" if device == "auto" else {"": device}
-                # model already present (HF cache or local folder) → load WITHOUT network:
-                # otherwise from_pretrained queries the Hub and fails offline, even if cached.
-                offline_ok = resolve_local_dir(model_id) is not None
-                if offline_ok:
-                    kwargs["local_files_only"] = True
-                tok_kwargs = {"local_files_only": True} if offline_ok else {}
-                started = time.perf_counter()
-                hf_model = transformers.AutoModelForCausalLM.from_pretrained(source, **kwargs)
-                tokenizer = transformers.AutoTokenizer.from_pretrained(source, **tok_kwargs)
-                # "base" models with no chat template: we fetch the real template from
-                # the Hub (instruct sibling with shared tokenizer), generic as a last resort
-                chat_template_source = None
-                if not getattr(tokenizer, "chat_template", None):
-                    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-                    fetched, src = fetch_chat_template(
-                        model_id, token, revision=_resolve_revision(source)
-                    )
-                    if fetched:
-                        tokenizer.chat_template = fetched
-                        chat_template_source = src
-                    else:
-                        tokenizer.chat_template = FALLBACK_CHAT_TEMPLATE
-                        chat_template_source = "generic"
-                chat_template_fallback = chat_template_source == "generic"
-                hf_model.eval()
-                text_config = hf_model.config.get_text_config()
-                self.hf_model = hf_model
-                self.tokenizer = tokenizer
-                self.jl = jlens.from_hf(hf_model, tokenizer)
-                self.jl._jwash_declared_quant = quant
-                # Cache the authoritative fail-closed editing policy once.  In
-                # particular, global projection remains disabled for every topology.
-                from core.capabilities import build_profile, legacy, normalize_profile
-                self.capability_profile = build_profile(self.jl, quant)
-                capability_meta = legacy(self.capability_profile, loaded=True)
-                normalized_profile = normalize_profile(self.capability_profile)
-                self.meta = {
-                    "model_id": model_id,
-                    "revision": _resolve_revision(source),
-                    "dtype": dtype,
-                    "quant": quant,
-                    "device": device,
-                    "n_layers": text_config.num_hidden_layers,
-                    "d_model": text_config.hidden_size,
-                    "has_packed_read_parameters": (
-                        normalized_profile["has_packed_read_parameters"]
-                        if normalized_profile is not None else False
-                    ),
-                    # Includes legacy rebase_supported = safe readthrough support.
-                    **capability_meta,
-                    "chat_template_source": chat_template_source,
-                    "chat_template_fallback": chat_template_fallback,
-                    "load_seconds": round(time.perf_counter() - started, 1),
-                }
-                return self.meta
-            except Exception:
-                # failure (often OOM): drop any partial allocation and return the
-                # reserved blocks, otherwise they linger until the server restarts
-                self.hf_model = self.tokenizer = self.jl = self.meta = None
-                self.capability_profile = None
-                hf_model = None
-                tokenizer = None
+        token = None
+        old_bundle = None
+        candidate = None
+        try:
+            token, snap = self.coordinator.acquire(OperationType.LOAD)
+            expected_session = snap.model_session_id
+            if snap.loaded:
+                old_bundle, expected_session, _ = self.coordinator.withdraw_loaded(token)
+                with self._lock:
+                    self._sync_from_bundle(None)
+                old_bundle = None
                 _free_cuda()
-                raise
-            finally:
-                self.busy = None
+            torch_dtype = torch.bfloat16 if dtype == "bf16" else torch.float16
+            source = resolve_source(model_id)
+            kwargs = {"dtype": torch_dtype}
+            if quant == "int8":
+                kwargs["quantization_config"] = transformers.BitsAndBytesConfig(load_in_8bit=True)
+            elif quant == "nf4":
+                kwargs["quantization_config"] = transformers.BitsAndBytesConfig(
+                    load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch_dtype, bnb_4bit_use_double_quant=True,
+                )
+            kwargs["device_map"] = "auto" if device == "auto" else {"": device}
+            offline_ok = resolve_local_dir(model_id) is not None
+            if offline_ok:
+                kwargs["local_files_only"] = True
+            tok_kwargs = {"local_files_only": True} if offline_ok else {}
+            started = time.perf_counter()
+            hf_model = transformers.AutoModelForCausalLM.from_pretrained(source, **kwargs)
+            tokenizer = transformers.AutoTokenizer.from_pretrained(source, **tok_kwargs)
+            chat_template_source = None
+            if not getattr(tokenizer, "chat_template", None):
+                token_env = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+                fetched, src = fetch_chat_template(model_id, token_env, revision=_resolve_revision(source))
+                if fetched:
+                    tokenizer.chat_template = fetched
+                    chat_template_source = src
+                else:
+                    tokenizer.chat_template = FALLBACK_CHAT_TEMPLATE
+                    chat_template_source = "generic"
+            chat_template_fallback = chat_template_source == "generic"
+            hf_model.eval()
+            text_config = hf_model.config.get_text_config()
+            jl = jlens.from_hf(hf_model, tokenizer)
+            jl._jwash_declared_quant = quant
+            from core.capabilities import build_profile, legacy, normalize_profile
+            capability_profile = build_profile(jl, quant)
+            capability_meta = legacy(capability_profile, loaded=True)
+            normalized_profile = normalize_profile(capability_profile)
+            meta = {
+                "model_id": model_id, "revision": _resolve_revision(source),
+                "dtype": dtype, "quant": quant, "device": device,
+                "n_layers": text_config.num_hidden_layers, "d_model": text_config.hidden_size,
+                "has_packed_read_parameters": (normalized_profile["has_packed_read_parameters"] if normalized_profile is not None else False),
+                **capability_meta,
+                "chat_template_source": chat_template_source,
+                "chat_template_fallback": chat_template_fallback,
+                "load_seconds": round(time.perf_counter() - started, 1),
+            }
+            candidate = LoadedModelBundle.from_parts(hf_model, tokenizer, jl, meta, capability_profile)
+            self.coordinator.publish_loaded(token, candidate, expected_unloaded_session=expected_session)
+            with self._lock:
+                self._sync_from_bundle(candidate)
+            return dict(candidate.meta)
+        except Exception:
+            if candidate is None:
+                _free_cuda()
+            raise
+        finally:
+            if token is not None:
+                self.coordinator.release(token)
 
     def unload(self):
-        with self._lock:
-            return self._unload_locked()
+        token = None
+        try:
+            token, _snap = self.coordinator.acquire(OperationType.UNLOAD)
+            return self._unload_locked(token=token)
+        finally:
+            if token is not None:
+                self.coordinator.release(token)
 
-    def _unload_locked(self):
-        if self.hf_model is None:
-            self.tokenizer = self.jl = self.meta = None
-            self.capability_profile = None
+    def _unload_locked(self, token=None):
+        old, _session, changed = self.coordinator.withdraw_loaded(token)
+        if not changed:
+            with self._lock:
+                self._sync_from_bundle(None)
             return {"unloaded": False, "vram_allocated": _torch_allocated()}
         before = _torch_allocated()
-        self.hf_model = None
-        self.tokenizer = None
-        self.jl = None
-        self.meta = None
-        self.capability_profile = None
+        with self._lock:
+            self._sync_from_bundle(None)
         _free_cuda()
         return {
             "unloaded": True,
@@ -576,12 +583,12 @@ class ModelManager:
         EXTEND — the template leaves its turn open instead of starting a new
         one, and the model picks up where it stopped."""
         hf_model, tokenizer = self.hf_model, self.tokenizer
-        self.busy = "generating"
         reader = None
+        attachment = None
         ok = False
         try:
             if ablator is not None:
-                ablator.attach(self.jl)
+                attachment = ablator.attach(self.jl)
             is_gpt_oss = "gpt-oss" in (self.meta or {}).get("model_id", "").lower()
             template_kwargs = {}
             if is_gpt_oss:
@@ -769,11 +776,11 @@ class ModelManager:
             )
             ok = True
         finally:
-            if ablator is not None:
-                ablator.detach()
+            if attachment is not None:
+                attachment.close()
             if reader is not None:
                 reader.close()
-            self.busy = None
+            self.coordinator = ModelSessionCoordinator()
             # aborted generation (OOM/error/hard stop): the KV cache and captured
             # activations are now dereferenced — return the blocks
             if not ok:
