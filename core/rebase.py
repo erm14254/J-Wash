@@ -397,7 +397,11 @@ def _block_inventory(block, index, hidden, validated_norms):
             child, child_class, f"layer {index} {kind}.{child_name}"
         )
     if discriminator is not None and getattr(block, "layer_type", None) != discriminator:
-        raise ValueError(f"layer {index} mixer discriminator is inconsistent")
+        raise ValueError(
+            f"layer {index} mixer discriminator is inconsistent: "
+            f"block={getattr(block, 'layer_type', None)!r}, mixer="
+            f"{getattr(mixer_module, 'layer_type', None)!r}, expected={discriminator!r}"
+        )
     expected_children = {kind, "mlp", "input_layernorm", "post_attention_layernorm"}
     if set(getattr(block, "_modules", {})) != expected_children:
         raise ValueError(f"layer {index} has unlisted decoder modules")
