@@ -94,7 +94,7 @@ def test_fresh_gguf_bake_requires_capability_profile(tmp_path, monkeypatch):
             SimpleNamespace(name="job", gguf_type="bf16")
         ))
     assert exc.value.status_code == 422
-    assert exc.value.detail == "Load a model to use this operation."
+    assert exc.value.detail == "Capability data is unavailable for this model."
 
 
 @pytest.mark.parametrize("name", ["COM¹", "com²", "COM³.txt", "LPT¹", "lpt².json", "folder/LPT³"])
