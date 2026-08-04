@@ -452,7 +452,13 @@ def _open_verified_directory_chain(snapshots):
 def _strict_inspection_capability():
     """Return whether metadata-preserving startup inspection is available."""
     required_flags = ("O_NOATIME", "O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC")
-    if os.name != "posix" or any(not hasattr(os, name) for name in required_flags):
+    if os.name != "posix":
+        return False
+    for name in required_flags:
+        value = getattr(os, name, 0)
+        if not isinstance(value, int) or isinstance(value, bool) or value == 0:
+            return False
+    if os.scandir not in getattr(os, "supports_fd", ()):
         return False
     if not _OPEN_SUPPORTS_DIR_FD:
         return False
@@ -461,6 +467,17 @@ def _strict_inspection_capability():
     # CPython's POSIX scandir accepts an open directory descriptor.  Windows
     # does not, and is rejected above before any tree access.
     return True
+
+
+def _scandir_inspection_fd(directory_fd):
+    """Open an fd-based iterator or fail closed without a pathname fallback."""
+    try:
+        return os.scandir(directory_fd)
+    except (TypeError, NotImplementedError) as exc:
+        raise _UnsafeAnchoredInspection(
+            "strict metadata-preserving temporary inspection is unavailable: "
+            "fd-based os.scandir is not supported at runtime"
+        ) from exc
 
 
 def _inspection_directory_flags():
@@ -643,7 +660,7 @@ def _revalidate_candidate_full(candidate):
 def _newest_mtime_from_fd(directory_fd, display):
     """Walk one opened directory without following names or updating atime."""
     newest = os.fstat(directory_fd).st_mtime
-    with os.scandir(directory_fd) as entries:
+    with _scandir_inspection_fd(directory_fd) as entries:
         for entry in entries:
             entry_stat = os.stat(
                 entry.name, dir_fd=directory_fd, follow_symlinks=False,
@@ -674,7 +691,7 @@ def _discover_temp_candidates(root, root_chain, result):
     root_fd = _open_inspection_root(root_chain)
 
     def walk(directory_fd, display, relative_chain):
-        with os.scandir(directory_fd) as entries:
+        with _scandir_inspection_fd(directory_fd) as entries:
             for entry in entries:
                 path = display / entry.name
                 try:

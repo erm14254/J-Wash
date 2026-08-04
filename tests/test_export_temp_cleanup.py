@@ -189,6 +189,84 @@ def test_unavailable_strict_inspection_does_not_traverse(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(os.name != "posix", reason="strict O_NOATIME inspection is POSIX-only")
+def test_zero_noatime_capability_fails_before_traversal(tmp_path, monkeypatch):
+    child = tmp_path / "job" / "hf"
+    child.mkdir(parents=True)
+    (child / "config.json").write_bytes(b"cache")
+    watched = [tmp_path, tmp_path / "job", child]
+    before = {path: _set_old_atime(path).st_atime_ns for path in watched}
+    monkeypatch.setattr(os, "O_NOATIME", 0)
+    monkeypatch.setattr(os, "open", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(os, "scandir", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(os, "walk", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(Path, "iterdir", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(Path, "rglob", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
+
+    result = _inspect(tmp_path)
+
+    assert editing._strict_inspection_capability() is False
+    assert result["errors"] and "unavailable" in result["errors"][0]["error"]
+    assert not any(result[key] for key in (
+        "active", "recent", "completed", "abandoned", "changed_or_unsafe",
+    ))
+    assert all(path.stat().st_atime_ns == before[path] for path in watched)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="strict O_NOATIME inspection is POSIX-only")
+def test_missing_fd_scandir_capability_fails_before_traversal(tmp_path, monkeypatch):
+    child = tmp_path / "job"
+    child.mkdir()
+    before = {path: _set_old_atime(path).st_atime_ns for path in (tmp_path, child)}
+    monkeypatch.setattr(os, "supports_fd", set(os.supports_fd) - {os.scandir})
+    monkeypatch.setattr(os, "open", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
+    monkeypatch.setattr(os, "scandir", lambda *a, **k: (_ for _ in ()).throw(AssertionError()))
+
+    result = _inspect(tmp_path)
+
+    assert editing._strict_inspection_capability() is False
+    assert result["errors"] and "unavailable" in result["errors"][0]["error"]
+    assert not any(result[key] for key in (
+        "active", "recent", "completed", "abandoned", "changed_or_unsafe",
+    ))
+    assert all(path.stat().st_atime_ns == before[path] for path in (tmp_path, child))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="strict O_NOATIME inspection is POSIX-only")
+def test_advertised_fd_scandir_runtime_failure_is_controlled(tmp_path, monkeypatch):
+    child = tmp_path / "job"
+    child.mkdir()
+    before = {path: _set_old_atime(path).st_atime_ns for path in (tmp_path, child)}
+    real_open = os.open
+    opened = []
+
+    def tracking_open(*args, **kwargs):
+        fd = real_open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    def reject_fd(path):
+        if isinstance(path, int):
+            raise TypeError("fd scandir unavailable")
+        raise AssertionError("pathname scandir fallback attempted")
+
+    monkeypatch.setattr(os, "open", tracking_open)
+    monkeypatch.setattr(os, "scandir", reject_fd)
+    monkeypatch.setattr(os, "supports_fd", set(os.supports_fd) | {reject_fd})
+
+    result = _inspect(tmp_path)
+
+    assert result["errors"] and "fd-based os.scandir" in result["errors"][0]["error"]
+    assert not any(result[key] for key in (
+        "active", "recent", "completed", "abandoned", "changed_or_unsafe",
+    ))
+    assert opened
+    for fd in opened:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+    assert all(path.stat().st_atime_ns == before[path] for path in (tmp_path, child))
+
+
+@pytest.mark.skipif(os.name != "posix", reason="strict O_NOATIME inspection is POSIX-only")
 def test_root_noatime_denial_has_no_fallback(tmp_path, monkeypatch):
     _gguf(tmp_path)
     before = _set_old_atime(tmp_path)
