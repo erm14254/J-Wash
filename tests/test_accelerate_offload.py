@@ -58,9 +58,9 @@ def test_profile_construction_inspects_each_unique_norm_once(monkeypatch):
     before = [parameter.device for parameter in jl._hf_model.parameters()]
     calls = []
     original = rebase.validate_rms_norm
-    def counted(norm, hidden, name="RMSNorm"):
+    def counted(norm, hidden, name="RMSNorm", expected=None):
         calls.append(id(norm))
-        return original(norm, hidden, name)
+        return original(norm, hidden, name, expected)
     monkeypatch.setattr(rebase, "validate_rms_norm", counted)
     profile = capabilities.build_profile(jl, None)
     assert capabilities.normalize_profile(profile) is not None

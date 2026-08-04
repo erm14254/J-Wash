@@ -41,9 +41,9 @@ def test_capabilities_fail_closed_and_dense_exact_is_positive():
         writer = dense.linear_attn.out_proj if linear else dense.self_attn.o_proj
         writer.bias = nn.Parameter(torch.zeros(8))
         cap = rebase.block_capabilities(dense)
-        assert cap.readthrough_supported and not cap.exact_supported and "unsupported" in cap.exact_reason
+        assert not cap.readthrough_supported
         writer.bias = None; writer.weight = nn.Parameter(torch.zeros(7, 8))
-        assert "unsupported" in rebase.block_capabilities(dense).exact_reason
+        assert not rebase.block_capabilities(dense).exact_supported
     b = block(); del b.mlp.shared_expert_gate
     assert not rebase.block_capabilities(b).readthrough_supported
     b = block(); b.linear_attn = nn.Module()
@@ -103,7 +103,7 @@ def test_modified_and_noncanonical_dense_topologies_fail_closed():
         rebase.model_preflight(jl)
     jl = dense_lens()
     jl.layers[0].adapter = nn.Linear(8, 8, False)
-    with pytest.raises(ValueError, match="unlisted"):
+    with pytest.raises(ValueError, match="inventory is not audited"):
         rebase.model_preflight(jl)
     jl = dense_lens()
     jl.layers[0].forward = lambda hidden: hidden
@@ -156,7 +156,7 @@ def test_head_embedding_storage_aliases_and_execution_state_fail_closed():
     jl = dense_lens()
     torch.nn.utils.parametrize.register_parametrization(
         jl.layers[0].self_attn.q_proj, "weight", nn.Identity())
-    with pytest.raises(ValueError, match="parameterization|child inventory"):
+    with pytest.raises(ValueError, match="parameterization|child inventory|class is not audited"):
         rebase.model_preflight(jl)
 
 
@@ -250,7 +250,7 @@ def test_norm_semantics_and_final_norm_preflight(tiny):
         setattr(dense, "input_layernorm" if where == "input" else "post_attention_layernorm",
                 nn.LayerNorm(8, bias=False))
         cap = rebase.block_capabilities(dense)
-        assert not cap.readthrough_supported and "LayerNorm" in cap.readthrough_reason
+        assert not cap.readthrough_supported and "class is not audited" in cap.readthrough_reason
     bad = lens(tiny); bad._final_norm = nn.LayerNorm(32, bias=False)
     with pytest.raises(ValueError, match="LayerNorm"):
         rebase.model_preflight(bad)
@@ -308,7 +308,8 @@ def test_production_width_qwen35_moe_block_capability(hidden, monkeypatch):
     b.post_attention_layernorm = Qwen3_5MoeRMSNorm(hidden).to(torch.bfloat16)
     monkeypatch.setitem(rebase.AUDITED_DECODER_SPECS, type(b),
                         replace(SYNTHETIC_PACKED_SPEC,
-                                decoder=rebase.class_contract(type(b))))
+                                decoder=rebase.class_contract(type(b)),
+                                norm_class=rebase.class_contract(Qwen3_5MoeRMSNorm)))
     cap = rebase.block_capabilities(b)
     assert cap.readthrough_supported and not cap.exact_supported
 
@@ -366,7 +367,7 @@ def test_adversarial_norms_fail_closed(tiny, site, kind):
         assert not cap.readthrough_supported and not cap.exact_supported
 
 
-def test_live_read_hook_uses_bf16_output_not_fp32_gain(tiny):
+def test_live_read_rejects_instance_overridden_norm(tiny):
     import types
     def mixed_model():
         model = copy.deepcopy(tiny).bfloat16().eval()
@@ -378,18 +379,10 @@ def test_live_read_hook_uses_bf16_output_not_fp32_gain(tiny):
             norm.forward = types.MethodType(
                 lambda self, x: type(self).forward(self, x).to(x.dtype), norm)
         return model
-    model, oracle_model = mixed_model(), mixed_model()
-    rules = rules_for(model); ids = torch.tensor([[1, 8, 4]])
-    oracle_rules = rules_for(oracle_model); oracle_sites = oracle_handles(oracle_model, oracle_rules)
-    with torch.no_grad(): oracle_logits = oracle_model(ids).logits
-    for handle in oracle_sites: handle.remove()
-    iv = Interventions(); iv._rules = rules; iv.set_mode("readthrough"); iv.attach(lens(model))
-    try:
-        with torch.no_grad(): got = model(ids).logits
-        assert got.dtype == torch.bfloat16 and torch.isfinite(got).all()
-        torch.testing.assert_close(got, oracle_logits, rtol=4e-3, atol=4e-3)
-    finally:
-        iv.detach()
+    model = mixed_model(); rules = rules_for(model)
+    iv = Interventions(); iv._rules = rules; iv.set_mode("readthrough")
+    with pytest.raises(ValueError, match="forward provenance"):
+        iv.attach(lens(model))
     assert iv._handles == [] and all(len(module._forward_hooks) == 0 for module in model.modules())
 
 

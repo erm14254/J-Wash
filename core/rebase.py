@@ -511,7 +511,8 @@ def _block_inventory(block, index, hidden, validated_norms):
                 f"block={block_discriminator!r}, mixer={mixer_discriminator!r}, "
                 f"expected={discriminator!r}"
             )
-    if kind == "linear_attn" and spec.packed:
+    if (kind == "linear_attn" and spec.packed
+            and mixer_class.cls is qwen_moe_modeling.Qwen3_5MoeGatedDeltaNet):
         dt_bias, a_log = mixer_module.dt_bias, mixer_module.A_log
         if (dt_bias.ndim != 1 or a_log.ndim != 1 or dt_bias.shape != a_log.shape
                 or not dt_bias.dtype.is_floating_point or not a_log.dtype.is_floating_point):
