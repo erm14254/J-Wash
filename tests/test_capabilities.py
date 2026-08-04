@@ -214,6 +214,29 @@ def test_packed_exact_denies_before_norm_materialization(tiny, layer, monkeypatc
     assert iv._handles == []
 
 
+def test_qwen_nested_storage_and_hooks_fail_closed(tiny):
+    model = copy.deepcopy(tiny); jl = lens(model)
+    linear = model.model.layers[0].linear_attn
+    linear.dt_bias = nn.Parameter(linear.dt_bias.reshape(1, -1))
+    with pytest.raises(ValueError, match="raw parameters"):
+        rebase.model_preflight(jl)
+
+    model = copy.deepcopy(tiny); jl = lens(model)
+    experts = model.model.layers[0].mlp.experts
+    experts.down_proj = nn.Parameter(experts.down_proj[..., :-1])
+    with pytest.raises(ValueError, match="packed expert storage"):
+        rebase.model_preflight(jl)
+
+    model = copy.deepcopy(tiny); jl = lens(model)
+    handle = model.model.layers[0].mlp.register_forward_hook(
+        lambda _module, _inputs, output: output)
+    try:
+        with pytest.raises(ValueError, match="execution hooks"):
+            rebase.model_preflight(jl)
+    finally:
+        handle.remove()
+
+
 def test_api_and_legacy_capability_fields(tiny):
     meta = _rebase_capability_meta(lens(tiny))
     assert meta["readthrough_supported"] and meta["rebase_supported"]
