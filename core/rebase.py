@@ -161,6 +161,11 @@ AUDITED_DECODER_SPECS = {
         TopologySpec(("self_attn", "linear_attn"), packed=True),
 }
 
+_AUDITED_PACKED_ROUTERS = {
+    ("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe",
+     "Qwen3_5MoeTopKRouter"),
+}
+
 
 _MOE_READS = (
     TransformTarget("mlp.gate.weight", "mlp.gate", "post_attention_layernorm"),
@@ -342,6 +347,11 @@ def _block_inventory(block, index, hidden, validated_norms):
         if raw_packed:
             if not isinstance(module, torch.nn.Parameter) or tensor.ndim != 3:
                 raise ValueError(f"layer {index} packed reader {target.state_suffix} is modified")
+        elif (target.accessor == "mlp.gate" and spec.packed and
+              ((type(module).__module__, type(module).__name__) in _AUDITED_PACKED_ROUTERS
+               or type(module) is torch.nn.Linear)):
+            if tensor.ndim != 2:
+                raise ValueError(f"layer {index} packed router storage is modified")
         elif (type(module) is not torch.nn.Linear or tensor.ndim != 2):
             raise ValueError(f"layer {index} reader {target.state_suffix} is not an audited Linear")
         if not tensor.dtype.is_floating_point or tensor.shape[target.axis] != hidden:

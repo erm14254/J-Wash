@@ -45,7 +45,8 @@ def test_actual_auto_disk_offload_norm_inspection(tmp_path):
     U, V = torch.randn(128, 1), torch.randn(128, 1)
     Ug, Vg = rebase.gamma_pair(offloaded, U, V)
     assert torch.isfinite(Ug).all() and torch.isfinite(Vg).all()
-    jl = lens(loaded); first = _rebase_capability_meta(jl); second = _rebase_capability_meta(jl)
+    jl = lens(loaded); rebase.model_inventory(jl)
+    first = _rebase_capability_meta(jl); second = _rebase_capability_meta(jl)
     assert first["readthrough_supported"] and second == first
     assert offloaded.weight.device == before
     with torch.no_grad(): output = loaded(torch.tensor([[1, 2, 3]]))
