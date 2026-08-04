@@ -400,7 +400,8 @@ def _block_inventory(block, index, hidden, validated_norms):
         block_discriminator = getattr(block, "layer_type", None)
         mixer_discriminator = getattr(mixer_module, "layer_type", None)
         if (block_discriminator not in (None, discriminator) or
-                mixer_discriminator != discriminator):
+                mixer_discriminator not in (None, discriminator) or
+                discriminator not in (block_discriminator, mixer_discriminator)):
             raise ValueError(
                 f"layer {index} mixer discriminator is inconsistent: "
                 f"block={block_discriminator!r}, mixer={mixer_discriminator!r}, "
@@ -435,8 +436,15 @@ def _block_inventory(block, index, hidden, validated_norms):
                              (torch.nn.Linear.__module__, torch.nn.Linear.__name__)
                              else ("weight",))
         _validate_direct_inventory(router, (), router_parameters, f"layer {index} router")
-        _validate_direct_inventory(experts, (), ("gate_up_proj", "down_proj"),
+        experts_modules = (("act_fn",) if spec.experts_class ==
+                           (_QWEN_MOE, "Qwen3_5MoeExperts") else ())
+        _validate_direct_inventory(experts, experts_modules,
+                                   ("gate_up_proj", "down_proj"),
                                    f"layer {index} experts")
+        if "act_fn" in experts_modules:
+            validate_forward_provenance(
+                experts.act_fn, _SILU, f"layer {index} experts.act_fn"
+            )
         shared_modules = (("gate_proj", "up_proj", "down_proj", "act_fn")
                           if spec.shared_expert_class == (_QWEN_MOE, "Qwen3_5MoeMLP")
                           else ("gate_proj", "up_proj", "down_proj"))
