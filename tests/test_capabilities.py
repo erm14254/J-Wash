@@ -561,3 +561,98 @@ def test_superscript_reserved_index_shard_is_rejected(tiny, tmp_path, monkeypatc
     with pytest.raises(ValueError, match="reserved"):
         editing.export_rebase(rules_for(tiny), lens(tiny), {"dtype": "fp32"},
                               fmt="full", name="bad-index", source_dir=source)
+
+
+def test_qwen_full_attention_head_arithmetic_fail_closed(tiny):
+    assert rebase.model_preflight(lens(tiny)).packed
+
+    mutations = []
+    model = copy.deepcopy(tiny); model.config.num_attention_heads = 3; mutations.append((model, "grouping"))
+    model = copy.deepcopy(tiny); layer = model.model.layers[1]
+    layer.self_attn.q_proj.weight = nn.Parameter(layer.self_attn.q_proj.weight[:-1].clone()); mutations.append((model, "attention projection"))
+    model = copy.deepcopy(tiny); layer = model.model.layers[1]
+    layer.self_attn.k_proj.weight = nn.Parameter(layer.self_attn.k_proj.weight[:-1].clone()); mutations.append((model, "attention projection"))
+    model = copy.deepcopy(tiny); model.config.head_dim = 0; mutations.append((model, "head_dim"))
+    model = copy.deepcopy(tiny); layer = model.model.layers[1]
+    layer.self_attn.q_norm.weight = nn.Parameter(torch.ones(layer.self_attn.q_norm.weight.numel() + 1)); mutations.append((model, "q_norm"))
+    for model, phrase in mutations:
+        with pytest.raises(ValueError, match=phrase):
+            rebase.model_preflight(lens(model))
+        assert not capabilities.build_profile(lens(model), None)["modes"]["readthrough"]["supported"]
+
+
+def test_qwen_linear_attention_arithmetic_fail_closed(tiny):
+    assert rebase.model_preflight(lens(tiny)).packed
+    cases = []
+    model = copy.deepcopy(tiny); model.config.linear_num_key_heads = 0; cases.append((model, "key-head"))
+    model = copy.deepcopy(tiny); model.config.linear_num_value_heads = 0; cases.append((model, "value-head"))
+    model = copy.deepcopy(tiny); model.config.linear_num_key_heads = 3; cases.append((model, "grouping"))
+    model = copy.deepcopy(tiny); la = model.model.layers[0].linear_attn
+    la.in_proj_qkv.weight = nn.Parameter(la.in_proj_qkv.weight[:-1].clone()); cases.append((model, "raw parameters"))
+    model = copy.deepcopy(tiny); la = model.model.layers[0].linear_attn
+    la.in_proj_z.weight = nn.Parameter(la.in_proj_z.weight[:-1].clone()); cases.append((model, "raw parameters"))
+    model = copy.deepcopy(tiny); la = model.model.layers[0].linear_attn
+    la.in_proj_b.weight = nn.Parameter(la.in_proj_b.weight.repeat(2, 1)); cases.append((model, "raw parameters"))
+    model = copy.deepcopy(tiny); la = model.model.layers[0].linear_attn
+    la.dt_bias = nn.Parameter(torch.ones(la.dt_bias.numel() + 1)); cases.append((model, "raw parameters"))
+    model = copy.deepcopy(tiny); la = model.model.layers[0].linear_attn
+    la.conv1d.groups = max(1, la.conv1d.groups - 1); cases.append((model, "raw parameters"))
+    model = copy.deepcopy(tiny); la = model.model.layers[0].linear_attn
+    la.out_proj.weight = nn.Parameter(la.out_proj.weight[:, :-1].clone()); cases.append((model, "raw parameters"))
+    for model, phrase in cases:
+        with pytest.raises(ValueError, match=phrase):
+            rebase.model_preflight(lens(model))
+
+
+def test_qwen_router_expert_count_and_topk_fail_closed(tiny):
+    cases = []
+    model = copy.deepcopy(tiny); model.config.num_experts = 0; cases.append((model, "expert count"))
+    model = copy.deepcopy(tiny); model.config.num_experts_per_tok = 0; cases.append((model, "top-k"))
+    model = copy.deepcopy(tiny); model.config.num_experts_per_tok = -1; cases.append((model, "top-k"))
+    model = copy.deepcopy(tiny); model.config.num_experts_per_tok = model.config.num_experts + 1; cases.append((model, "top-k"))
+    model = copy.deepcopy(tiny); mlp = model.model.layers[0].mlp
+    mlp.gate.weight = nn.Parameter(mlp.gate.weight[:-1].clone()); cases.append((model, "expert storage"))
+    model = copy.deepcopy(tiny); experts = model.model.layers[0].mlp.experts
+    experts.gate_up_proj = nn.Parameter(experts.gate_up_proj[:-1].clone()); cases.append((model, "expert storage"))
+    model = copy.deepcopy(tiny); experts = model.model.layers[0].mlp.experts
+    experts.down_proj = nn.Parameter(experts.down_proj[:-1].clone()); cases.append((model, "expert storage"))
+    for model, phrase in cases:
+        with pytest.raises(ValueError, match=phrase):
+            rebase.model_preflight(lens(model))
+
+    lower = copy.deepcopy(tiny); lower.config.num_experts_per_tok = 1
+    assert rebase.model_preflight(lens(lower)).packed
+    upper = copy.deepcopy(tiny); upper.config.num_experts_per_tok = upper.config.num_experts
+    assert rebase.model_preflight(lens(upper)).packed
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_qwen_gated_norm_nonfinite_gain_fails_closed(tiny, value):
+    model = copy.deepcopy(tiny)
+    norm = model.model.layers[0].linear_attn.norm
+    norm.weight.data[0] = value
+    with pytest.raises(ValueError, match="nonfinite"):
+        rebase.model_preflight(lens(model))
+    assert not capabilities.build_profile(lens(model), None)["modes"]["readthrough"]["supported"]
+
+
+def test_final_norm_storage_overlap_is_authoritative():
+    jl = dense_lens()
+    source = jl.layers[0].self_attn.q_proj.weight
+    jl._final_norm.weight = nn.Parameter(source.reshape(-1)[:8])
+    with pytest.raises(ValueError, match="final norm storage aliases"):
+        rebase.model_preflight(jl)
+
+    jl = dense_lens()
+    storage = torch.randn(18, 8)
+    jl._embed_tokens.weight = nn.Parameter(storage[:17])
+    jl._final_norm.weight = nn.Parameter(storage.reshape(-1)[:8])
+    with pytest.raises(ValueError, match="embedding or head storage aliases|final norm storage"):
+        rebase.model_preflight(jl)
+
+    jl = dense_lens()
+    storage = torch.randn(18, 8)
+    jl._lm_head.weight = nn.Parameter(storage[:17])
+    jl._final_norm.weight = nn.Parameter(storage.reshape(-1)[:8])
+    with pytest.raises(ValueError, match="embedding or head storage aliases|final norm storage"):
+        rebase.model_preflight(jl)

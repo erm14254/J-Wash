@@ -303,6 +303,29 @@ def _overlaps(left, right):
             and max(left.start, right.start) < min(left.end, right.end))
 
 
+def _positive_int(value, label):
+    if not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{label} is not a positive integer")
+    return value
+
+
+def _finite_float(value, label):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{label} is not finite")
+    if not torch.isfinite(torch.tensor(number)):
+        raise ValueError(f"{label} is not finite")
+    return number
+
+
+def _config_attr(config, name, label):
+    value = getattr(config, name, None)
+    if value is None:
+        raise ValueError(f"{label} is missing required config field {name}")
+    return value
+
+
 _LINEAR = class_contract(torch.nn.Linear)
 _EMBEDDING = class_contract(torch.nn.Embedding)
 _CONV1D = class_contract(torch.nn.Conv1d)
@@ -470,7 +493,13 @@ def validate_rms_norm(norm, hidden, name="RMSNorm", expected=None):
     return norm
 
 
-def _block_inventory(block, index, hidden, validated_norms):
+def _block_inventory(block, index, hidden, validated_norms, config=None):
+    if config is None:
+        for owner in (block, getattr(block, "self_attn", None), getattr(block, "linear_attn", None),
+                      getattr(block, "mlp", None)):
+            config = getattr(owner, "config", None)
+            if config is not None:
+                break
     spec = AUDITED_DECODER_SPECS.get(type(block))
     if spec is None:
         raise ValueError(f"layer {index} decoder class or forward is not audited")
@@ -540,26 +569,76 @@ def _block_inventory(block, index, hidden, validated_norms):
             llama_modeling.LlamaDecoderLayer, qwen_moe_modeling.Qwen3_5MoeDecoderLayer):
         q, k, v, o = (mixer_module.q_proj.weight, mixer_module.k_proj.weight,
                       mixer_module.v_proj.weight, mixer_module.o_proj.weight)
-        num_heads = getattr(mixer_module, "num_heads", None)
-        num_kv_heads = getattr(mixer_module, "num_key_value_heads", None)
-        head_dim = getattr(mixer_module, "head_dim", None)
-        scaling = getattr(mixer_module, "scaling", None)
-        if isinstance(num_heads, int) and isinstance(head_dim, int):
-            q_out = num_heads * head_dim
-            if q.shape[0] != q_out or o.shape[1] != q_out:
-                raise ValueError(f"layer {index} attention projection dimensions are modified")
-        if isinstance(num_kv_heads, int) and isinstance(head_dim, int):
-            kv_out = num_kv_heads * head_dim
-            if k.shape[0] != kv_out or v.shape[0] != kv_out:
-                raise ValueError(f"layer {index} attention projection dimensions are modified")
-        if (k.shape != v.shape or o.shape[0] != hidden
+        if config is not None:
+            q_heads = _positive_int(_config_attr(config, "num_attention_heads", f"layer {index} attention"),
+                                    f"layer {index} query head count")
+            kv_heads = _positive_int(_config_attr(config, "num_key_value_heads", f"layer {index} attention"),
+                                     f"layer {index} key/value head count")
+            head_dim_value = getattr(config, "head_dim", None)
+            if head_dim_value is None:
+                if hidden % q_heads != 0:
+                    raise ValueError(f"layer {index} attention head dimension is not integral")
+                head_dim_value = hidden // q_heads
+            head_dim = _positive_int(head_dim_value, f"layer {index} head_dim")
+            if q_heads % kv_heads != 0:
+                raise ValueError(f"layer {index} attention grouping is not integral")
+            query_width = q_heads * head_dim
+            kv_width = kv_heads * head_dim
+        else:
+            head_dim = _positive_int(getattr(mixer_module, "head_dim", None), f"layer {index} head_dim")
+            query_width = o.shape[1]
+            kv_width = k.shape[0]
+            if query_width % head_dim != 0 or kv_width % head_dim != 0:
+                raise ValueError(f"layer {index} attention grouping is not integral")
+            q_heads, kv_heads = query_width // head_dim, kv_width // head_dim
+            if q_heads <= 0 or kv_heads <= 0 or q_heads % kv_heads != 0:
+                raise ValueError(f"layer {index} attention grouping is not integral")
+        q_rows = query_width
+        if spec.decoder.cls is qwen_moe_modeling.Qwen3_5MoeDecoderLayer:
+            q_rows = 2 * query_width
+            for norm_name in ("q_norm", "k_norm"):
+                norm = getattr(mixer_module, norm_name, None)
+                if getattr(getattr(norm, "weight", None), "numel", lambda: None)() != head_dim:
+                    raise ValueError(f"layer {index} {norm_name} width is inconsistent with head_dim")
+        expected_scale = head_dim ** -0.5
+        scaling = getattr(mixer_module, "scaling", expected_scale)
+        if abs(_finite_float(scaling, f"layer {index} attention scaling") - expected_scale) > 1e-12:
+            raise ValueError(f"layer {index} attention scaling is modified")
+        if (q.shape[0] != q_rows or k.shape[0] != kv_width or v.shape[0] != kv_width
+                or k.shape != v.shape or o.shape[1] != query_width or o.shape[0] != hidden
                 or any(weight.shape[1] != hidden for weight in (q, k, v))
                 or not all(weight.dtype.is_floating_point for weight in (q, k, v, o))):
             raise ValueError(f"layer {index} attention projection dimensions are modified")
-        if scaling is not None and not isinstance(scaling, (float, int)):
-            raise ValueError(f"layer {index} attention configuration is modified")
     if (kind == "linear_attn" and spec.packed
             and mixer_class.cls is qwen_moe_modeling.Qwen3_5MoeGatedDeltaNet):
+        if config is not None:
+            key_heads = _positive_int(_config_attr(config, "linear_num_key_heads", f"layer {index} linear attention"),
+                                      f"layer {index} linear key-head count")
+            value_heads = _positive_int(_config_attr(config, "linear_num_value_heads", f"layer {index} linear attention"),
+                                        f"layer {index} linear value-head count")
+            key_dim = _positive_int(_config_attr(config, "linear_key_head_dim", f"layer {index} linear attention"),
+                                    f"layer {index} linear key head_dim")
+            value_dim = _positive_int(_config_attr(config, "linear_value_head_dim", f"layer {index} linear attention"),
+                                      f"layer {index} linear value head_dim")
+            conv_kernel = _positive_int(
+                _config_attr(config, "linear_conv_kernel_dim", f"layer {index} linear attention"),
+                f"layer {index} linear convolution kernel")
+        else:
+            key_heads = _positive_int(getattr(mixer_module, "num_k_heads", None),
+                                      f"layer {index} linear key-head count")
+            value_heads = _positive_int(getattr(mixer_module, "num_v_heads", None),
+                                        f"layer {index} linear value-head count")
+            key_dim = _positive_int(getattr(mixer_module, "head_k_dim", None),
+                                    f"layer {index} linear key head_dim")
+            value_dim = _positive_int(getattr(mixer_module, "head_v_dim", None),
+                                      f"layer {index} linear value head_dim")
+            conv_kernel = _positive_int(getattr(mixer_module, "conv_kernel_size", None),
+                                        f"layer {index} linear convolution kernel")
+        if value_heads % key_heads != 0:
+            raise ValueError(f"layer {index} linear attention value/key grouping is not integral")
+        key_width = key_heads * key_dim
+        value_width = value_heads * value_dim
+        qkv_rows = 2 * key_width + value_width
         dt_bias, a_log = mixer_module.dt_bias, mixer_module.A_log
         conv = mixer_module.conv1d
         qkv, z, b, a, out_proj = (mixer_module.in_proj_qkv.weight,
@@ -567,13 +646,32 @@ def _block_inventory(block, index, hidden, validated_norms):
                                   mixer_module.in_proj_b.weight,
                                   mixer_module.in_proj_a.weight,
                                   mixer_module.out_proj.weight)
-        if (dt_bias.ndim != 1 or a_log.ndim != 1 or dt_bias.shape != a_log.shape
+
+        gated_weight = getattr(mixer_module.norm, "weight", None)
+        if (gated_weight is None or tuple(gated_weight.shape) != (value_dim,)
+                or not gated_weight.dtype.is_floating_point):
+            raise ValueError(f"layer {index} linear gated norm has wrong hidden width")
+        gated_gain = materialize_parameter_for_inspection(mixer_module.norm, "weight")
+        if not bool(torch.isfinite(gated_gain).all()):
+            raise ValueError(f"layer {index} linear gated norm gain is nonfinite")
+        gated_epsilon = getattr(mixer_module.norm, "variance_epsilon",
+                               getattr(mixer_module.norm, "eps", None))
+        if (not isinstance(gated_epsilon, (float, int))
+                or not (0 < float(gated_epsilon) < 1)
+                or not torch.isfinite(torch.tensor(float(gated_epsilon)))):
+            raise ValueError(f"layer {index} linear gated norm epsilon is invalid")
+        recurrent_heads = value_heads
+        if (dt_bias.ndim != 1 or a_log.ndim != 1 or dt_bias.shape != (recurrent_heads,)
+                or a_log.shape != (recurrent_heads,)
                 or not dt_bias.dtype.is_floating_point or not a_log.dtype.is_floating_point
-                or qkv.shape[1] != hidden or any(weight.shape[1] != hidden for weight in (z, b, a))
-                or out_proj.shape[0] != hidden or out_proj.shape[1] != z.shape[0]
+                or qkv.shape != (qkv_rows, hidden) or z.shape != (value_width, hidden)
+                or b.shape != (recurrent_heads, hidden) or a.shape != (recurrent_heads, hidden)
+                or out_proj.shape != (hidden, value_width)
                 or conv.weight.ndim != 3 or conv.bias is not None
-                or conv.groups != conv.in_channels or conv.weight.shape[0] != conv.in_channels
-                or conv.weight.shape[1] != 1):
+                or conv.in_channels != qkv_rows or conv.out_channels != qkv_rows
+                or conv.groups != qkv_rows or conv.weight.shape[0] != qkv_rows
+                or conv.weight.shape[1] != 1
+                or conv.weight.shape[2] != conv_kernel):
             raise ValueError(f"layer {index} linear attention raw parameters are modified")
     expected_children = {kind, "mlp", "input_layernorm", "post_attention_layernorm"}
     _validate_direct_inventory(block, expected_children, (), f"layer {index} decoder")
@@ -612,9 +710,20 @@ def _block_inventory(block, index, hidden, validated_norms):
                                    ("gate_up_proj", "down_proj"),
                                    f"layer {index} experts")
         gate_up, down = experts.gate_up_proj, experts.down_proj
+        enforce_router_count = config is not None and spec.decoder.cls is qwen_moe_modeling.Qwen3_5MoeDecoderLayer
+        if enforce_router_count:
+            num_experts = _positive_int(_config_attr(config, "num_experts", f"layer {index} MoE"),
+                                        f"layer {index} expert count")
+            top_k = getattr(config, "num_experts_per_tok", getattr(config, "top_k", None))
+            top_k = _positive_int(top_k, f"layer {index} MoE top-k")
+        else:
+            num_experts, top_k = gate_up.shape[0], 1
+        if top_k > num_experts:
+            raise ValueError(f"layer {index} MoE top-k exceeds expert count")
         if (gate_up.ndim != 3 or down.ndim != 3
                 or not gate_up.dtype.is_floating_point or not down.dtype.is_floating_point
-                or gate_up.shape[0] != down.shape[0]
+                or gate_up.shape[0] != num_experts or down.shape[0] != num_experts
+                or (enforce_router_count and router.weight.shape[0] != num_experts)
                 or gate_up.shape[1] != 2 * down.shape[2]
                 or gate_up.shape[2] != hidden or down.shape[1] != hidden):
             raise ValueError(f"layer {index} packed expert storage is modified")
@@ -736,6 +845,7 @@ def model_inventory(jl):
     validate_forward_provenance(embed, _EMBEDDING, "embedding")
     _validate_direct_inventory(embed, (), ("weight",), "embedding")
     hidden = embed_weight.shape[-1]
+    config = getattr(getattr(jl, "_hf_model", None), "config", None)
     blocks, validated_norms = [], set()
     block_ids, norm_layers, module_sites, tensor_sites, names = set(), {}, {}, {}, set()
     family = None
@@ -749,7 +859,7 @@ def model_inventory(jl):
             family = type(block)
         elif type(block) is not family:
             raise ValueError("mixed decoder families are not audited")
-        inventory = _block_inventory(block, index, hidden, validated_norms)
+        inventory = _block_inventory(block, index, hidden, validated_norms, config)
         for norm_name, norm in inventory.norms:
             previous = norm_layers.setdefault(id(norm), index)
             if previous != index:
@@ -791,6 +901,13 @@ def model_inventory(jl):
         raise ValueError("final norm aliases a decoder block norm")
     final_spec = AUDITED_DECODER_SPECS[family]
     validate_rms_norm(final_norm, hidden, "final norm", final_spec.norm_class)
+    final_norm_weight = getattr(final_norm, "weight", None)
+    final_norm_span = storage_span(final_norm_weight)
+    if any(_overlaps(final_norm_span, prior) for prior in decoder_spans):
+        raise ValueError("final norm storage aliases another audited site")
+    if final_norm_span is not None:
+        decoder_spans.append(final_norm_span)
+        decoder_tensor_ids.add(id(final_norm_weight))
     head = getattr(jl, "_lm_head", None)
     head_weight = getattr(head, "weight", None)
     validate_forward_provenance(
@@ -812,8 +929,10 @@ def model_inventory(jl):
         head_span = _offloaded_registered_span(head, "weight", head_weight)
     if embed_span is None and embed_weight is not head_weight:
         embed_span = _offloaded_registered_span(embed, "weight", embed_weight)
-    config = getattr(getattr(jl, "_hf_model", None), "config", None)
-    declared_tie = getattr(config, "tie_word_embeddings", False) is True
+    declared_tie_value = getattr(config, "tie_word_embeddings", False)
+    if type(declared_tie_value) is not bool:
+        raise ValueError("tie_word_embeddings must be a boolean")
+    declared_tie = declared_tie_value is True
     tied = head_weight is embed_weight
     if declared_tie != tied:
         raise ValueError("embedding/head tie declaration does not match physical parameters")
