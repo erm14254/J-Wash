@@ -50,3 +50,27 @@ def test_actual_auto_disk_offload_norm_inspection(tmp_path):
     assert offloaded.weight.device == before
     with torch.no_grad(): output = loaded(torch.tensor([[1, 2, 3]]))
     assert torch.isfinite(output.logits).all() and offloaded.weight.device == before
+
+
+def test_profile_construction_inspects_each_unique_norm_once(monkeypatch):
+    jl = dense_lens()
+    before = [parameter.device for parameter in jl._hf_model.parameters()]
+    calls = []
+    original = rebase.validate_rms_norm
+    def counted(norm, hidden, name="RMSNorm"):
+        calls.append(id(norm))
+        return original(norm, hidden, name)
+    monkeypatch.setattr(rebase, "validate_rms_norm", counted)
+    profile = capabilities.build_profile(jl, None)
+    assert capabilities.normalize_profile(profile) is not None
+    assert len(calls) == len(set(calls)) == 5
+    assert [parameter.device for parameter in jl._hf_model.parameters()] == before
+    assert all(not module._forward_hooks for module in jl._hf_model.modules())
+
+    import api.app as app
+    monkeypatch.setattr(app.manager, "hf_model", jl._hf_model)
+    monkeypatch.setattr(app.manager, "meta", {"model_id": "synthetic"})
+    monkeypatch.setattr(app.manager, "capability_profile", profile)
+    monkeypatch.setattr(app, "gpu_stats", lambda: [])
+    app.api_status()
+    assert len(calls) == 5

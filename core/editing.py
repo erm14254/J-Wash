@@ -1563,6 +1563,12 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
     """
     from core.capabilities import ensure_unquantized
     ensure_unquantized(jl, model_meta)
+    inventory = rebase.model_preflight(jl, exact=exact)
+    if inventory.packed and fmt in ("layers", "lora"):
+        raise ValueError(
+            f"{fmt} export is unavailable for packed MoE parameters. "
+            "Use full-checkpoint export."
+        )
     parts = validate_export_name(name)
     root = EDITS_DIR.resolve()
     final_dir = root.joinpath(*parts).resolve()

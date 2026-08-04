@@ -33,16 +33,16 @@ def test_rank3_read_matches_explicit_expert_loop_and_validates_shape():
 
 def test_capabilities_fail_closed_and_dense_exact_is_positive():
     cap = rebase.block_capabilities(block())
-    assert cap.readthrough_supported and not cap.exact_supported and "aggregate-MoE" in cap.exact_reason
+    assert cap.readthrough_supported and not cap.exact_supported and "packed" in cap.exact_reason
     for linear in (False, True):
         dense = block(linear, sparse=False)
         assert rebase.block_capabilities(dense).exact_supported
         writer = dense.linear_attn.out_proj if linear else dense.self_attn.o_proj
         writer.bias = nn.Parameter(torch.zeros(8))
         cap = rebase.block_capabilities(dense)
-        assert cap.readthrough_supported and not cap.exact_supported and "bias" in cap.exact_reason
+        assert cap.readthrough_supported and not cap.exact_supported and "unsupported" in cap.exact_reason
         writer.bias = None; writer.weight = nn.Parameter(torch.zeros(7, 8))
-        assert "output axis" in rebase.block_capabilities(dense).exact_reason
+        assert "unsupported" in rebase.block_capabilities(dense).exact_reason
     b = block(); del b.mlp.shared_expert_gate
     assert not rebase.block_capabilities(b).readthrough_supported
     b = block(); b.linear_attn = nn.Module()
@@ -64,6 +64,52 @@ def test_tiny_supported_inventory_and_version_contract(tiny):
     assert {t.state_suffix for t, _, _ in rebase.iter_reads(tiny.model.layers[2])} == LINEAR_READERS
     assert tiny.model.layers[1].mlp.experts.gate_up_proj.ndim == 3
     assert "model.layers.1.mlp.experts.gate_up_proj" in tiny.state_dict()
+
+
+def test_audited_decoder_class_and_alias_contracts_fail_closed():
+    unknown = block(sparse=False)
+    rebase.AUDITED_DECODER_SPECS.pop((type(unknown).__module__, type(unknown).__name__))
+    try:
+        with pytest.raises(ValueError, match="not audited"):
+            rebase.model_preflight(SimpleNamespace(
+                layers=[unknown], _lm_head=nn.Linear(8, 17, False),
+                _final_norm=unknown.post_attention_layernorm))
+    finally:
+        rebase.AUDITED_DECODER_SPECS[(type(unknown).__module__, type(unknown).__name__)] = (
+            rebase.TopologySpec(("self_attn", "linear_attn"), packed=False))
+
+    cases = []
+    jl = dense_lens(); jl.layers = nn.ModuleList([jl.layers[0], jl.layers[0]]); cases.append(jl)
+    jl = dense_lens(); jl.layers[1].input_layernorm = jl.layers[0].input_layernorm; cases.append(jl)
+    jl = dense_lens(); jl.layers[1].self_attn.q_proj = jl.layers[0].self_attn.q_proj; cases.append(jl)
+    jl = dense_lens(); jl.layers[1].self_attn.q_proj.weight = jl.layers[0].self_attn.q_proj.weight; cases.append(jl)
+    jl = dense_lens(); jl.layers[1].self_attn.o_proj = jl.layers[0].self_attn.o_proj; cases.append(jl)
+    jl = dense_lens(); jl.layers[1].self_attn.o_proj.weight = jl.layers[0].self_attn.o_proj.weight; cases.append(jl)
+    jl = dense_lens(); jl._final_norm = jl.layers[0].input_layernorm; cases.append(jl)
+    for candidate in cases:
+        with pytest.raises(ValueError, match="shared|alias"):
+            rebase.model_preflight(candidate)
+
+
+def test_modified_and_noncanonical_dense_topologies_fail_closed():
+    base = block(sparse=False)
+    subclass = type("SyntheticSubclass", (type(base),), {})()
+    subclass.__dict__.update(base.__dict__)
+    jl = dense_lens(); jl.layers[0] = subclass
+    with pytest.raises(ValueError, match="not audited"):
+        rebase.model_preflight(jl)
+    jl = dense_lens()
+    jl.layers[0].adapter = nn.Linear(8, 8, False)
+    with pytest.raises(ValueError, match="unlisted"):
+        rebase.model_preflight(jl)
+    jl = dense_lens()
+    jl.layers[0].forward = lambda hidden: hidden
+    with pytest.raises(ValueError, match="not audited"):
+        rebase.model_preflight(jl)
+    jl = dense_lens()
+    jl.layers[0].mlp.gate_proj.weight = nn.Parameter(torch.randn(2, 3, 8))
+    with pytest.raises(ValueError, match="audited Linear"):
+        rebase.model_preflight(jl)
 
 
 @pytest.mark.parametrize("layer", [0, 1, 2])
@@ -152,7 +198,7 @@ def test_production_width_bf16_allowlisted_rmsnorms(hidden):
 
 
 @pytest.mark.parametrize("hidden", [2048, 3072])
-def test_production_width_qwen35_moe_block_capability(hidden):
+def test_production_width_qwen35_moe_block_capability(hidden, monkeypatch):
     from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeRMSNorm
     b = nn.Module(); b.self_attn = nn.Module()
     b.self_attn.q_proj = nn.Linear(hidden, 8, False, dtype=torch.bfloat16)
@@ -166,6 +212,9 @@ def test_production_width_qwen35_moe_block_capability(hidden):
     b.mlp.shared_expert_gate = nn.Linear(hidden, 1, False, dtype=torch.bfloat16)
     b.input_layernorm = Qwen3_5MoeRMSNorm(hidden).to(torch.bfloat16)
     b.post_attention_layernorm = Qwen3_5MoeRMSNorm(hidden).to(torch.bfloat16)
+    monkeypatch.setitem(rebase.AUDITED_DECODER_SPECS,
+                        (type(b).__module__, type(b).__name__),
+                        rebase.TopologySpec(("self_attn",), packed=True))
     cap = rebase.block_capabilities(b)
     assert cap.readthrough_supported and not cap.exact_supported
 
@@ -191,13 +240,13 @@ def test_exact_writer_contract_is_linear_tensor_only(kind):
     cap = rebase.block_capabilities(dense)
     assert cap.exact_supported is (kind == "tensor")
     if kind != "tensor":
-        assert "audited tensor-returning Linear" in cap.exact_reason
+        assert "unsupported" in cap.exact_reason
         direction = torch.randn(8); direction /= direction.norm()
         iv = Interventions(); iv._rules = [{"id": 1, "token_id": 1, "token": "x",
             "mode": "scale", "factor": .8, "replacement_id": None, "replacement": None,
             "layers": [0], "dirs_a": {0: direction}, "dirs_b": None}]
         iv.set_mode("exact"); before = [len(module._forward_hooks) for module in jl._hf_model.modules()]
-        with pytest.raises(ValueError, match="audited tensor-returning Linear"): iv.attach(jl)
+        with pytest.raises(ValueError, match="unsupported"): iv.attach(jl)
         assert before == [len(module._forward_hooks) for module in jl._hf_model.modules()]
         assert iv._handles == []
 

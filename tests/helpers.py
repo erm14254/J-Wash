@@ -96,6 +96,27 @@ class CallableNotHookable:
     def __call__(self, x): return x
 
 
+class SyntheticDecoderBlock(nn.Module):
+    def forward(self, hidden_states):
+        return hidden_states
+
+
+class SyntheticPackedDecoderBlock(SyntheticDecoderBlock):
+    pass
+
+
+# Production has no generic fallback; tests explicitly audit their purpose-built
+# structural fixture in the same way as a real Transformers decoder class.
+rebase.AUDITED_DECODER_SPECS[(SyntheticDecoderBlock.__module__,
+                              SyntheticDecoderBlock.__name__)] = rebase.TopologySpec(
+    ("self_attn", "linear_attn"), packed=False
+)
+rebase.AUDITED_DECODER_SPECS[(SyntheticPackedDecoderBlock.__module__,
+                              SyntheticPackedDecoderBlock.__name__)] = rebase.TopologySpec(
+    ("self_attn", "linear_attn"), packed=True
+)
+
+
 def block(linear=False, hidden=8, sparse=True):
     from transformers.models.llama.modeling_llama import LlamaRMSNorm
     mixer = nn.Module()
@@ -114,7 +135,8 @@ def block(linear=False, hidden=8, sparse=True):
     else:
         mlp.gate_proj = nn.Linear(hidden, 3, False); mlp.up_proj = nn.Linear(hidden, 3, False)
         mlp.down_proj = nn.Linear(3, hidden, False)
-    result = nn.Module(); setattr(result, "linear_attn" if linear else "self_attn", mixer)
+    result = (SyntheticPackedDecoderBlock() if sparse else SyntheticDecoderBlock())
+    setattr(result, "linear_attn" if linear else "self_attn", mixer)
     result.mlp = mlp; result.input_layernorm = LlamaRMSNorm(hidden)
     result.post_attention_layernorm = LlamaRMSNorm(hidden)
     return result

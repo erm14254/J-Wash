@@ -326,7 +326,7 @@ class Interventions:
         # Model-wide Phase-1 contract: capability does not depend on which rule
         # happens to be last.  This also validates the final norm before any
         # hook registration is attempted.
-        rebase.model_preflight(jl, exact=exact)
+        inventory = rebase.model_preflight(jl, exact=exact)
         cums = rebase.cumulative(active, self._scale, n_layers)
         if not cums:
             return
@@ -361,14 +361,15 @@ class Interventions:
         for m in sorted(k for k in cums if k < n_layers):
             U, V = cums[m]
             block = jl.layers[m]
+            block_inventory = inventory.blocks[m]
             norms = {}
-            for _suffix, _module, norm in rebase.iter_reads(block):
+            for _suffix, _module, norm in block_inventory.reads:
                 norms[id(norm)] = norm
             for norm in norms.values():
                 sites.append((norm, read_hook_for(norm, U, V)))
             if exact:
                 U_inv, Vw, _regularized = rebase.inverse_uv(U, V)
-                for _suffix, module in rebase.iter_writes(block):
+                for _suffix, module in block_inventory.writes:
                     sites.append((module, write_hook_for(module, U_inv, Vw)))
         U, V = cums[n_layers]
         sites.append((jl._final_norm, read_hook_for(jl._final_norm, U, V)))

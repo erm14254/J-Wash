@@ -118,6 +118,50 @@ class RebaseCapabilities:
     exact_reason: str
 
 
+@dataclass(frozen=True)
+class TopologySpec:
+    mixers: tuple[str, ...]
+    packed: bool = False
+
+
+@dataclass(frozen=True)
+class BlockInventory:
+    index: int
+    kind: str
+    norms: tuple[tuple[str, object], ...]
+    reads: tuple[tuple[TransformTarget, object, object], ...]
+    writes: tuple[tuple[str, object], ...]
+    packed: bool
+    exact_supported: bool
+    exact_reason: str
+
+
+@dataclass(frozen=True)
+class ModelInventory:
+    blocks: tuple[BlockInventory, ...]
+    final_norm: object
+    hidden: int
+    packed: bool
+    exact_supported: bool
+    exact_reason: str
+
+
+AUDITED_DECODER_SPECS = {
+    ("transformers.models.llama.modeling_llama", "LlamaDecoderLayer"):
+        TopologySpec(("self_attn",)),
+    ("transformers.models.mistral.modeling_mistral", "MistralDecoderLayer"):
+        TopologySpec(("self_attn",)),
+    ("transformers.models.qwen2.modeling_qwen2", "Qwen2DecoderLayer"):
+        TopologySpec(("self_attn",)),
+    ("transformers.models.qwen3.modeling_qwen3", "Qwen3DecoderLayer"):
+        TopologySpec(("self_attn",)),
+    ("transformers.models.qwen3_5.modeling_qwen3_5", "Qwen3_5DecoderLayer"):
+        TopologySpec(("self_attn", "linear_attn")),
+    ("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe", "Qwen3_5MoeDecoderLayer"):
+        TopologySpec(("self_attn", "linear_attn"), packed=True),
+}
+
+
 _MOE_READS = (
     TransformTarget("mlp.gate.weight", "mlp.gate", "post_attention_layernorm"),
     TransformTarget("mlp.experts.gate_up_proj", "mlp.experts.gate_up_proj", "post_attention_layernorm", lora_supported=False),
@@ -247,149 +291,167 @@ def validate_rms_norm(norm, hidden, name="RMSNorm"):
     return norm
 
 
-def block_capabilities(block, _validated_norms=None):
-    """Positively validate a complete supported topology; unknowns fail closed."""
-    try:
-        for marker in _UNSUPPORTED_MARKERS:
-            if getattr(block, marker, None) is not None:
-                raise ValueError(f"layer has unsupported residual branch {marker}")
-        full = _submodule(block, "self_attn") is not None
-        linear = _submodule(block, "linear_attn") is not None
-        if full == linear:
-            raise ValueError("token-mixer topology is unknown or ambiguous")
-        mixer = (("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj") if full else
-                 ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_b", "linear_attn.in_proj_a"))
-        first = _submodule(block, mixer[0])
-        hidden = first.weight.shape[-1] if first is not None and hasattr(first, "weight") else None
-        if hidden is None:
-            raise ValueError(f"required reader {mixer[0]}.weight is absent")
-        validated = _validated_norms if _validated_norms is not None else set()
-        def validate(norm, label):
-            if id(norm) not in validated:
-                validate_rms_norm(norm, hidden, label); validated.add(id(norm))
-        validate(getattr(block, "input_layernorm", None), "input_layernorm")
-        targets = [TransformTarget(s + ".weight", s, "input_layernorm") for s in mixer]
-        sparse = _submodule(block, "mlp.experts.gate_up_proj") is not None
-        if sparse:
-            targets.extend(_MOE_READS)
-            validate(getattr(block, "post_attention_layernorm", None), "post_attention_layernorm")
-        else:
-            for s in ("mlp.gate_proj", "mlp.up_proj"):
-                if _submodule(block, s) is None:
-                    raise ValueError(f"required reader {s}.weight is absent")
-                targets.append(TransformTarget(s + ".weight", s, "post_attention_layernorm" if getattr(block, "post_attention_layernorm", None) is not None else "input_layernorm"))
-        for target in targets:
-            tensor = target.tensor(block)
-            if tensor is None:
-                raise ValueError(f"required reader {target.state_suffix} is absent")
-            if tensor.ndim < 2 or tensor.shape[target.axis] != hidden:
-                raise ValueError(f"reader {target.state_suffix} has wrong residual hidden axis")
-            validate(getattr(block, target.norm_name, None), target.norm_name)
-        exact_ok = False
-        if sparse:
-            exact_reason = (
-                "packed routed and shared-expert residual writers require a separate "
-                "implementation and aggregate-MoE live oracle"
-            )
-        else:
-            # Exact preview hooks, and the bake left-multiplies, every residual
-            # writer.  Claim support only when the complete inventory for the
-            # positively identified mixer exists and has the contract used by
-            # both paths.  In particular a bias would be transformed by the
-            # live output hook but is not represented in the current bake.
-            expected_writes = (("self_attn.o_proj",) if full else
-                               ("linear_attn.out_proj",)) + ("mlp.down_proj",)
-            exact_reason = "supported"
-            for name in expected_writes:
-                writer = _submodule(block, name)
+def _block_inventory(block, index, hidden, validated_norms):
+    key = (type(block).__module__, type(block).__name__)
+    spec = AUDITED_DECODER_SPECS.get(key)
+    if spec is None or "forward" in getattr(block, "__dict__", {}):
+        raise ValueError(f"layer {index} decoder class or forward is not audited")
+    for marker in _UNSUPPORTED_MARKERS:
+        if getattr(block, marker, None) is not None:
+            raise ValueError(f"layer {index} has unsupported residual branch {marker}")
+    present_mixers = tuple(name for name in ("self_attn", "linear_attn")
+                           if _submodule(block, name) is not None)
+    if len(present_mixers) != 1 or present_mixers[0] not in spec.mixers:
+        raise ValueError(f"layer {index} token-mixer topology is not audited")
+    kind = present_mixers[0]
+    expected_children = {kind, "mlp", "input_layernorm", "post_attention_layernorm"}
+    if set(getattr(block, "_modules", {})) != expected_children:
+        raise ValueError(f"layer {index} has unlisted decoder modules")
+    mixer = (("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj")
+             if kind == "self_attn" else
+             ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z",
+              "linear_attn.in_proj_b", "linear_attn.in_proj_a"))
+    sparse_present = _submodule(block, "mlp.experts.gate_up_proj") is not None
+    if sparse_present != spec.packed:
+        raise ValueError(f"layer {index} MLP topology is not audited")
+    targets = [TransformTarget(path + ".weight", path, "input_layernorm")
+               for path in mixer]
+    if spec.packed:
+        targets.extend(_MOE_READS)
+    else:
+        norm_name = ("post_attention_layernorm"
+                     if getattr(block, "post_attention_layernorm", None) is not None
+                     else "input_layernorm")
+        targets.extend(TransformTarget(path + ".weight", path, norm_name)
+                       for path in ("mlp.gate_proj", "mlp.up_proj"))
+    norm_names = tuple(dict.fromkeys(target.norm_name for target in targets))
+    norms = []
+    for name in norm_names:
+        norm = getattr(block, name, None)
+        if id(norm) not in validated_norms:
+            validate_rms_norm(norm, hidden, f"layer {index} {name}")
+            validated_norms.add(id(norm))
+        norms.append((name, norm))
+    reads = []
+    for target in targets:
+        tensor = target.tensor(block)
+        module = _submodule(block, target.accessor)
+        if tensor is None or not isinstance(tensor, torch.Tensor):
+            raise ValueError(f"layer {index} reader {target.state_suffix} is absent")
+        raw_packed = spec.packed and not target.state_suffix.endswith(".weight")
+        if raw_packed:
+            if not isinstance(module, torch.nn.Parameter) or tensor.ndim != 3:
+                raise ValueError(f"layer {index} packed reader {target.state_suffix} is modified")
+        elif (type(module) is not torch.nn.Linear or tensor.ndim != 2):
+            raise ValueError(f"layer {index} reader {target.state_suffix} is not an audited Linear")
+        if not tensor.dtype.is_floating_point or tensor.shape[target.axis] != hidden:
+            raise ValueError(f"layer {index} reader {target.state_suffix} has invalid storage")
+        reads.append((target, tensor, getattr(block, target.norm_name)))
+    expected_writes = ((f"{kind}.o_proj",) if kind == "self_attn" else
+                       ("linear_attn.out_proj",)) + ("mlp.down_proj",)
+    writes, exact_ok, exact_reason = [], not spec.packed, "supported"
+    if spec.packed:
+        exact_reason = "packed residual writers are unsupported"
+    else:
+        present = {name for name in WRITES if _submodule(block, name) is not None}
+        if present != set(expected_writes):
+            exact_ok, exact_reason = False, "residual writer inventory is incomplete"
+        for name in expected_writes:
+            writer, weight = _submodule(block, name), None
+            if writer is not None:
                 weight = getattr(writer, "weight", None)
-                if writer is None or weight is None:
-                    exact_reason = f"required residual writer {name}.weight is absent"
-                    break
-                if weight.ndim != 2 or weight.shape[0] != hidden:
-                    exact_reason = f"residual writer {name}.weight has wrong residual output axis"
-                    break
-                if getattr(writer, "bias", None) is not None:
-                    exact_reason = f"residual writer {name} has an untransformed bias"
-                    break
-                if type(writer) is not torch.nn.Linear:
-                    exact_reason = f"residual writer {name} is not an audited tensor-returning Linear"
-                    break
-                if not callable(writer) or not callable(getattr(writer, "register_forward_hook", None)):
-                    exact_reason = f"residual writer {name} is not hookable by the live exact path"
-                    break
-            else:
-                # No additional writers may silently escape the inventory.
-                present = {name for name in WRITES if _submodule(block, name) is not None}
-                if present != set(expected_writes):
-                    exact_reason = "residual writer inventory is ambiguous or incomplete"
+            if (type(writer) is not torch.nn.Linear or weight is None or weight.ndim != 2
+                    or not weight.dtype.is_floating_point or weight.shape[0] != hidden
+                    or getattr(writer, "bias", None) is not None
+                    or not callable(getattr(writer, "register_forward_hook", None))):
+                exact_ok, exact_reason = False, f"residual writer {name} is unsupported"
+            writes.append((name, writer))
+    return BlockInventory(index, kind, tuple(norms), tuple(reads), tuple(writes),
+                          spec.packed, exact_ok, exact_reason)
+
+
+def model_inventory(jl):
+    layers = getattr(jl, "layers", None)
+    if not layers:
+        raise ValueError("model has no decoder blocks")
+    hidden = jl._lm_head.weight.shape[-1]
+    blocks, validated_norms = [], set()
+    block_ids, norm_layers, module_sites, tensor_sites, names = set(), {}, {}, {}, set()
+    for index, block in enumerate(layers):
+        if id(block) in block_ids:
+            raise ValueError("decoder block object is shared across layers")
+        block_ids.add(id(block))
+        inventory = _block_inventory(block, index, hidden, validated_norms)
+        for norm_name, norm in inventory.norms:
+            previous = norm_layers.setdefault(id(norm), index)
+            if previous != index:
+                raise ValueError("normalization module is shared across decoder layers")
+        for role, entries in (("reader", inventory.reads), ("writer", inventory.writes)):
+            for entry in entries:
+                if role == "reader":
+                    target, tensor, _norm = entry
+                    path, module = target.state_suffix, _submodule(block, target.accessor)
                 else:
-                    exact_ok = True
-        return RebaseCapabilities(True, "supported", exact_ok, exact_reason)
-    except ValueError as exc:
+                    path, module = entry
+                    tensor = getattr(module, "weight", None)
+                logical = f"layers.{index}.{path}"
+                if logical in names:
+                    raise ValueError("duplicate logical checkpoint target")
+                names.add(logical)
+                for table, identity in ((module_sites, id(module)), (tensor_sites, id(tensor))):
+                    previous = table.setdefault(identity, (role, logical))
+                    if previous != (role, logical):
+                        raise ValueError(f"unsafe {role} module or parameter alias")
+        blocks.append(inventory)
+    final_norm = getattr(jl, "_final_norm", None)
+    if id(final_norm) in norm_layers:
+        raise ValueError("final norm aliases a decoder block norm")
+    validate_rms_norm(final_norm, hidden, "final norm")
+    packed = any(block.packed for block in blocks)
+    exact_ok = not packed and all(block.exact_supported for block in blocks)
+    reason = ("packed residual writers are unsupported" if packed else
+              next((block.exact_reason for block in blocks
+                    if not block.exact_supported), "supported"))
+    return ModelInventory(tuple(blocks), final_norm, hidden, packed, exact_ok, reason)
+
+
+def block_capabilities(block, _validated_norms=None):
+    try:
+        first = next((m for name in ("self_attn.q_proj", "linear_attn.in_proj_qkv")
+                      if (m := _submodule(block, name)) is not None), None)
+        hidden = first.weight.shape[-1]
+        inv = _block_inventory(block, 0, hidden,
+                               _validated_norms if _validated_norms is not None else set())
+        return RebaseCapabilities(True, "supported", inv.exact_supported, inv.exact_reason)
+    except (AttributeError, StopIteration, TypeError, ValueError) as exc:
         return RebaseCapabilities(False, str(exc), False, f"readthrough unsupported: {exc}")
 
 
 def model_preflight(jl, *, exact=False):
-    """Model-wide capability contract, including the final normalization."""
-    if not getattr(jl, "layers", None):
-        raise ValueError("model has no decoder blocks")
-    hidden = jl._lm_head.weight.shape[-1]
-    validated_norms = set()
-    for index, block in enumerate(jl.layers):
-        cap = block_capabilities(block, validated_norms)
-        if not cap.readthrough_supported:
-            raise ValueError(f"layer {index} readthrough unsupported: {cap.readthrough_reason}")
-        if exact and not cap.exact_supported:
-            raise ValueError(f"exact mode is unavailable for this model: layer {index}: {cap.exact_reason}")
-    final_norm = getattr(jl, "_final_norm", None)
-    if id(final_norm) not in validated_norms:
-        validate_rms_norm(final_norm, hidden, "final norm")
-    return True
+    inventory = model_inventory(jl)
+    if exact and not inventory.exact_supported:
+        raise ValueError("exact mode is unavailable for this model: " + inventory.exact_reason)
+    return inventory
 
 
 def has_packed_read_parameters(jl):
-    """Derive packed storage from every reader in the validated model inventory."""
-    model_preflight(jl, exact=False)
-    for block in jl.layers:
-        for target, tensor, _norm in iter_reads(block):
-            if tensor.ndim > 2 or not target.lora_supported:
-                return True
-    return False
+    return model_inventory(jl).packed
 
 
-def check_block_supported(block):
-    capability = block_capabilities(block)
-    if not capability.readthrough_supported:
-        raise ValueError("architecture not supported by readthrough: " + capability.readthrough_reason)
+def iter_reads(block, inventory=None):
+    inv = inventory or _block_inventory(
+        block, 0, next(iter(_submodule(block, p).weight.shape[-1]
+                            for p in ("self_attn.q_proj", "linear_attn.in_proj_qkv")
+                            if _submodule(block, p) is not None)), set())
+    yield from inv.reads
 
 
-def iter_reads(block):
-    """Yields ``(suffix, module, norm)`` for each residual read."""
-    check_block_supported(block)
-    if _submodule(block, "mlp.experts.gate_up_proj") is not None:
-        mixer = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj") if _submodule(block, "self_attn") is not None else ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_b", "linear_attn.in_proj_a")
-        targets = [TransformTarget(s + ".weight", s, "input_layernorm") for s in mixer] + list(_MOE_READS)
-        for target in targets:
-            yield target, target.tensor(block), getattr(block, target.norm_name)
-        return
-    for suffix, norm_name in READS.items():
-        module = _submodule(block, suffix)
-        if module is None:
-            continue
-        if suffix in READS_POST and getattr(block, "post_attention_layernorm", None) is not None:
-            norm_name = "post_attention_layernorm"
-        norm = getattr(block, norm_name, None)
-        if norm is None or not hasattr(norm, "weight"):
-            raise ValueError(f"RMSNorm {norm_name} not found for {suffix}")
-        yield TransformTarget(suffix + ".weight", suffix, norm_name), module.weight, norm
-
-
-def iter_writes(block):
-    for suffix in WRITES:
-        module = _submodule(block, suffix)
-        if module is not None:
-            yield suffix, module
+def iter_writes(block, inventory=None):
+    inv = inventory or _block_inventory(
+        block, 0, next(iter(_submodule(block, p).weight.shape[-1]
+                            for p in ("self_attn.q_proj", "linear_attn.in_proj_qkv")
+                            if _submodule(block, p) is not None)), set())
+    yield from inv.writes
 
 
 def rule_factors(rules, scale):
@@ -544,7 +606,7 @@ def build_plan(rules, jl, scale, exact=False):
     done by the export."""
     from core.capabilities import ensure_unquantized
     ensure_unquantized(jl)
-    model_preflight(jl, exact=exact)
+    inventory = model_preflight(jl, exact=exact)
     active = [r for r in rules if r["layers"]]
     if not active:
         raise ValueError("no active rule (all have 0 layers): nothing to export")
@@ -563,10 +625,8 @@ def build_plan(rules, jl, scale, exact=False):
     for m in sorted(k for k in cums if k < n_layers):
         U, V = cums[m]
         block = jl.layers[m]
-        caps = block_capabilities(block)
-        if exact and not caps.exact_supported:
-            raise ValueError("exact mode is unavailable: " + caps.exact_reason)
-        for target, _tensor, norm in iter_reads(block):
+        block_inventory = inventory.blocks[m]
+        for target, _tensor, norm in block_inventory.reads:
             Ug, Vg = gamma_pair(norm, U, V)
             g_min = effective_gamma(norm).abs().min().item()
             min_gamma = g_min if min_gamma is None else min(min_gamma, g_min)
@@ -575,7 +635,7 @@ def build_plan(rules, jl, scale, exact=False):
             U_inv, Vw, regularized = inverse_uv(U, V)
             if regularized:
                 regularized_layers.append(m)
-            for suffix, _module in iter_writes(block):
+            for suffix, _module in block_inventory.writes:
                 transforms[f"{path}.layers.{m}.{suffix}.weight"] = ("write", U_inv, Vw)
 
     U, V = cums[n_layers]
@@ -593,6 +653,8 @@ def build_plan(rules, jl, scale, exact=False):
         "layers_span": [min(cums), n_layers - 1],
         "regularized_layers": regularized_layers,
         "min_gamma": min_gamma,
-        "targets": {f"{path}.layers.{m}.{target.state_suffix}": target for m in sorted(k for k in cums if k < n_layers) for target, _tensor, _norm in iter_reads(jl.layers[m])},
+        "targets": {f"{path}.layers.{m}.{target.state_suffix}": target
+                    for m in sorted(k for k in cums if k < n_layers)
+                    for target, _tensor, _norm in inventory.blocks[m].reads},
     }
     return transforms, info

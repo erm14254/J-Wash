@@ -439,7 +439,9 @@ def _sample(logits, temperature, top_p, top_k, generator=None, penalty=1.0, pena
 def _rebase_capability_meta(jl):
     """Compatibility wrapper around the single production policy."""
     from core import capabilities
-    profile = capabilities.build_profile(jl, None)
+    profile = capabilities.build_profile(
+        jl, getattr(jl, "_jwash_declared_quant", None)
+    )
     return capabilities.legacy(profile, loaded=True)
 
 
@@ -509,10 +511,10 @@ class ModelManager:
                 self.jl._jwash_declared_quant = quant
                 # Cache the authoritative fail-closed editing policy once.  In
                 # particular, global projection remains disabled for every topology.
-                from core.capabilities import build_profile
+                from core.capabilities import build_profile, legacy, normalize_profile
                 self.capability_profile = build_profile(self.jl, quant)
-                from core.capabilities import legacy
                 capability_meta = legacy(self.capability_profile, loaded=True)
+                normalized_profile = normalize_profile(self.capability_profile)
                 self.meta = {
                     "model_id": model_id,
                     "revision": _resolve_revision(source),
@@ -521,7 +523,10 @@ class ModelManager:
                     "device": device,
                     "n_layers": text_config.num_hidden_layers,
                     "d_model": text_config.hidden_size,
-                    "has_packed_read_parameters": self.capability_profile["has_packed_read_parameters"],
+                    "has_packed_read_parameters": (
+                        normalized_profile["has_packed_read_parameters"]
+                        if normalized_profile is not None else False
+                    ),
                     # Includes legacy rebase_supported = safe readthrough support.
                     **capability_meta,
                     "chat_template_source": chat_template_source,

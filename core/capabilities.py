@@ -50,6 +50,8 @@ def normalize_profile(profile):
     try:
         if not isinstance(profile, dict):
             raise ValueError
+        if set(profile) != {"declared_quantization", "has_packed_read_parameters", "modes"}:
+            raise ValueError
         quant = profile["declared_quantization"]
         packed = profile["has_packed_read_parameters"]
         modes = profile["modes"]
@@ -66,10 +68,26 @@ def normalize_profile(profile):
             raise ValueError
         if quant is None and normalized["standard"] != decision(True, "supported"):
             raise ValueError
-        if packed and (normalized["readthrough"] != decision(True, "supported")
-                       or normalized["exact"] != decision(
-                           False, "packed_moe_exact_unsupported")):
-            raise ValueError
+        if quant is None:
+            readthrough, exact = normalized["readthrough"], normalized["exact"]
+            if readthrough not in (decision(True, "supported"),
+                                    decision(False, "architecture_unsupported")):
+                raise ValueError
+            valid_exact = (decision(True, "supported"),
+                           decision(False, "architecture_unsupported"),
+                           decision(False, "packed_moe_exact_unsupported"))
+            if exact not in valid_exact:
+                raise ValueError
+            if not readthrough["supported"] and exact != decision(
+                    False, "architecture_unsupported"):
+                raise ValueError
+            if packed and (not readthrough["supported"] or exact != decision(
+                    False, "packed_moe_exact_unsupported")):
+                raise ValueError
+            if not packed and exact == decision(False, "packed_moe_exact_unsupported"):
+                raise ValueError
+            if exact["supported"] and (not readthrough["supported"] or packed):
+                raise ValueError
         return {"declared_quantization": quant,
                 "has_packed_read_parameters": packed, "modes": normalized}
     except (KeyError, TypeError, ValueError):
@@ -88,17 +106,31 @@ def build_profile(jl, quant):
     """Compute intrinsic facts once per successful model load."""
     from core import rebase
 
+    jl_quant = getattr(jl, "_jwash_declared_quant", None)
+    if quant not in (None, *QUANTS) or jl_quant not in (None, *QUANTS):
+        return None
+    if jl_quant != quant and not (jl_quant is None and quant is None):
+        return None
     quantized = quant in QUANTS
     if quantized:
         packed = False
         modes = {name: decision(False, "quantized_model_unsupported")
                  for name in ("standard", "readthrough", "exact")}
     else:
-        readthrough = _safe_preflight(lambda: rebase.model_preflight(jl, exact=False))
-        packed = (rebase.has_packed_read_parameters(jl)
-                  if readthrough["supported"] else False)
-        exact_code = "packed_moe_exact_unsupported" if packed else "architecture_unsupported"
-        exact = _safe_preflight(lambda: rebase.model_preflight(jl, exact=True), exact_code)
+        try:
+            inventory = rebase.model_inventory(jl)
+        except Exception:
+            inventory = None
+        readthrough = decision(inventory is not None,
+                               "supported" if inventory is not None else
+                               "architecture_unsupported")
+        packed = inventory.packed if inventory is not None else False
+        if packed:
+            exact = decision(False, "packed_moe_exact_unsupported")
+        elif inventory is not None and inventory.exact_supported:
+            exact = decision(True, "supported")
+        else:
+            exact = decision(False, "architecture_unsupported")
         modes = {"standard": decision(True, "supported"),
                  "readthrough": readthrough, "exact": exact}
     modes["abliteration"] = decision(False, "global_projection_unvalidated")

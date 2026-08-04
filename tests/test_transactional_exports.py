@@ -51,11 +51,11 @@ def test_packed_export_rejections_are_early_and_clean(tiny, tmp_path, monkeypatc
     monkeypatch.setattr(editing, "EDITS_DIR", tmp_path); jl = lens(tiny); rules = rules_for(tiny)
     def forbidden(): raise AssertionError("full state traversal occurred")
     monkeypatch.setattr(jl._hf_model, "state_dict", forbidden)
-    for fmt, phrase in (("layers", "bounded-memory"), ("lora", "LoRA export")):
+    for fmt, phrase in (("layers", "layers export"), ("lora", "lora export")):
         with pytest.raises(ValueError, match=phrase):
             editing.export_rebase(rules, jl, {"dtype": "fp16"}, fmt=fmt, name=fmt)
         assert not (tmp_path / fmt).exists()
-    with pytest.raises(ValueError, match="aggregate-MoE"):
+    with pytest.raises(ValueError, match="packed residual"):
         editing.export_rebase(rules, jl, {"dtype": "fp16"}, fmt="full", name="exact", exact=True)
     assert not (tmp_path / "exact").exists()
 

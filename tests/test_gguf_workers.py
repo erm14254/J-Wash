@@ -18,6 +18,15 @@ from helpers import *
 from helpers import _deferred_threads, _gguf_test_tools
 
 
+@pytest.fixture(autouse=True)
+def _restore_gguf_singleton_state():
+    import api.app as app
+    original = dict(app._gguf_state)
+    yield
+    app._gguf_state.clear()
+    app._gguf_state.update(original)
+
+
 def _mock_loaded_readthrough(app, monkeypatch):
     """Install the complete invariant produced by a successful unquantized load."""
     supported = capabilities.decision(True, "supported")
@@ -95,6 +104,29 @@ def test_fresh_gguf_bake_requires_capability_profile(tmp_path, monkeypatch):
         ))
     assert exc.value.status_code == 422
     assert exc.value.detail == "Capability data is unavailable for this model."
+
+
+def test_fresh_gguf_abliteration_rejected_before_dispatch_or_state(tmp_path, monkeypatch):
+    import api.app as app
+    monkeypatch.setattr(app.editing, "EDITS_DIR", tmp_path / "edits")
+    monkeypatch.setattr(app, "_llamacpp_paths",
+                        lambda: (tmp_path / "convert.py", None, None))
+    _mock_loaded_readthrough(app, monkeypatch)
+    monkeypatch.setattr(app.manager, "jl", dense_lens())
+    monkeypatch.setattr(app.interventions, "_mode", "abliteration")
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("global export or worker dispatch must not run")
+    monkeypatch.setattr(app.editing, "export_abliteration", forbidden)
+    monkeypatch.setattr(app, "threading", SimpleNamespace(Thread=forbidden))
+    original = {"state": "idle", "name": None, "step": None,
+                "error": None, "result": None}
+    app._gguf_state.update(original)
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(app.api_edit_export_gguf(
+            SimpleNamespace(name="global", gguf_type="bf16")
+        ))
+    assert exc.value.status_code == 422
+    assert app._gguf_state == original
 
 
 @pytest.mark.parametrize("name", ["COM¹", "com²", "COM³.txt", "LPT¹", "lpt².json", "folder/LPT³"])
