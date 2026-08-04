@@ -18,15 +18,6 @@ from helpers import *
 from helpers import _deferred_threads, _gguf_test_tools
 
 
-@pytest.fixture(autouse=True)
-def _restore_gguf_singleton_state():
-    import api.app as app
-    original = dict(app._gguf_state)
-    yield
-    app._gguf_state.clear()
-    app._gguf_state.update(original)
-
-
 def _mock_loaded_readthrough(app, monkeypatch):
     """Install the complete invariant produced by a successful unquantized load."""
     supported = capabilities.decision(True, "supported")

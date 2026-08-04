@@ -47,6 +47,21 @@ def test_full_export_observer_covers_every_bounded_row(tiny, tmp_path, monkeypat
     assert any(count < 3 for count in observed)
 
 
+def test_public_export_builds_one_semantic_inventory(tiny, tmp_path, monkeypatch):
+    source = tmp_path / "source"; make_source(tiny, source)
+    monkeypatch.setattr(editing, "EDITS_DIR", tmp_path / "edits")
+    calls = 0
+    original = rebase.model_inventory
+    def counted(jl):
+        nonlocal calls
+        calls += 1
+        return original(jl)
+    monkeypatch.setattr(rebase, "model_inventory", counted)
+    editing.export_rebase(rules_for(tiny), lens(tiny), {"dtype": "fp32"},
+                          fmt="full", name="single-pass", source_dir=source)
+    assert calls == 1
+
+
 def test_packed_export_rejections_are_early_and_clean(tiny, tmp_path, monkeypatch):
     monkeypatch.setattr(editing, "EDITS_DIR", tmp_path); jl = lens(tiny); rules = rules_for(tiny)
     def forbidden(): raise AssertionError("full state traversal occurred")

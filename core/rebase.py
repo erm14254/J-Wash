@@ -35,6 +35,7 @@ RMSNorm output: the preview and the exported checkpoint differ only by rounding.
 """
 
 from dataclasses import dataclass
+import functools
 
 import torch
 
@@ -86,6 +87,52 @@ def _submodule(block, dotted):
     return module
 
 
+def _bound_matches(method, module, function):
+    return (getattr(method, "__self__", None) is module
+            and getattr(method, "__func__", None) is function)
+
+
+def _supported_accelerate_hook(hook):
+    key = (type(hook).__module__, type(hook).__name__)
+    if key == ("accelerate.hooks", "AlignDevicesHook"):
+        return True
+    if key == ("accelerate.hooks", "SequentialHook"):
+        hooks = getattr(hook, "hooks", None)
+        return isinstance(hooks, tuple) and hooks and all(
+            _supported_accelerate_hook(item) for item in hooks
+        )
+    return False
+
+
+def validate_forward_provenance(module, expected_class, label):
+    """Require the class forward or Accelerate 1.14's exact wrapper shape."""
+    if (type(module).__module__, type(module).__name__) != expected_class:
+        raise ValueError(f"{label} class is not audited")
+    expected = type(module).forward
+    current = getattr(module, "forward", None)
+    old = getattr(module, "_old_forward", None)
+    hook = getattr(module, "_hf_hook", None)
+    if old is None and hook is None:
+        if not _bound_matches(current, module, expected):
+            raise ValueError(f"{label} forward provenance is not audited")
+        return
+    if not _supported_accelerate_hook(hook) or not _bound_matches(old, module, expected):
+        raise ValueError(f"{label} Accelerate wrapper is not audited")
+    if not isinstance(current, functools.partial) or current.args != (module,):
+        raise ValueError(f"{label} Accelerate wrapper shape is not audited")
+    wrapper = current.func
+    if (getattr(wrapper, "__module__", None) != "accelerate.hooks"
+            or getattr(wrapper, "__name__", None) != "new_forward"
+            or not _bound_matches(getattr(wrapper, "__wrapped__", None), module,
+                                  expected)):
+        raise ValueError(f"{label} Accelerate wrapper provenance is not audited")
+
+
+def _validate_direct_inventory(module, modules, parameters, label):
+    if set(module._modules) != set(modules) or set(module._parameters) != set(parameters):
+        raise ValueError(f"{label} child inventory is not audited")
+
+
 @dataclass(frozen=True)
 class TransformTarget:
     """A residual-coordinate tensor, without assuming ``nn.Linear.weight``.
@@ -120,8 +167,14 @@ class RebaseCapabilities:
 
 @dataclass(frozen=True)
 class TopologySpec:
-    mixers: tuple[str, ...]
+    mixers: tuple[tuple[str, tuple[str, str], tuple[str, ...], tuple[str, ...], str | None], ...]
+    mlp_class: tuple[str, str]
+    mlp_modules: tuple[str, ...]
+    mlp_parameters: tuple[str, ...] = ()
     packed: bool = False
+    router_class: tuple[str, str] | None = None
+    experts_class: tuple[str, str] | None = None
+    shared_expert_class: tuple[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -144,26 +197,31 @@ class ModelInventory:
     packed: bool
     exact_supported: bool
     exact_reason: str
+    final_head: tuple[str, object, object]
 
+
+_LLAMA = "transformers.models.llama.modeling_llama"
+_QWEN_MOE = "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe"
 
 AUDITED_DECODER_SPECS = {
-    ("transformers.models.llama.modeling_llama", "LlamaDecoderLayer"):
-        TopologySpec(("self_attn",)),
-    ("transformers.models.mistral.modeling_mistral", "MistralDecoderLayer"):
-        TopologySpec(("self_attn",)),
-    ("transformers.models.qwen2.modeling_qwen2", "Qwen2DecoderLayer"):
-        TopologySpec(("self_attn",)),
-    ("transformers.models.qwen3.modeling_qwen3", "Qwen3DecoderLayer"):
-        TopologySpec(("self_attn",)),
-    ("transformers.models.qwen3_5.modeling_qwen3_5", "Qwen3_5DecoderLayer"):
-        TopologySpec(("self_attn", "linear_attn")),
-    ("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe", "Qwen3_5MoeDecoderLayer"):
-        TopologySpec(("self_attn", "linear_attn"), packed=True),
-}
-
-_AUDITED_PACKED_ROUTERS = {
-    ("transformers.models.qwen3_5_moe.modeling_qwen3_5_moe",
-     "Qwen3_5MoeTopKRouter"),
+    (_LLAMA, "LlamaDecoderLayer"): TopologySpec(
+        (("self_attn", (_LLAMA, "LlamaAttention"),
+          ("q_proj", "k_proj", "v_proj", "o_proj"), (), None),),
+        (_LLAMA, "LlamaMLP"), ("gate_proj", "up_proj", "down_proj"),
+    ),
+    (_QWEN_MOE, "Qwen3_5MoeDecoderLayer"): TopologySpec(
+        (("self_attn", (_QWEN_MOE, "Qwen3_5MoeAttention"),
+          ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm"),
+          (), "full_attention"),
+         ("linear_attn", (_QWEN_MOE, "Qwen3_5MoeGatedDeltaNet"),
+          ("conv1d", "norm", "out_proj", "in_proj_qkv", "in_proj_z",
+           "in_proj_b", "in_proj_a"), ("dt_bias", "A_log"), "linear_attention")),
+        (_QWEN_MOE, "Qwen3_5MoeSparseMoeBlock"),
+        ("gate", "experts", "shared_expert", "shared_expert_gate"), packed=True,
+        router_class=(_QWEN_MOE, "Qwen3_5MoeTopKRouter"),
+        experts_class=(_QWEN_MOE, "Qwen3_5MoeExperts"),
+        shared_expert_class=(_QWEN_MOE, "Qwen3_5MoeMLP"),
+    ),
 }
 
 
@@ -203,15 +261,16 @@ def materialize_parameter_for_inspection(module, parameter_name):
         raise ParameterInspectionError(
             f"meta parameter {parameter_name!r} has no supported Accelerate weights_map"
         )
-    candidates = [parameter_name]
     try:
-        keys = list(weights_map.keys())
-    except (AttributeError, TypeError):
-        keys = []
-    candidates.extend(key for key in keys
-                      if isinstance(key, str) and key.rsplit(".", 1)[-1] == parameter_name)
+        value = weights_map[parameter_name]
+        if isinstance(value, torch.Tensor) and value.device.type != "meta":
+            return value.detach().cpu().clone()
+    except (KeyError, OSError, RuntimeError, ValueError, TypeError):
+        pass
+    prefix = getattr(weights_map, "prefix", None)
+    candidates = ([f"{prefix}{parameter_name}"] if isinstance(prefix, str) else [])
     errors = []
-    for key in dict.fromkeys(candidates):
+    for key in candidates:
         try:
             value = weights_map[key]
             if isinstance(value, torch.Tensor) and value.device.type != "meta":
@@ -299,19 +358,38 @@ def validate_rms_norm(norm, hidden, name="RMSNorm"):
 def _block_inventory(block, index, hidden, validated_norms):
     key = (type(block).__module__, type(block).__name__)
     spec = AUDITED_DECODER_SPECS.get(key)
-    instance_forward = "forward" in getattr(block, "__dict__", {})
-    accelerate_wrapped = (getattr(block, "_hf_hook", None) is not None
-                          and getattr(block, "_old_forward", None) is not None)
-    if spec is None or (instance_forward and not accelerate_wrapped):
+    if spec is None:
         raise ValueError(f"layer {index} decoder class or forward is not audited")
+    validate_forward_provenance(block, key, f"layer {index} decoder")
     for marker in _UNSUPPORTED_MARKERS:
         if getattr(block, marker, None) is not None:
             raise ValueError(f"layer {index} has unsupported residual branch {marker}")
     present_mixers = tuple(name for name in ("self_attn", "linear_attn")
                            if _submodule(block, name) is not None)
-    if len(present_mixers) != 1 or present_mixers[0] not in spec.mixers:
+    contracts = {item[0]: item for item in spec.mixers}
+    if len(present_mixers) != 1 or present_mixers[0] not in contracts:
         raise ValueError(f"layer {index} token-mixer topology is not audited")
     kind = present_mixers[0]
+    _kind, mixer_class, mixer_modules, mixer_parameters, discriminator = contracts[kind]
+    mixer_module = getattr(block, kind)
+    validate_forward_provenance(mixer_module, mixer_class, f"layer {index} {kind}")
+    _validate_direct_inventory(mixer_module, mixer_modules, mixer_parameters,
+                               f"layer {index} {kind}")
+    for child_name in mixer_modules:
+        child = getattr(mixer_module, child_name)
+        if child_name in ("q_norm", "k_norm"):
+            child_class = (_QWEN_MOE, "Qwen3_5MoeRMSNorm")
+        elif child_name == "norm":
+            child_class = (_QWEN_MOE, "Qwen3_5MoeRMSNormGated")
+        elif child_name == "conv1d":
+            child_class = (torch.nn.Conv1d.__module__, torch.nn.Conv1d.__name__)
+        else:
+            child_class = (torch.nn.Linear.__module__, torch.nn.Linear.__name__)
+        validate_forward_provenance(
+            child, child_class, f"layer {index} {kind}.{child_name}"
+        )
+    if discriminator is not None and getattr(block, "layer_type", None) != discriminator:
+        raise ValueError(f"layer {index} mixer discriminator is inconsistent")
     expected_children = {kind, "mlp", "input_layernorm", "post_attention_layernorm"}
     if set(getattr(block, "_modules", {})) != expected_children:
         raise ValueError(f"layer {index} has unlisted decoder modules")
@@ -322,6 +400,33 @@ def _block_inventory(block, index, hidden, validated_norms):
     sparse_present = _submodule(block, "mlp.experts.gate_up_proj") is not None
     if sparse_present != spec.packed:
         raise ValueError(f"layer {index} MLP topology is not audited")
+    mlp = block.mlp
+    validate_forward_provenance(mlp, spec.mlp_class, f"layer {index} mlp")
+    _validate_direct_inventory(mlp, spec.mlp_modules, spec.mlp_parameters,
+                               f"layer {index} mlp")
+    if spec.packed:
+        router, experts, shared = mlp.gate, mlp.experts, mlp.shared_expert
+        validate_forward_provenance(router, spec.router_class, f"layer {index} router")
+        validate_forward_provenance(experts, spec.experts_class, f"layer {index} experts")
+        validate_forward_provenance(shared, spec.shared_expert_class,
+                                    f"layer {index} shared expert")
+        router_parameters = (("weight", "bias") if spec.router_class ==
+                             (torch.nn.Linear.__module__, torch.nn.Linear.__name__)
+                             else ("weight",))
+        _validate_direct_inventory(router, (), router_parameters, f"layer {index} router")
+        _validate_direct_inventory(experts, (), ("gate_up_proj", "down_proj"),
+                                   f"layer {index} experts")
+        _validate_direct_inventory(shared, ("gate_proj", "up_proj", "down_proj"), (),
+                                   f"layer {index} shared expert")
+        for child_name in ("gate_proj", "up_proj", "down_proj"):
+            validate_forward_provenance(
+                getattr(shared, child_name),
+                (torch.nn.Linear.__module__, torch.nn.Linear.__name__),
+                f"layer {index} shared expert.{child_name}"
+            )
+        validate_forward_provenance(mlp.shared_expert_gate,
+                                    (torch.nn.Linear.__module__, torch.nn.Linear.__name__),
+                                    f"layer {index} shared expert gate")
     targets = [TransformTarget(path + ".weight", path, "input_layernorm")
                for path in mixer]
     if spec.packed:
@@ -350,13 +455,16 @@ def _block_inventory(block, index, hidden, validated_norms):
         if raw_packed:
             if not isinstance(module, torch.nn.Parameter) or tensor.ndim != 3:
                 raise ValueError(f"layer {index} packed reader {target.state_suffix} is modified")
-        elif (target.accessor == "mlp.gate" and spec.packed and
-              ((type(module).__module__, type(module).__name__) in _AUDITED_PACKED_ROUTERS
-               or type(module) is torch.nn.Linear)):
+        elif target.accessor == "mlp.gate" and spec.packed:
             if tensor.ndim != 2:
                 raise ValueError(f"layer {index} packed router storage is modified")
         elif (type(module) is not torch.nn.Linear or tensor.ndim != 2):
             raise ValueError(f"layer {index} reader {target.state_suffix} is not an audited Linear")
+        if isinstance(module, torch.nn.Module):
+            expected = (spec.router_class if target.accessor == "mlp.gate" else
+                        (torch.nn.Linear.__module__, torch.nn.Linear.__name__))
+            validate_forward_provenance(module, expected,
+                                        f"layer {index} reader {target.state_suffix}")
         if not tensor.dtype.is_floating_point or tensor.shape[target.axis] != hidden:
             raise ValueError(f"layer {index} reader {target.state_suffix} has invalid storage")
         reads.append((target, tensor, getattr(block, target.norm_name)))
@@ -378,6 +486,11 @@ def _block_inventory(block, index, hidden, validated_norms):
                     or getattr(writer, "bias", None) is not None
                     or not callable(getattr(writer, "register_forward_hook", None))):
                 exact_ok, exact_reason = False, f"residual writer {name} is unsupported"
+            else:
+                validate_forward_provenance(
+                    writer, (torch.nn.Linear.__module__, torch.nn.Linear.__name__),
+                    f"layer {index} writer {name}"
+                )
             writes.append((name, writer))
     return BlockInventory(index, kind, tuple(norms), tuple(reads), tuple(writes),
                           spec.packed, exact_ok, exact_reason)
@@ -387,7 +500,10 @@ def model_inventory(jl):
     layers = getattr(jl, "layers", None)
     if not layers:
         raise ValueError("model has no decoder blocks")
-    hidden = jl._lm_head.weight.shape[-1]
+    embed_weight = getattr(getattr(jl, "_embed_tokens", None), "weight", None)
+    if embed_weight is None or embed_weight.ndim != 2:
+        raise ValueError("embedding storage is unsupported")
+    hidden = embed_weight.shape[-1]
     blocks, validated_norms = [], set()
     block_ids, norm_layers, module_sites, tensor_sites, names = set(), {}, {}, {}, set()
     for index, block in enumerate(layers):
@@ -420,12 +536,37 @@ def model_inventory(jl):
     if id(final_norm) in norm_layers:
         raise ValueError("final norm aliases a decoder block norm")
     validate_rms_norm(final_norm, hidden, "final norm")
+    head = getattr(jl, "_lm_head", None)
+    head_weight = getattr(head, "weight", None)
+    validate_forward_provenance(
+        head, (torch.nn.Linear.__module__, torch.nn.Linear.__name__), "final lm_head"
+    )
+    _validate_direct_inventory(head, (), ("weight", "bias"), "final lm_head")
+    if (head_weight is None or head_weight.ndim != 2
+            or not head_weight.dtype.is_floating_point or head_weight.shape[1] != hidden
+            or getattr(head, "bias", None) is not None
+            or not callable(getattr(head, "register_forward_hook", None))):
+        raise ValueError("final lm_head storage or execution contract is unsupported")
+    head_name = f"{jl.layout.lm_head}.weight"
+    if head_name in names:
+        raise ValueError("duplicate final checkpoint target")
+    if id(head) in module_sites or id(head_weight) in tensor_sites:
+        raise ValueError("final lm_head aliases a decoder reader or writer")
+    if head_weight is embed_weight:
+        embed = jl._embed_tokens
+        validate_forward_provenance(
+            embed, (torch.nn.Embedding.__module__, torch.nn.Embedding.__name__),
+            "tied embedding"
+        )
+        if embed_weight.ndim != 2 or embed_weight.shape[1] != hidden:
+            raise ValueError("tied embedding/head contract is incomplete")
     packed = any(block.packed for block in blocks)
     exact_ok = not packed and all(block.exact_supported for block in blocks)
     reason = ("packed residual writers are unsupported" if packed else
               next((block.exact_reason for block in blocks
                     if not block.exact_supported), "supported"))
-    return ModelInventory(tuple(blocks), final_norm, hidden, packed, exact_ok, reason)
+    return ModelInventory(tuple(blocks), final_norm, hidden, packed, exact_ok, reason,
+                          (head_name, head, head_weight))
 
 
 def block_capabilities(block, _validated_norms=None):
@@ -440,7 +581,27 @@ def block_capabilities(block, _validated_norms=None):
         return RebaseCapabilities(False, str(exc), False, f"readthrough unsupported: {exc}")
 
 
+PACKED_EXACT_REASON = "exact mode is unavailable for packed MoE models"
+
+
+def _deny_known_packed_exact(jl):
+    """Deny only an entirely canonical packed decoder class; never grants support."""
+    layers = getattr(jl, "layers", None)
+    packed_key = (_QWEN_MOE, "Qwen3_5MoeDecoderLayer")
+    if layers and all((type(block).__module__, type(block).__name__) == packed_key
+                      for block in layers):
+        try:
+            for index, block in enumerate(layers):
+                validate_forward_provenance(block, packed_key,
+                                            f"layer {index} decoder")
+        except ValueError:
+            return
+        raise ValueError(PACKED_EXACT_REASON)
+
+
 def model_preflight(jl, *, exact=False):
+    if exact:
+        _deny_known_packed_exact(jl)
     inventory = model_inventory(jl)
     if exact and not inventory.exact_supported:
         raise ValueError("exact mode is unavailable for this model: " + inventory.exact_reason)
@@ -609,7 +770,7 @@ def apply_transform(entry, W):
     return apply_write(W, X, Y)
 
 
-def build_plan(rules, jl, scale, exact=False):
+def build_plan(rules, jl, scale, exact=False, *, inventory=None):
     """Bake plan: ``{param_name: entry}`` with ``entry = ("read", Ug, Vg)`` or
     ``("write", U_inv, V)`` — apply with :func:`apply_transform` — plus the
     diagnostic metadata.
@@ -619,7 +780,7 @@ def build_plan(rules, jl, scale, exact=False):
     done by the export."""
     from core.capabilities import ensure_unquantized
     ensure_unquantized(jl)
-    inventory = model_preflight(jl, exact=exact)
+    inventory = inventory or model_preflight(jl, exact=exact)
     active = [r for r in rules if r["layers"]]
     if not active:
         raise ValueError("no active rule (all have 0 layers): nothing to export")
@@ -652,8 +813,8 @@ def build_plan(rules, jl, scale, exact=False):
                 transforms[f"{path}.layers.{m}.{suffix}.weight"] = ("write", U_inv, Vw)
 
     U, V = cums[n_layers]
-    Ug, Vg = gamma_pair(jl._final_norm, U, V)
-    lm_head_key = f"{jl.layout.lm_head}.weight"
+    Ug, Vg = gamma_pair(inventory.final_norm, U, V)
+    lm_head_key, _head, _head_weight = inventory.final_head
     transforms[lm_head_key] = ("read", Ug, Vg)
 
     tied = jl._lm_head.weight.data_ptr() == jl._embed_tokens.weight.data_ptr()

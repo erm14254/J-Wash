@@ -1587,7 +1587,7 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
         try:
             result = _export_rebase_impl(
                 rules, jl, model_meta, fmt=fmt, name=name, source_dir=source_dir,
-                scale=scale, exact=exact, out_dir=stage,
+                scale=scale, exact=exact, out_dir=stage, inventory=inventory,
             )
             stage.replace(final_dir)
             result["out_dir"] = str(final_dir)
@@ -1597,7 +1597,7 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
 
 
 def _export_rebase_impl(rules, jl, model_meta, *, fmt, name, source_dir=None,
-                        scale=1.0, exact=False, out_dir):
+                        scale=1.0, exact=False, out_dir, inventory=None):
     """Pure-weight export by change of basis of the reads (cf. core/rebase).
 
     ``readthrough`` (exact=False): the downstream read matrices + lm_head.
@@ -1613,13 +1613,16 @@ def _export_rebase_impl(rules, jl, model_meta, *, fmt, name, source_dir=None,
     method = "rebase-exact" if exact else "rebase-readthrough"
     if fmt not in ("full", "layers", "lora"):
         raise ValueError(f"unknown format for {method}: {fmt}")
-    transforms, info = rebase.build_plan(rules, jl, scale, exact=exact)
+    inventory = inventory or rebase.model_preflight(jl, exact=exact)
+    transforms, info = rebase.build_plan(
+        rules, jl, scale, exact=exact, inventory=inventory
+    )
     lm_head_key = info["lm_head_key"]
 
     # The cached fact drives API eligibility; repeat this cheap topology fact at
     # deep execution so direct callers with legacy metadata cannot bypass it.
     packed_model = (bool(model_meta.get("has_packed_read_parameters"))
-                    or rebase.has_packed_read_parameters(jl))
+                    or inventory.packed)
     packed = [key for key, target in info["targets"].items()
               if not target.lora_supported or target.tensor(jl.layers[int(key.split(".layers.", 1)[1].split(".", 1)[0])]).ndim > 2]
     if (packed_model or packed) and fmt == "lora":

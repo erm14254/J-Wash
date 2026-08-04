@@ -105,15 +105,23 @@ class SyntheticPackedDecoderBlock(SyntheticDecoderBlock):
     pass
 
 
-# Production has no generic fallback; tests explicitly audit their purpose-built
-# structural fixture in the same way as a real Transformers decoder class.
-rebase.AUDITED_DECODER_SPECS[(SyntheticDecoderBlock.__module__,
-                              SyntheticDecoderBlock.__name__)] = rebase.TopologySpec(
-    ("self_attn", "linear_attn"), packed=False
+SYNTHETIC_DENSE_SPEC = rebase.TopologySpec(
+    (("self_attn", (nn.Module.__module__, nn.Module.__name__),
+      ("q_proj", "k_proj", "v_proj", "o_proj"), (), None),
+     ("linear_attn", (nn.Module.__module__, nn.Module.__name__),
+      ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"),
+      (), None)),
+    (nn.Module.__module__, nn.Module.__name__),
+    ("gate_proj", "up_proj", "down_proj"),
 )
-rebase.AUDITED_DECODER_SPECS[(SyntheticPackedDecoderBlock.__module__,
-                              SyntheticPackedDecoderBlock.__name__)] = rebase.TopologySpec(
-    ("self_attn", "linear_attn"), packed=True
+
+SYNTHETIC_PACKED_SPEC = rebase.TopologySpec(
+    SYNTHETIC_DENSE_SPEC.mixers,
+    (nn.Module.__module__, nn.Module.__name__),
+    ("gate", "experts", "shared_expert", "shared_expert_gate"), packed=True,
+    router_class=(nn.Linear.__module__, nn.Linear.__name__),
+    experts_class=(nn.Module.__module__, nn.Module.__name__),
+    shared_expert_class=(nn.Module.__module__, nn.Module.__name__),
 )
 
 

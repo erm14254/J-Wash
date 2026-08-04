@@ -76,7 +76,7 @@ def test_audited_decoder_class_and_alias_contracts_fail_closed():
                 _final_norm=unknown.post_attention_layernorm))
     finally:
         rebase.AUDITED_DECODER_SPECS[(type(unknown).__module__, type(unknown).__name__)] = (
-            rebase.TopologySpec(("self_attn", "linear_attn"), packed=False))
+            SYNTHETIC_DENSE_SPEC)
 
     cases = []
     jl = dense_lens(); jl.layers = nn.ModuleList([jl.layers[0], jl.layers[0]]); cases.append(jl)
@@ -112,6 +112,25 @@ def test_modified_and_noncanonical_dense_topologies_fail_closed():
         rebase.model_preflight(jl)
 
 
+def test_final_head_contract_and_explicit_embedding_tie():
+    assert rebase.model_preflight(dense_lens()).final_head[0] == "lm_head.weight"
+    tied = dense_lens(); tied._lm_head.weight = tied._embed_tokens.weight
+    assert rebase.model_preflight(tied).final_head[2] is tied._embed_tokens.weight
+
+    bad = []
+    jl = dense_lens(); jl._lm_head.weight = jl.layers[0].self_attn.q_proj.weight; bad.append(jl)
+    jl = dense_lens(); jl._lm_head.forward = lambda x: x; bad.append(jl)
+    jl = dense_lens(); jl._lm_head = nn.Sequential(nn.Linear(8, 17, False)); bad.append(jl)
+    jl = dense_lens(); jl._lm_head.bias = nn.Parameter(torch.zeros(17)); bad.append(jl)
+    jl = dense_lens(); jl._lm_head.weight = nn.Parameter(torch.ones(17, 2, 4)); bad.append(jl)
+    jl = dense_lens(); jl._lm_head.weight = nn.Parameter(torch.ones(17, 7)); bad.append(jl)
+    jl = dense_lens(); jl._lm_head.weight = nn.Parameter(torch.ones(17, 8, dtype=torch.int8),
+                                                         requires_grad=False); bad.append(jl)
+    for candidate in bad:
+        with pytest.raises((ValueError, AttributeError)):
+            rebase.model_preflight(candidate)
+
+
 @pytest.mark.parametrize("layer", [0, 1, 2])
 def test_packed_exact_is_model_wide_and_live_rejection_is_clean(tiny, layer):
     jl = lens(tiny); rules = rule_at(tiny, layer)
@@ -122,6 +141,23 @@ def test_packed_exact_is_model_wide_and_live_rejection_is_clean(tiny, layer):
     with pytest.raises(ValueError, match="exact mode is unavailable for this model"):
         iv.attach(jl)
     assert before == [len(module._forward_hooks) for module in tiny.modules()]
+    assert iv._handles == []
+
+
+@pytest.mark.parametrize("layer", [0, 1, 2])
+def test_packed_exact_denies_before_norm_materialization(tiny, layer, monkeypatch):
+    jl, rules = lens(tiny), rule_at(tiny, layer)
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("packed exact reached semantic materialization")
+    monkeypatch.setattr(rebase, "validate_rms_norm", forbidden)
+    monkeypatch.setattr(rebase, "materialize_parameter_for_inspection", forbidden)
+    with pytest.raises(ValueError, match="exact mode is unavailable for packed"):
+        rebase.model_preflight(jl, exact=True)
+    with pytest.raises(ValueError, match="exact mode is unavailable for packed"):
+        rebase.build_plan(rules, jl, 1.0, exact=True)
+    iv = Interventions(); iv._rules = rules; iv.set_mode("exact")
+    with pytest.raises(ValueError, match="exact mode is unavailable for packed"):
+        iv.attach(jl)
     assert iv._handles == []
 
 
@@ -204,17 +240,22 @@ def test_production_width_qwen35_moe_block_capability(hidden, monkeypatch):
     b.self_attn.q_proj = nn.Linear(hidden, 8, False, dtype=torch.bfloat16)
     b.self_attn.k_proj = nn.Linear(hidden, 8, False, dtype=torch.bfloat16)
     b.self_attn.v_proj = nn.Linear(hidden, 8, False, dtype=torch.bfloat16)
+    b.self_attn.o_proj = nn.Linear(8, hidden, False, dtype=torch.bfloat16)
     b.mlp = nn.Module(); b.mlp.gate = nn.Linear(hidden, 4, False, dtype=torch.bfloat16)
     b.mlp.experts = nn.Module(); b.mlp.experts.gate_up_proj = nn.Parameter(torch.randn(2, 8, hidden, dtype=torch.bfloat16))
+    b.mlp.experts.down_proj = nn.Parameter(torch.randn(2, hidden, 4,
+                                                       dtype=torch.bfloat16))
     b.mlp.shared_expert = nn.Module()
     b.mlp.shared_expert.gate_proj = nn.Linear(hidden, 8, False, dtype=torch.bfloat16)
     b.mlp.shared_expert.up_proj = nn.Linear(hidden, 8, False, dtype=torch.bfloat16)
+    b.mlp.shared_expert.down_proj = nn.Linear(8, hidden, False,
+                                              dtype=torch.bfloat16)
     b.mlp.shared_expert_gate = nn.Linear(hidden, 1, False, dtype=torch.bfloat16)
     b.input_layernorm = Qwen3_5MoeRMSNorm(hidden).to(torch.bfloat16)
     b.post_attention_layernorm = Qwen3_5MoeRMSNorm(hidden).to(torch.bfloat16)
     monkeypatch.setitem(rebase.AUDITED_DECODER_SPECS,
                         (type(b).__module__, type(b).__name__),
-                        rebase.TopologySpec(("self_attn",), packed=True))
+                        SYNTHETIC_PACKED_SPEC)
     cap = rebase.block_capabilities(b)
     assert cap.readthrough_supported and not cap.exact_supported
 
@@ -355,6 +396,39 @@ def test_dense_live_hooks_match_baked_reader_and_writer_transforms(exact):
     if exact:
         baked_writer = torch.nn.functional.linear(h, writer_baked)
         torch.testing.assert_close(live_writer, baked_writer, rtol=2e-5, atol=2e-6)
+
+
+@pytest.mark.parametrize("exact", [False, True])
+def test_real_tiny_llama_live_logits_match_baked_plan(exact):
+    from transformers import LlamaConfig, LlamaForCausalLM
+    config = LlamaConfig(vocab_size=31, hidden_size=16, intermediate_size=24,
+                         num_hidden_layers=2, num_attention_heads=2,
+                         num_key_value_heads=1, max_position_embeddings=32)
+    torch.manual_seed(17)
+    model = LlamaForCausalLM(config).float().eval()
+    baked = copy.deepcopy(model).eval()
+    jl = lens(model)
+    direction = torch.randn(16); direction /= direction.norm()
+    rules = [{"id": 1, "token_id": 1, "token": "x", "mode": "scale",
+              "factor": 0.9, "replacement_id": None, "replacement": None,
+              "layers": [0], "dirs_a": {0: direction}, "dirs_b": None}]
+    transforms, _ = rebase.build_plan(rules, jl, 1.0, exact=exact)
+    state = baked.state_dict()
+    for key, transform in transforms.items():
+        state[key] = rebase.apply_transform(transform, state[key].float())[0]
+    baked.load_state_dict(state)
+    iv = Interventions(); iv._rules = rules
+    iv.set_mode("exact" if exact else "readthrough")
+    ids = torch.tensor([[1, 7, 4, 9]])
+    iv.attach(jl)
+    try:
+        with torch.no_grad():
+            live_logits = model(ids).logits
+    finally:
+        iv.detach()
+    with torch.no_grad():
+        baked_logits = baked(ids).logits
+    torch.testing.assert_close(live_logits, baked_logits, rtol=3e-3, atol=3e-4)
 
 
 @pytest.mark.parametrize("base", ["COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³"])

@@ -372,7 +372,8 @@ class Interventions:
                 for _suffix, module in block_inventory.writes:
                     sites.append((module, write_hook_for(module, U_inv, Vw)))
         U, V = cums[n_layers]
-        sites.append((jl._final_norm, read_hook_for(jl._final_norm, U, V)))
+        sites.append((inventory.final_norm,
+                      read_hook_for(inventory.final_norm, U, V)))
         handles = []
         try:
             for module, hook in sites:

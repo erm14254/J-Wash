@@ -75,3 +75,44 @@ def test_profile_construction_inspects_each_unique_norm_once(monkeypatch):
     monkeypatch.setattr(app, "gpu_stats", lambda: [])
     app.api_status()
     assert len(calls) == 5
+
+
+def test_forward_provenance_accepts_only_authentic_accelerate_wrapper():
+    from accelerate.hooks import AlignDevicesHook, add_hook_to_module
+    expected = (nn.Linear.__module__, nn.Linear.__name__)
+    module = nn.Linear(4, 4, False)
+    add_hook_to_module(module, AlignDevicesHook(execution_device="cpu"))
+    rebase.validate_forward_provenance(module, expected, "linear")
+
+    replaced = module
+    replaced.forward = lambda x: x
+    with pytest.raises(ValueError, match="wrapper shape"):
+        rebase.validate_forward_provenance(replaced, expected, "linear")
+
+    fabricated = nn.Linear(4, 4, False)
+    fabricated._hf_hook = SimpleNamespace()
+    fabricated._old_forward = fabricated.forward
+    fabricated.forward = lambda x: x
+    with pytest.raises(ValueError, match="Accelerate wrapper"):
+        rebase.validate_forward_provenance(fabricated, expected, "linear")
+
+    wrong_old = nn.Linear(4, 4, False)
+    other = nn.Linear(4, 4, False)
+    add_hook_to_module(wrong_old, AlignDevicesHook(execution_device="cpu"))
+    wrong_old._old_forward = other.forward
+    with pytest.raises(ValueError, match="Accelerate wrapper"):
+        rebase.validate_forward_provenance(wrong_old, expected, "linear")
+
+
+def test_meta_parameter_direct_lazy_lookup_never_iterates_keys():
+    module = nn.Linear(4, 4, False, device="meta")
+    value = torch.randn(4, 4)
+    class LazyMap:
+        def __getitem__(self, key):
+            if key == "weight": return value
+            raise KeyError(key)
+        def keys(self): raise AssertionError("lazy keyspace must not be enumerated")
+    module._hf_hook = SimpleNamespace(weights_map=LazyMap())
+    got = rebase.materialize_parameter_for_inspection(module, "weight")
+    assert got.device.type == "cpu" and got._base is None
+    assert torch.equal(got, value) and got.data_ptr() != value.data_ptr()
