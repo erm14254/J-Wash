@@ -275,7 +275,7 @@ def test_norm_semantics_and_final_norm_preflight(tiny):
         cap = rebase.block_capabilities(dense)
         assert not cap.readthrough_supported and "class is not audited" in cap.readthrough_reason
     bad = lens(tiny); bad._final_norm = nn.LayerNorm(32, bias=False)
-    with pytest.raises(ValueError, match="LayerNorm"):
+    with pytest.raises(ValueError, match="class is not audited"):
         rebase.model_preflight(bad)
     for value, phrase in ((SimpleNamespace(weight=torch.ones(32)), "noncallable"),
                           (lambda x: x, "hookable")):
