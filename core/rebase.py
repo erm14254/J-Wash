@@ -37,7 +37,6 @@ RMSNorm output: the preview and the exported checkpoint differ only by rounding.
 from dataclasses import dataclass
 import functools
 import types
-import weakref
 
 import torch
 import transformers
@@ -124,8 +123,9 @@ def class_contract(cls):
 
 
 def _bound_matches(method, module, function):
-    return (getattr(method, "__self__", None) is module
-            and getattr(method, "__func__", None) is function)
+    return (type(method) is types.MethodType
+            and method.__self__ is module
+            and method.__func__ is function)
 
 
 def _supported_accelerate_hook(hook):
@@ -155,13 +155,17 @@ def validate_forward_provenance(module, expected_class, label):
     if (not _supported_accelerate_hook(hook) or type(old) is not types.MethodType
             or not _bound_matches(old, module, expected)):
         raise ValueError(f"{label} Accelerate wrapper is not audited")
-    if (type(current) is not functools.partial or current.args != (module,)
-            or current.keywords):
+    if (type(current) is not functools.partial or len(current.args) != 1
+            or current.args[0] is not module or current.keywords):
         raise ValueError(f"{label} Accelerate wrapper shape is not audited")
     wrapper = current.func
     if (type(wrapper) is not types.FunctionType
             or wrapper.__code__ is not _ACCELERATE_WRAPPER_CODE
-            or getattr(current, "__wrapped__", None) is not old):
+            or getattr(current, "__wrapped__", None) is not old
+            or wrapper.__globals__.get("AlignDevicesHook") is not AlignDevicesHook
+            or wrapper.__defaults__ is not None
+            or wrapper.__kwdefaults__ is not None
+            or wrapper.__closure__ is not None):
         raise ValueError(f"{label} Accelerate wrapper provenance is not audited")
 
 
@@ -181,6 +185,15 @@ def _validate_direct_inventory(module, modules, parameters, label, buffers=()):
             f"{label} child inventory is not audited: modules={tuple(module._modules)}, "
             f"parameters={tuple(module._parameters)}, buffers={tuple(module._buffers)}"
         )
+    for name in modules:
+        if getattr(module, name) is not module._modules[name]:
+            raise ValueError(f"{label}.{name} is not the registered child module")
+    for name in parameters:
+        if getattr(module, name) is not module._parameters[name]:
+            raise ValueError(f"{label}.{name} is not the registered parameter")
+    for name in buffers:
+        if getattr(module, name) is not module._buffers[name]:
+            raise ValueError(f"{label}.{name} is not the registered buffer")
 
 
 @dataclass(frozen=True)
@@ -241,10 +254,8 @@ class BlockInventory:
     exact_reason: str
 
 
-_INVENTORY_TOKEN = object()
 
-
-@dataclass(frozen=True, slots=True, weakref_slot=True)
+@dataclass(frozen=True, slots=True)
 class ModelInventory:
     blocks: tuple[BlockInventory, ...]
     final_norm: object
@@ -257,7 +268,6 @@ class ModelInventory:
     tied: bool
     owner: object
     layer_ids: tuple[int, ...]
-    token: object
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,11 +278,24 @@ class StorageSpan:
 
 
 def storage_span(tensor):
-    if not isinstance(tensor, torch.Tensor) or tensor.device.type == "meta":
+    if not isinstance(tensor, torch.Tensor):
         return None
+    if tensor.device.type == "meta":
+        return None
+    if not tensor.is_contiguous():
+        raise ValueError("editing-relevant tensor storage is non-contiguous")
     storage = tensor.untyped_storage()
     start = tensor.storage_offset() * tensor.element_size()
     return StorageSpan(storage._cdata, start, start + tensor.numel() * tensor.element_size())
+
+
+def _offloaded_registered_span(module, parameter_name, tensor):
+    if not isinstance(tensor, torch.Tensor) or tensor.device.type != "meta":
+        return None
+    materialized = materialize_parameter_for_inspection(module, parameter_name)
+    if materialized.device.type != "cpu" or not materialized.is_contiguous():
+        raise ValueError("offloaded tensor storage cannot be classified safely")
+    return StorageSpan(-id(tensor), 0, materialized.numel() * materialized.element_size())
 
 
 def _overlaps(left, right):
@@ -287,8 +310,6 @@ _SILU = class_contract(SiLUActivation)
 _LLAMA_NORM = class_contract(llama_modeling.LlamaRMSNorm)
 _QWEN_NORM = class_contract(qwen_moe_modeling.Qwen3_5MoeRMSNorm)
 _QWEN_GATED_NORM = class_contract(qwen_moe_modeling.Qwen3_5MoeRMSNormGated)
-_VALID_INVENTORIES = weakref.WeakValueDictionary()
-
 AUDITED_DECODER_SPECS = {
     llama_modeling.LlamaDecoderLayer: TopologySpec(
         class_contract(llama_modeling.LlamaDecoderLayer),
@@ -497,35 +518,62 @@ def _block_inventory(block, index, hidden, validated_norms):
         else:
             _validate_direct_inventory(child, (), ("weight",), child_label)
     if discriminator is not None:
-        block_discriminator = getattr(block, "layer_type", None)
+        layer_type = getattr(block, "layer_type", None)
+        block_type = getattr(block, "block_type", None)
         mixer_discriminator = getattr(mixer_module, "layer_type", None)
         version = Version(transformers.__version__)
-        valid = ((block_discriminator == discriminator and mixer_discriminator is None)
-                 if version < Version("5.14") else
-                 (mixer_discriminator == discriminator and block_discriminator is None)
-                 if kind == "linear_attn" else
-                 (block_discriminator is None and mixer_discriminator is None))
+        if version < Version("5.14"):
+            valid = layer_type == discriminator and block_type is None
+        else:
+            valid = block_type == discriminator and layer_type is None
+            if kind == "linear_attn":
+                valid = valid and mixer_discriminator in (None, discriminator)
+            else:
+                valid = valid and mixer_discriminator is None
         if not valid:
             raise ValueError(
                 f"layer {index} mixer discriminator is inconsistent: "
-                f"block={block_discriminator!r}, mixer={mixer_discriminator!r}, "
-                f"expected={discriminator!r}"
+                f"layer_type={layer_type!r}, block_type={block_type!r}, "
+                f"mixer={mixer_discriminator!r}, expected={discriminator!r}"
             )
     if kind == "self_attn" and spec.decoder.cls in (
             llama_modeling.LlamaDecoderLayer, qwen_moe_modeling.Qwen3_5MoeDecoderLayer):
         q, k, v, o = (mixer_module.q_proj.weight, mixer_module.k_proj.weight,
                       mixer_module.v_proj.weight, mixer_module.o_proj.weight)
-        q_multiplier = (2 if spec.decoder.cls is qwen_moe_modeling.Qwen3_5MoeDecoderLayer
-                        else 1)
-        if (q.shape[0] != q_multiplier * o.shape[1] or k.shape != v.shape
-                or o.shape[0] != hidden or any(weight.shape[1] != hidden
-                                               for weight in (q, k, v))):
+        num_heads = getattr(mixer_module, "num_heads", None)
+        num_kv_heads = getattr(mixer_module, "num_key_value_heads", None)
+        head_dim = getattr(mixer_module, "head_dim", None)
+        scaling = getattr(mixer_module, "scaling", None)
+        if isinstance(num_heads, int) and isinstance(head_dim, int):
+            q_out = num_heads * head_dim
+            if q.shape[0] != q_out or o.shape[1] != q_out:
+                raise ValueError(f"layer {index} attention projection dimensions are modified")
+        if isinstance(num_kv_heads, int) and isinstance(head_dim, int):
+            kv_out = num_kv_heads * head_dim
+            if k.shape[0] != kv_out or v.shape[0] != kv_out:
+                raise ValueError(f"layer {index} attention projection dimensions are modified")
+        if (k.shape != v.shape or o.shape[0] != hidden
+                or any(weight.shape[1] != hidden for weight in (q, k, v))
+                or not all(weight.dtype.is_floating_point for weight in (q, k, v, o))):
             raise ValueError(f"layer {index} attention projection dimensions are modified")
+        if scaling is not None and not isinstance(scaling, (float, int)):
+            raise ValueError(f"layer {index} attention configuration is modified")
     if (kind == "linear_attn" and spec.packed
             and mixer_class.cls is qwen_moe_modeling.Qwen3_5MoeGatedDeltaNet):
         dt_bias, a_log = mixer_module.dt_bias, mixer_module.A_log
+        conv = mixer_module.conv1d
+        qkv, z, b, a, out_proj = (mixer_module.in_proj_qkv.weight,
+                                  mixer_module.in_proj_z.weight,
+                                  mixer_module.in_proj_b.weight,
+                                  mixer_module.in_proj_a.weight,
+                                  mixer_module.out_proj.weight)
         if (dt_bias.ndim != 1 or a_log.ndim != 1 or dt_bias.shape != a_log.shape
-                or not dt_bias.dtype.is_floating_point or not a_log.dtype.is_floating_point):
+                or not dt_bias.dtype.is_floating_point or not a_log.dtype.is_floating_point
+                or qkv.shape[1] != hidden or any(weight.shape[1] != hidden for weight in (z, b, a))
+                or out_proj.shape[0] != hidden or out_proj.shape[1] != z.shape[0]
+                or conv.weight.ndim != 3 or conv.bias is not None
+                or conv.groups != conv.in_channels or conv.weight.shape[0] != conv.in_channels
+                or conv.weight.shape[1] != 1):
             raise ValueError(f"layer {index} linear attention raw parameters are modified")
     expected_children = {kind, "mlp", "input_layernorm", "post_attention_layernorm"}
     _validate_direct_inventory(block, expected_children, (), f"layer {index} decoder")
@@ -690,11 +738,17 @@ def model_inventory(jl):
     hidden = embed_weight.shape[-1]
     blocks, validated_norms = [], set()
     block_ids, norm_layers, module_sites, tensor_sites, names = set(), {}, {}, {}, set()
+    family = None
     decoder_spans = []
+    decoder_tensor_ids = set()
     for index, block in enumerate(layers):
         if id(block) in block_ids:
             raise ValueError("decoder block object is shared across layers")
         block_ids.add(id(block))
+        if family is None:
+            family = type(block)
+        elif type(block) is not family:
+            raise ValueError("mixed decoder families are not audited")
         inventory = _block_inventory(block, index, hidden, validated_norms)
         for norm_name, norm in inventory.norms:
             previous = norm_layers.setdefault(id(norm), index)
@@ -721,11 +775,21 @@ def model_inventory(jl):
                     raise ValueError("decoder reader/writer storage aliases another site")
                 if span is not None:
                     decoder_spans.append(span)
+                    decoder_tensor_ids.add(id(tensor))
+        for _name, tensor in tuple(block.named_parameters(recurse=True)) + tuple(block.named_buffers(recurse=True)):
+            if id(tensor) in decoder_tensor_ids:
+                continue
+            span = storage_span(tensor)
+            if any(_overlaps(span, prior) for prior in decoder_spans):
+                raise ValueError("decoder storage aliases another audited site")
+            if span is not None:
+                decoder_spans.append(span)
+                decoder_tensor_ids.add(id(tensor))
         blocks.append(inventory)
     final_norm = getattr(jl, "_final_norm", None)
     if id(final_norm) in norm_layers:
         raise ValueError("final norm aliases a decoder block norm")
-    final_spec = AUDITED_DECODER_SPECS[type(layers[0])]
+    final_spec = AUDITED_DECODER_SPECS[family]
     validate_rms_norm(final_norm, hidden, "final norm", final_spec.norm_class)
     head = getattr(jl, "_lm_head", None)
     head_weight = getattr(head, "weight", None)
@@ -744,17 +808,24 @@ def model_inventory(jl):
     if id(head) in module_sites or id(head_weight) in tensor_sites:
         raise ValueError("final lm_head aliases a decoder reader or writer")
     head_span, embed_span = storage_span(head_weight), storage_span(embed_weight)
+    if head_span is None and head_weight is not embed_weight:
+        head_span = _offloaded_registered_span(head, "weight", head_weight)
+    if embed_span is None and embed_weight is not head_weight:
+        embed_span = _offloaded_registered_span(embed, "weight", embed_weight)
+    config = getattr(getattr(jl, "_hf_model", None), "config", None)
+    declared_tie = getattr(config, "tie_word_embeddings", False) is True
     tied = head_weight is embed_weight
-    if not tied and _overlaps(head_span, embed_span):
+    if declared_tie != tied:
+        raise ValueError("embedding/head tie declaration does not match physical parameters")
+    if head_span is None or embed_span is None:
+        if not tied:
+            raise ValueError("embedding/head storage cannot be classified safely")
+    elif not tied and _overlaps(head_span, embed_span):
         raise ValueError("distinct embedding and head parameters share storage")
     if any(_overlaps(span, head_span) or _overlaps(span, embed_span)
            for span in decoder_spans):
         raise ValueError("embedding or head storage aliases decoder storage")
-    if tied:
-        config = getattr(getattr(jl, "_hf_model", None), "config", None)
-        if getattr(config, "tie_word_embeddings", None) is not True:
-            raise ValueError("embedding/head tie is not declared by model configuration")
-    if embed_weight.ndim != 2 or embed_weight.shape[1] != hidden:
+    if embed_weight.ndim != 2 or embed_weight.shape[1] != hidden or embed_weight.shape[0] != head_weight.shape[0] or not embed_weight.dtype.is_floating_point:
         raise ValueError("embedding/head contract is incomplete")
     packed = any(block.packed for block in blocks)
     exact_ok = not packed and all(block.exact_supported for block in blocks)
@@ -762,12 +833,10 @@ def model_inventory(jl):
               next((block.exact_reason for block in blocks
                     if not block.exact_supported), "supported"))
     embed_name = f"{jl.layout.path}.{jl.layout.embed}.weight"
-    result = ModelInventory(tuple(blocks), final_norm, hidden, packed, exact_ok, reason,
-                            (head_name, head, head_weight),
-                            (embed_name, embed, embed_weight), tied, jl,
-                            tuple(id(block) for block in layers), _INVENTORY_TOKEN)
-    _VALID_INVENTORIES[id(result)] = result
-    return result
+    return ModelInventory(tuple(blocks), final_norm, hidden, packed, exact_ok, reason,
+                          (head_name, head, head_weight),
+                          (embed_name, embed, embed_weight), tied, jl,
+                          tuple(id(block) for block in layers))
 
 
 def block_capabilities(block, _validated_norms=None):
@@ -799,12 +868,10 @@ def _deny_known_packed_exact(jl):
         raise ValueError(PACKED_EXACT_REASON)
 
 
-def validate_inventory_policy(inventory, jl, *, exact=False):
-    """Authenticate an opaque inventory and authorize its requested mode."""
-    if (type(inventory) is not ModelInventory or inventory.token is not _INVENTORY_TOKEN
-            or _VALID_INVENTORIES.get(id(inventory)) is not inventory
-            or inventory.owner is not jl):
-        raise ValueError("model inventory is not authentic for this model")
+def _validate_inventory_policy(inventory, jl, *, exact=False):
+    """Authorize an operation-private inventory for the exact requested mode."""
+    if type(inventory) is not ModelInventory or inventory.owner is not jl:
+        raise ValueError("model inventory does not belong to this model operation")
     layers = getattr(jl, "layers", None)
     if (layers is None or len(layers) != len(inventory.layer_ids)
             or tuple(id(block) for block in layers) != inventory.layer_ids
@@ -817,6 +884,22 @@ def validate_inventory_policy(inventory, jl, *, exact=False):
         if spec is None:
             raise ValueError("model topology is no longer audited")
         validate_forward_provenance(block, spec.decoder, f"layer {index} decoder")
+        block_inventory = inventory.blocks[index]
+        for target, tensor, norm in block_inventory.reads:
+            if target.tensor(block) is not tensor:
+                raise ValueError("model reader changed after inventory validation")
+            if getattr(block, target.norm_name, None) is not norm:
+                raise ValueError("model norm changed after inventory validation")
+        for suffix, module in block_inventory.writes:
+            if _submodule(block, suffix) is not module:
+                raise ValueError("model writer changed after inventory validation")
+    head_name, head, head_weight = inventory.final_head
+    embed_name, embed, embed_weight = inventory.embedding
+    if getattr(head, "weight", None) is not head_weight or getattr(embed, "weight", None) is not embed_weight:
+        raise ValueError("embedding/head storage changed after inventory validation")
+    declared_tie = getattr(getattr(getattr(jl, "_hf_model", None), "config", None), "tie_word_embeddings", False) is True
+    if declared_tie != inventory.tied or (head_weight is embed_weight) != inventory.tied:
+        raise ValueError("embedding/head tie changed after inventory validation")
     if exact and inventory.packed:
         raise ValueError(PACKED_EXACT_REASON)
     if exact and not inventory.exact_supported:
@@ -828,23 +911,23 @@ def model_preflight(jl, *, exact=False):
     if exact:
         _deny_known_packed_exact(jl)
     inventory = model_inventory(jl)
-    return validate_inventory_policy(inventory, jl, exact=exact)
+    return _validate_inventory_policy(inventory, jl, exact=exact)
 
 
 def has_packed_read_parameters(jl):
     return model_inventory(jl).packed
 
 
-def iter_reads(block, inventory=None):
-    inv = inventory or _block_inventory(
+def iter_reads(block):
+    inv = _block_inventory(
         block, 0, next(iter(_submodule(block, p).weight.shape[-1]
                             for p in ("self_attn.q_proj", "linear_attn.in_proj_qkv")
                             if _submodule(block, p) is not None)), set())
     yield from inv.reads
 
 
-def iter_writes(block, inventory=None):
-    inv = inventory or _block_inventory(
+def iter_writes(block):
+    inv = _block_inventory(
         block, 0, next(iter(_submodule(block, p).weight.shape[-1]
                             for p in ("self_attn.q_proj", "linear_attn.in_proj_qkv")
                             if _submodule(block, p) is not None)), set())
@@ -993,7 +1076,7 @@ def apply_transform(entry, W):
     return apply_write(W, X, Y)
 
 
-def build_plan(rules, jl, scale, exact=False, *, inventory=None):
+def build_plan(rules, jl, scale, exact=False):
     """Bake plan: ``{param_name: entry}`` with ``entry = ("read", Ug, Vg)`` or
     ``("write", U_inv, V)`` — apply with :func:`apply_transform` — plus the
     diagnostic metadata.
@@ -1003,10 +1086,12 @@ def build_plan(rules, jl, scale, exact=False, *, inventory=None):
     done by the export."""
     from core.capabilities import ensure_unquantized
     ensure_unquantized(jl)
-    if inventory is None:
-        inventory = model_preflight(jl, exact=exact)
-    else:
-        validate_inventory_policy(inventory, jl, exact=exact)
+    inventory = model_preflight(jl, exact=exact)
+    return _build_plan_from_inventory(rules, jl, scale, exact=exact, inventory=inventory)
+
+
+def _build_plan_from_inventory(rules, jl, scale, *, exact=False, inventory):
+    _validate_inventory_policy(inventory, jl, exact=exact)
     active = [r for r in rules if r["layers"]]
     if not active:
         raise ValueError("no active rule (all have 0 layers): nothing to export")

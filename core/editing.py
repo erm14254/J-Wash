@@ -1585,7 +1585,7 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
     with artifact_lease(stage):
         stage.mkdir()
         try:
-            result = _export_rebase_impl(
+            result = _export_rebase_impl_from_inventory(
                 rules, jl, model_meta, fmt=fmt, name=name, source_dir=source_dir,
                 scale=scale, exact=exact, out_dir=stage, inventory=inventory,
             )
@@ -1597,7 +1597,7 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
 
 
 def _export_rebase_impl(rules, jl, model_meta, *, fmt, name, source_dir=None,
-                        scale=1.0, exact=False, out_dir, inventory=None):
+                        scale=1.0, exact=False, out_dir):
     """Pure-weight export by change of basis of the reads (cf. core/rebase).
 
     ``readthrough`` (exact=False): the downstream read matrices + lm_head.
@@ -1613,11 +1613,18 @@ def _export_rebase_impl(rules, jl, model_meta, *, fmt, name, source_dir=None,
     method = "rebase-exact" if exact else "rebase-readthrough"
     if fmt not in ("full", "layers", "lora"):
         raise ValueError(f"unknown format for {method}: {fmt}")
-    if inventory is None:
-        inventory = rebase.model_preflight(jl, exact=exact)
-    else:
-        rebase.validate_inventory_policy(inventory, jl, exact=exact)
-    transforms, info = rebase.build_plan(
+    inventory = rebase.model_preflight(jl, exact=exact)
+    return _export_rebase_impl_from_inventory(
+        rules, jl, model_meta, fmt=fmt, name=name, source_dir=source_dir,
+        scale=scale, exact=exact, out_dir=out_dir, inventory=inventory,
+    )
+
+
+def _export_rebase_impl_from_inventory(rules, jl, model_meta, *, fmt, name, source_dir=None,
+                                       scale=1.0, exact=False, out_dir, inventory):
+    method = "rebase-exact" if exact else "rebase-readthrough"
+    rebase._validate_inventory_policy(inventory, jl, exact=exact)
+    transforms, info = rebase._build_plan_from_inventory(
         rules, jl, scale, exact=exact, inventory=inventory
     )
     lm_head_key = info["lm_head_key"]

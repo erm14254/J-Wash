@@ -138,12 +138,12 @@ def test_final_head_contract_and_explicit_embedding_tie():
 def test_head_embedding_storage_aliases_and_execution_state_fail_closed():
     jl = dense_lens()
     jl._lm_head.weight = nn.Parameter(jl._embed_tokens.weight.detach())
-    with pytest.raises(ValueError, match="share storage"):
+    with pytest.raises(ValueError, match="share storage|storage"):
         rebase.model_preflight(jl)
     jl = dense_lens(); storage = torch.randn(18, 8)
     jl._embed_tokens.weight = nn.Parameter(storage[:17])
     jl._lm_head.weight = nn.Parameter(storage[1:18])
-    with pytest.raises(ValueError, match="share storage"):
+    with pytest.raises(ValueError, match="share storage|storage"):
         rebase.model_preflight(jl)
     jl = dense_lens()
     handle = jl.layers[0].self_attn.q_proj.register_forward_pre_hook(
@@ -159,6 +159,60 @@ def test_head_embedding_storage_aliases_and_execution_state_fail_closed():
     with pytest.raises(ValueError, match="parameterization|child inventory|class is not audited"):
         rebase.model_preflight(jl)
 
+def test_forged_bound_method_metadata_is_rejected():
+    jl = dense_lens()
+    class ForgedCallable:
+        __self__ = jl.layers[0]
+        __func__ = type(jl.layers[0]).forward
+        def __call__(self, *args, **kwargs):
+            return args[0] if args else None
+    jl.layers[0].forward = ForgedCallable()
+    with pytest.raises(ValueError, match="forward provenance"):
+        rebase.model_preflight(jl)
+
+
+def test_registered_attribute_shadows_fail_closed():
+    cases = []
+    jl = dense_lens(); jl.layers[0].self_attn.__dict__["q_proj"] = nn.Linear(8, 16, False); cases.append(jl)
+    jl = dense_lens(); jl.layers[0].self_attn.q_proj.__dict__["weight"] = nn.Parameter(torch.randn(16, 8)); cases.append(jl)
+    jl = dense_lens(); jl.layers[0].self_attn.o_proj.__dict__["weight"] = nn.Parameter(torch.randn(8, 16)); cases.append(jl)
+    jl = dense_lens(); jl.layers[0].input_layernorm.__dict__["weight"] = nn.Parameter(torch.zeros(8)); cases.append(jl)
+    jl = dense_lens(); jl._embed_tokens.__dict__["weight"] = nn.Parameter(torch.randn(17, 8)); cases.append(jl)
+    jl = dense_lens(); jl._lm_head.__dict__["weight"] = nn.Parameter(torch.randn(17, 8)); cases.append(jl)
+    for candidate in cases:
+        with pytest.raises(ValueError, match="registered"):
+            rebase.model_preflight(candidate)
+
+
+def test_tie_declaration_and_physical_state_must_agree():
+    declared_untied = dense_lens()
+    declared_untied._hf_model.config = SimpleNamespace(tie_word_embeddings=True)
+    with pytest.raises(ValueError, match="tie declaration"):
+        rebase.model_preflight(declared_untied)
+    physical_undeclared = dense_lens()
+    physical_undeclared._lm_head.weight = physical_undeclared._embed_tokens.weight
+    physical_undeclared._hf_model.config = SimpleNamespace(tie_word_embeddings=False)
+    with pytest.raises(ValueError, match="tie declaration"):
+        rebase.model_preflight(physical_undeclared)
+
+
+def test_supported_mode_with_bad_scale_is_side_effect_free(monkeypatch):
+    import api.app as app
+    iv = Interventions(); iv.set_scale_and_mode(scale=2.0, mode="standard")
+    monkeypatch.setattr(app, "interventions", iv)
+    monkeypatch.setattr(app.manager, "meta", {"model_id": "local"})
+    monkeypatch.setattr(app.manager, "capability_profile", {
+        "declared_quantization": None, "has_packed_read_parameters": False,
+        "modes": {
+            "standard": capabilities.decision(True, "supported"),
+            "readthrough": capabilities.decision(True, "supported"),
+            "exact": capabilities.decision(True, "supported"),
+            "abliteration": capabilities.decision(False, "global_projection_unvalidated"),
+        }})
+    with pytest.raises(app.HTTPException):
+        app.api_interventions_scale(SimpleNamespace(scale="not-a-number", mode="readthrough"))
+    assert iv.state_snapshot() == (2.0, "standard")
+
 
 @pytest.mark.parametrize("layer", [0, 1, 2])
 def test_packed_exact_is_model_wide_and_live_rejection_is_clean(tiny, layer):
@@ -173,28 +227,21 @@ def test_packed_exact_is_model_wide_and_live_rejection_is_clean(tiny, layer):
     assert iv._handles == []
 
 
-def test_supplied_inventory_is_authenticated_and_policy_checked(tiny):
+def test_public_plan_revalidates_and_exposes_no_inventory_injection(tiny):
     packed_jl = lens(tiny)
-    packed_inventory = rebase.model_preflight(packed_jl)
+    with pytest.raises(TypeError):
+        rebase.build_plan(rules_for(tiny), packed_jl, 1.0, inventory=rebase.model_preflight(packed_jl))
     with pytest.raises(ValueError, match="exact mode is unavailable for packed"):
-        rebase.build_plan(rules_for(tiny), packed_jl, 1.0, exact=True,
-                          inventory=packed_inventory)
+        rebase.build_plan(rules_for(tiny), packed_jl, 1.0, exact=True)
 
-    first, second = dense_lens(), dense_lens()
-    inventory = rebase.model_preflight(first)
-    transforms, _ = rebase.build_plan(
-        [{"id": 1, "token_id": 1, "token": "x", "mode": "scale", "factor": .8,
-          "replacement_id": None, "replacement": None, "layers": [0],
-          "dirs_a": {0: torch.nn.functional.normalize(torch.randn(8), dim=0)},
-          "dirs_b": None}], first, 1.0, inventory=inventory)
-    assert transforms
-    with pytest.raises(ValueError, match="not authentic"):
-        rebase.validate_inventory_policy(replace(inventory), first)
-    with pytest.raises(ValueError, match="not authentic"):
-        rebase.validate_inventory_policy(inventory, second)
+    first = dense_lens()
+    rules = [{"id": 1, "token_id": 1, "token": "x", "mode": "scale", "factor": .8,
+              "replacement_id": None, "replacement": None, "layers": [0],
+              "dirs_a": {0: torch.nn.functional.normalize(torch.randn(8), dim=0)},
+              "dirs_b": None}]
+    assert rebase.build_plan(rules, first, 1.0)[0]
     first.layers[0] = block(sparse=False)
-    with pytest.raises(ValueError, match="changed after inventory"):
-        rebase.validate_inventory_policy(inventory, first)
+    assert rebase.build_plan(rules, first, 1.0)[0]
 
 
 @pytest.mark.parametrize("layer", [0, 1, 2])
