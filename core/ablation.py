@@ -108,6 +108,25 @@ class Interventions:
             self._mode = mode
             return self._mode
 
+    def set_scale_and_mode(self, *, scale=None, mode=None):
+        """Validate the complete patch before atomically changing either field."""
+        if mode is not None and mode not in MODES:
+            raise ValueError(f"unknown intervention mode: {mode}")
+        new_scale = self._scale if scale is None else float(scale)
+        with self._lock:
+            if mode is not None:
+                self._mode = mode
+            self._scale = new_scale
+            return self._scale, self._mode
+
+    def reset(self):
+        """Discard all model-bound intervention state."""
+        with self._lock:
+            self.detach()
+            self._rules = []
+            self._scale = 1.0
+            self._mode = "standard"
+
     def rules_full(self):
         return list(self._rules)
 
@@ -252,6 +271,8 @@ class Interventions:
     def attach(self, jl):
         if not self._rules:
             return
+        if getattr(jl, "_jwash_declared_quant", None) in ("int8", "nf4"):
+            raise ValueError("interventions unavailable on a quantized model")
         if self._mode == "abliteration":
             self._attach_abliteration(jl)
             return
@@ -288,9 +309,11 @@ class Interventions:
 
     def _attach_abliteration(self, jl):
         # Abliteration-mode preview: the SAME projection on every residual write
-        # (embed + each block's output), mirroring the pure-weight bake. A rule's
+        # (embed + validated projection modules), mirroring the pure-weight bake. A rule's
         # layers make no sense here (global projection), but layers=[] stays THE
         # "rule disabled" gesture: we honor it too.
+        from core import rebase
+        inventory = rebase.global_projection_inventory(jl)
         active = self._active_rules()
         if not active:
             return
@@ -311,13 +334,16 @@ class Interventions:
         def emb_hook(module, inputs, output):
             return apply(output)
 
-        def blk_hook(module, inputs, output):
-            h = output[0] if isinstance(output, tuple) else output
-            h = apply(h)
-            return (h,) + tuple(output[1:]) if isinstance(output, tuple) else h
-
-        self._handles = [jl._embed_tokens.register_forward_hook(emb_hook)]
-        self._handles += [blk.register_forward_hook(blk_hook) for blk in jl.layers]
+        handles = []
+        try:
+            handles.append(jl._embed_tokens.register_forward_hook(emb_hook))
+            for _index, _name, writer in inventory:
+                handles.append(writer.register_forward_hook(emb_hook))
+        except Exception:
+            for handle in handles:
+                handle.remove()
+            raise
+        self._handles = handles
 
     def _attach_rebase(self, jl, exact):
         # readthrough/exact preview: the SAME transform as the bake (core/rebase),

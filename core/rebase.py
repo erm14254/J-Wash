@@ -348,6 +348,56 @@ def model_preflight(jl, *, exact=False):
     return True
 
 
+def global_projection_inventory(jl):
+    """Positively prove the residual writes shared by live and baked projection.
+
+    Phase 1 deliberately supports only ordinary dense attention/MLP decoder
+    blocks.  Returning the modules here gives both paths one inventory rather
+    than treating a failed readthrough preflight as evidence of support.
+    """
+    layers = getattr(jl, "layers", None)
+    embed = getattr(jl, "_embed_tokens", None)
+    head = getattr(jl, "_lm_head", None)
+    if not layers or embed is None or head is None:
+        raise ValueError("global projection topology is incomplete")
+    hidden = head.weight.shape[-1]
+    if getattr(embed, "weight", None) is None or embed.weight.ndim != 2 or embed.weight.shape[1] != hidden:
+        raise ValueError("embedding has wrong residual hidden axis")
+    inventory = []
+    expected = {"self_attn.o_proj", "mlp.down_proj"}
+    for index, block in enumerate(layers):
+        if _submodule(block, "linear_attn") is not None:
+            raise ValueError(f"layer {index} uses unsupported linear attention")
+        if _submodule(block, "mlp.experts.gate_up_proj") is not None:
+            raise ValueError(f"layer {index} uses unsupported packed MoE writers")
+        for marker in _UNSUPPORTED_MARKERS:
+            if getattr(block, marker, None) is not None:
+                raise ValueError(f"layer {index} has unsupported residual branch {marker}")
+        present = {name for name in WRITES if _submodule(block, name) is not None}
+        if present != expected:
+            raise ValueError(f"layer {index} residual writer inventory is unknown")
+        for name in sorted(expected):
+            writer = _submodule(block, name)
+            weight = getattr(writer, "weight", None)
+            if (type(writer) is not torch.nn.Linear or weight is None or weight.ndim != 2
+                    or weight.shape[0] != hidden or getattr(writer, "bias", None) is not None
+                    or not callable(getattr(writer, "register_forward_hook", None))):
+                raise ValueError(f"layer {index} residual writer {name} is unsupported")
+            inventory.append((index, name, writer))
+    return inventory
+
+
+def global_projection_preflight(jl):
+    global_projection_inventory(jl)
+    return True
+
+
+def has_packed_read_parameters(jl):
+    """Cheap model-wide fact, computed once after the semantic preflight."""
+    return any(_submodule(block, "mlp.experts.gate_up_proj") is not None
+               for block in (getattr(jl, "layers", None) or ()))
+
+
 def check_block_supported(block):
     capability = block_capabilities(block)
     if not capability.readthrough_supported:

@@ -465,6 +465,7 @@ class ModelManager:
         self.tokenizer = None
         self.jl = None
         self.meta = None
+        self.capability_profile = None
         self.busy = None
 
     def list_models(self):
@@ -520,10 +521,20 @@ class ModelManager:
                 self.hf_model = hf_model
                 self.tokenizer = tokenizer
                 self.jl = jlens.from_hf(hf_model, tokenizer)
+                self.jl._jwash_declared_quant = quant
                 # Read-projection support: write-norm architectures (Gemma
                 # style) can't take the reads change of basis — the UI falls
                 # back to the global abliteration for pure-weights edits.
-                capability_meta = _rebase_capability_meta(self.jl)
+                from core.capabilities import build_profile
+                self.capability_profile = build_profile(self.jl, quant)
+                modes = self.capability_profile["modes"]
+                capability_meta = {
+                    "rebase_supported": modes["readthrough"]["supported"],
+                    "readthrough_supported": modes["readthrough"]["supported"],
+                    "readthrough_reason": modes["readthrough"]["reason"],
+                    "exact_supported": modes["exact"]["supported"],
+                    "exact_reason": modes["exact"]["reason"],
+                }
                 self.meta = {
                     "model_id": model_id,
                     "revision": _resolve_revision(source),
@@ -532,6 +543,8 @@ class ModelManager:
                     "device": device,
                     "n_layers": text_config.num_hidden_layers,
                     "d_model": text_config.hidden_size,
+                    "model_session_id": self.capability_profile["model_session_id"],
+                    "has_packed_read_parameters": self.capability_profile["has_packed_read_parameters"],
                     # Includes legacy rebase_supported = safe readthrough support.
                     **capability_meta,
                     "chat_template_source": chat_template_source,
@@ -543,6 +556,7 @@ class ModelManager:
                 # failure (often OOM): drop any partial allocation and return the
                 # reserved blocks, otherwise they linger until the server restarts
                 self.hf_model = self.tokenizer = self.jl = self.meta = None
+                self.capability_profile = None
                 hf_model = None
                 tokenizer = None
                 _free_cuda()
@@ -556,12 +570,15 @@ class ModelManager:
 
     def _unload_locked(self):
         if self.hf_model is None:
+            self.tokenizer = self.jl = self.meta = None
+            self.capability_profile = None
             return {"unloaded": False, "vram_allocated": _torch_allocated()}
         before = _torch_allocated()
         self.hf_model = None
         self.tokenizer = None
         self.jl = None
         self.meta = None
+        self.capability_profile = None
         _free_cuda()
         return {
             "unloaded": True,

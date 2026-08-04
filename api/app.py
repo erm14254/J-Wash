@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 import config
 from core import editing, registry
+from core import capabilities
 from core.ablation import Interventions
 from core.neighbors import TokenNeighbors
 from core import fitting
@@ -229,6 +230,9 @@ def api_models():
 def api_status():
     return {
         "loaded": manager.meta,
+        "capabilities": capabilities.snapshot(
+            manager.capability_profile, interventions.mode
+        ),
         "busy": manager.busy,
         "lens": lens_manager.meta,
         "gpus": gpu_stats(),
@@ -253,6 +257,11 @@ async def api_load(req: LoadRequest):
         raise HTTPException(422, f"invalid device: {req.device}")
     if manager.busy:
         raise HTTPException(409, f"busy: {manager.busy}")
+    # Everything below is bound to the old model's tensors or vocabulary.  A
+    # replacement attempt is a model boundary even if loading its successor fails.
+    interventions.reset()
+    lens_manager.unload()
+    neighbors.reset()
     try:
         return await asyncio.to_thread(
             manager.load, req.model_id, req.dtype, req.quant, req.device
@@ -352,6 +361,7 @@ def api_models_unregister(req: RegisterModelRequest):
 async def api_unload():
     if manager.busy:
         raise HTTPException(409, f"busy: {manager.busy}")
+    interventions.reset()
     lens_manager.unload()
     neighbors.reset()
     return await asyncio.to_thread(manager.unload)
@@ -403,6 +413,7 @@ def api_interventions_add(req: InterventionRequest):
     if manager.hf_model is None or lens_manager.lens is None:
         raise HTTPException(422, "model and lens required")
     try:
+        capabilities.require(manager.capability_profile, "modes", "standard")
         return {
             "rules": interventions.add(
                 lens_manager,
@@ -443,17 +454,10 @@ def api_interventions_patch(rule_id: int, req: InterventionPatch):
 
 @app.patch("/api/interventions")
 def api_interventions_scale(req: InterventionsScale):
-    if req.scale is not None:
-        interventions.set_scale(req.scale)
     try:
         if req.mode is not None:
-            capability = f"{req.mode}_supported" if req.mode in ("readthrough", "exact") else None
-            if capability and manager.meta is not None and manager.meta.get(capability, manager.meta.get("rebase_supported")) is False:
-                raise HTTPException(
-                    422,
-                    manager.meta.get(f"{req.mode}_reason", "read projection unavailable on this architecture"),
-                )
-            interventions.set_mode(req.mode)
+            capabilities.require(manager.capability_profile, "modes", req.mode)
+        interventions.set_scale_and_mode(scale=req.scale, mode=req.mode)
     except ValueError as exc:
         raise HTTPException(422, str(exc))
     return {
@@ -545,6 +549,10 @@ async def api_edit_export(req: ExportRequest):
         raise HTTPException(422, f"unknown format: {req.format}")
     source_dir = resolve_local_dir(manager.meta["model_id"])
     mode = interventions.mode
+    try:
+        capabilities.require(manager.capability_profile, "exports", req.format, mode)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
     kwargs = {}
     if mode in ("readthrough", "exact"):
         export_fn = editing.export_rebase
@@ -732,6 +740,10 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
         if not rules:
             raise HTTPException(422, "no active intervention to export")
         mode = interventions.mode
+        try:
+            capabilities.require(manager.capability_profile, "exports", "gguf", mode)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
         if mode in ("readthrough", "exact"):
             export_fn, kwargs = editing.export_rebase, {"exact": mode == "exact"}
         elif mode == "abliteration":

@@ -1092,6 +1092,8 @@ def compute_abliteration(rules, jl, scale=1.0):
         as per-rule rank-1 factors (delta = B·A), exact, for the LoRA export.
         For the embed, delta = (B·A)ᵀ (PEFT lookup convention).
     """
+    from core import rebase
+    rebase.global_projection_preflight(jl)
     # layers=[] = disabled rule, in this mode too (consistent with the preview)
     rules = [r for r in rules if r["layers"]]
     if not rules:
@@ -1188,6 +1190,8 @@ def export_abliteration(rules, jl, model_meta, *, fmt, name, source_dir=None, sc
     ``lora`` (exact PEFT adapter, rank = n_rules; embed omitted if embeddings
     are tied). Unties ``lm_head`` (full/layers) if the model has tied embeddings,
     to preserve the original un-embedding."""
+    if model_meta.get("quant") in ("int8", "nf4"):
+        raise ValueError("editing quantized model loads is not supported")
     parts = validate_export_name(name)
     name = "/".join(parts)
     out_dir = EDITS_DIR.joinpath(*parts)
@@ -1594,20 +1598,26 @@ def _export_rebase_impl(rules, jl, model_meta, *, fmt, name, source_dir=None,
     time, so tied embeddings need no untying). The bake is done streaming, one
     float32 CPU matrix at a time. Tied-embeddings model (full/layers): the embed
     stays INTACT, it's lm_head (untied) that receives the final read transform."""
+    if model_meta.get("quant") in ("int8", "nf4"):
+        raise ValueError("editing quantized model loads is not supported")
     method = "rebase-exact" if exact else "rebase-readthrough"
     if fmt not in ("full", "layers", "lora"):
         raise ValueError(f"unknown format for {method}: {fmt}")
     transforms, info = rebase.build_plan(rules, jl, scale, exact=exact)
     lm_head_key = info["lm_head_key"]
 
+    # The cached fact drives API eligibility; repeat this cheap topology fact at
+    # deep execution so direct callers with legacy metadata cannot bypass it.
+    packed_model = (bool(model_meta.get("has_packed_read_parameters"))
+                    or rebase.has_packed_read_parameters(jl))
     packed = [key for key, target in info["targets"].items()
               if not target.lora_supported or target.tensor(jl.layers[int(key.split(".layers.", 1)[1].split(".", 1)[0])]).ndim > 2]
-    if packed and fmt == "lora":
+    if (packed_model or packed) and fmt == "lora":
         raise ValueError(
             "LoRA export is unavailable for packed MoE parameters. "
             "Use full-checkpoint export."
         )
-    if packed and fmt == "layers":
+    if (packed_model or packed) and fmt == "layers":
         raise ValueError(
             "modified-layers export is unavailable for packed MoE parameters: "
             "bounded-memory sharding is not implemented. Use full-checkpoint export."
