@@ -1,6 +1,7 @@
 import copy
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -68,7 +69,7 @@ def test_tiny_supported_inventory_and_version_contract(tiny):
 
 def test_audited_decoder_class_and_alias_contracts_fail_closed():
     unknown = block(sparse=False)
-    rebase.AUDITED_DECODER_SPECS.pop((type(unknown).__module__, type(unknown).__name__))
+    rebase.AUDITED_DECODER_SPECS.pop(type(unknown))
     try:
         with pytest.raises(ValueError, match="not audited"):
             rebase.model_preflight(SimpleNamespace(
@@ -77,7 +78,7 @@ def test_audited_decoder_class_and_alias_contracts_fail_closed():
                 _embed_tokens=nn.Embedding(17, 8),
                 layout=SimpleNamespace(lm_head="lm_head")))
     finally:
-        rebase.AUDITED_DECODER_SPECS[(type(unknown).__module__, type(unknown).__name__)] = (
+        rebase.AUDITED_DECODER_SPECS[type(unknown)] = (
             SYNTHETIC_DENSE_SPEC)
 
     cases = []
@@ -117,6 +118,7 @@ def test_modified_and_noncanonical_dense_topologies_fail_closed():
 def test_final_head_contract_and_explicit_embedding_tie():
     assert rebase.model_preflight(dense_lens()).final_head[0] == "lm_head.weight"
     tied = dense_lens(); tied._lm_head.weight = tied._embed_tokens.weight
+    tied._hf_model.config = SimpleNamespace(tie_word_embeddings=True)
     assert rebase.model_preflight(tied).final_head[2] is tied._embed_tokens.weight
 
     bad = []
@@ -133,6 +135,31 @@ def test_final_head_contract_and_explicit_embedding_tie():
             rebase.model_preflight(candidate)
 
 
+def test_head_embedding_storage_aliases_and_execution_state_fail_closed():
+    jl = dense_lens()
+    jl._lm_head.weight = nn.Parameter(jl._embed_tokens.weight.detach())
+    with pytest.raises(ValueError, match="share storage"):
+        rebase.model_preflight(jl)
+    jl = dense_lens(); storage = torch.randn(18, 8)
+    jl._embed_tokens.weight = nn.Parameter(storage[:17])
+    jl._lm_head.weight = nn.Parameter(storage[1:18])
+    with pytest.raises(ValueError, match="share storage"):
+        rebase.model_preflight(jl)
+    jl = dense_lens()
+    handle = jl.layers[0].self_attn.q_proj.register_forward_pre_hook(
+        lambda _module, inputs: inputs)
+    try:
+        with pytest.raises(ValueError, match="execution hooks"):
+            rebase.model_preflight(jl)
+    finally:
+        handle.remove()
+    jl = dense_lens()
+    torch.nn.utils.parametrize.register_parametrization(
+        jl.layers[0].self_attn.q_proj, "weight", nn.Identity())
+    with pytest.raises(ValueError, match="parameterization|child inventory"):
+        rebase.model_preflight(jl)
+
+
 @pytest.mark.parametrize("layer", [0, 1, 2])
 def test_packed_exact_is_model_wide_and_live_rejection_is_clean(tiny, layer):
     jl = lens(tiny); rules = rule_at(tiny, layer)
@@ -144,6 +171,30 @@ def test_packed_exact_is_model_wide_and_live_rejection_is_clean(tiny, layer):
         iv.attach(jl)
     assert before == [len(module._forward_hooks) for module in tiny.modules()]
     assert iv._handles == []
+
+
+def test_supplied_inventory_is_authenticated_and_policy_checked(tiny):
+    packed_jl = lens(tiny)
+    packed_inventory = rebase.model_preflight(packed_jl)
+    with pytest.raises(ValueError, match="exact mode is unavailable for packed"):
+        rebase.build_plan(rules_for(tiny), packed_jl, 1.0, exact=True,
+                          inventory=packed_inventory)
+
+    first, second = dense_lens(), dense_lens()
+    inventory = rebase.model_preflight(first)
+    transforms, _ = rebase.build_plan(
+        [{"id": 1, "token_id": 1, "token": "x", "mode": "scale", "factor": .8,
+          "replacement_id": None, "replacement": None, "layers": [0],
+          "dirs_a": {0: torch.nn.functional.normalize(torch.randn(8), dim=0)},
+          "dirs_b": None}], first, 1.0, inventory=inventory)
+    assert transforms
+    with pytest.raises(ValueError, match="not authentic"):
+        rebase.validate_inventory_policy(replace(inventory), first)
+    with pytest.raises(ValueError, match="not authentic"):
+        rebase.validate_inventory_policy(inventory, second)
+    first.layers[0] = block(sparse=False)
+    with pytest.raises(ValueError, match="changed after inventory"):
+        rebase.validate_inventory_policy(inventory, first)
 
 
 @pytest.mark.parametrize("layer", [0, 1, 2])
@@ -255,9 +306,9 @@ def test_production_width_qwen35_moe_block_capability(hidden, monkeypatch):
     b.mlp.shared_expert_gate = nn.Linear(hidden, 1, False, dtype=torch.bfloat16)
     b.input_layernorm = Qwen3_5MoeRMSNorm(hidden).to(torch.bfloat16)
     b.post_attention_layernorm = Qwen3_5MoeRMSNorm(hidden).to(torch.bfloat16)
-    monkeypatch.setitem(rebase.AUDITED_DECODER_SPECS,
-                        (type(b).__module__, type(b).__name__),
-                        SYNTHETIC_PACKED_SPEC)
+    monkeypatch.setitem(rebase.AUDITED_DECODER_SPECS, type(b),
+                        replace(SYNTHETIC_PACKED_SPEC,
+                                decoder=rebase.class_contract(type(b))))
     cap = rebase.block_capabilities(b)
     assert cap.readthrough_supported and not cap.exact_supported
 

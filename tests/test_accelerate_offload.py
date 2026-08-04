@@ -79,7 +79,7 @@ def test_profile_construction_inspects_each_unique_norm_once(monkeypatch):
 
 def test_forward_provenance_accepts_only_authentic_accelerate_wrapper():
     from accelerate.hooks import AlignDevicesHook, add_hook_to_module
-    expected = (nn.Linear.__module__, nn.Linear.__name__)
+    expected = rebase.class_contract(nn.Linear)
     module = nn.Linear(4, 4, False)
     add_hook_to_module(module, AlignDevicesHook(execution_device="cpu"))
     rebase.validate_forward_provenance(module, expected, "linear")
@@ -102,6 +102,32 @@ def test_forward_provenance_accepts_only_authentic_accelerate_wrapper():
     wrong_old._old_forward = other.forward
     with pytest.raises(ValueError, match="Accelerate wrapper"):
         rebase.validate_forward_provenance(wrong_old, expected, "linear")
+
+
+def test_frozen_class_and_hook_method_identities_reject_spoofs(monkeypatch):
+    expected = rebase.class_contract(nn.Linear)
+    lookalike = type("Linear", (nn.Module,), {
+        "__module__": nn.Linear.__module__,
+        "forward": lambda self, value: value,
+    })()
+    with pytest.raises(ValueError, match="class is not audited"):
+        rebase.validate_forward_provenance(lookalike, expected, "linear")
+    original = nn.Linear.forward
+    monkeypatch.setattr(nn.Linear, "forward", lambda self, value: original(self, value))
+    with pytest.raises(ValueError, match="class forward was modified"):
+        rebase.validate_forward_provenance(nn.Linear(4, 4), expected, "linear")
+
+
+def test_accelerate_hook_method_override_fails_closed():
+    from accelerate.hooks import AlignDevicesHook, add_hook_to_module
+    module = nn.Linear(4, 4, False)
+    hook = AlignDevicesHook(execution_device="cpu")
+    add_hook_to_module(module, hook)
+    hook.pre_forward = lambda _module, *args, **kwargs: (args, kwargs)
+    with pytest.raises(ValueError, match="Accelerate wrapper"):
+        rebase.validate_forward_provenance(
+            module, rebase.class_contract(nn.Linear), "linear"
+        )
 
 
 def test_meta_parameter_direct_lazy_lookup_never_iterates_keys():

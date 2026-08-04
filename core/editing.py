@@ -1613,7 +1613,10 @@ def _export_rebase_impl(rules, jl, model_meta, *, fmt, name, source_dir=None,
     method = "rebase-exact" if exact else "rebase-readthrough"
     if fmt not in ("full", "layers", "lora"):
         raise ValueError(f"unknown format for {method}: {fmt}")
-    inventory = inventory or rebase.model_preflight(jl, exact=exact)
+    if inventory is None:
+        inventory = rebase.model_preflight(jl, exact=exact)
+    else:
+        rebase.validate_inventory_policy(inventory, jl, exact=exact)
     transforms, info = rebase.build_plan(
         rules, jl, scale, exact=exact, inventory=inventory
     )
@@ -1623,8 +1626,8 @@ def _export_rebase_impl(rules, jl, model_meta, *, fmt, name, source_dir=None,
     # deep execution so direct callers with legacy metadata cannot bypass it.
     packed_model = (bool(model_meta.get("has_packed_read_parameters"))
                     or inventory.packed)
-    packed = [key for key, target in info["targets"].items()
-              if not target.lora_supported or target.tensor(jl.layers[int(key.split(".layers.", 1)[1].split(".", 1)[0])]).ndim > 2]
+    packed = [target for target in info["targets"].values()
+              if not target.lora_supported]
     if (packed_model or packed) and fmt == "lora":
         raise ValueError(
             "LoRA export is unavailable for packed MoE parameters. "

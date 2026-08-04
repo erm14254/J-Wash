@@ -36,8 +36,17 @@ RMSNorm output: the preview and the exported checkpoint differ only by rounding.
 
 from dataclasses import dataclass
 import functools
+import types
+import weakref
 
 import torch
+import transformers
+from packaging.version import Version
+from torch.nn.utils import parametrize
+from accelerate.hooks import AlignDevicesHook, add_hook_to_module, remove_hook_from_module
+from transformers.activations import SiLUActivation
+from transformers.models.llama import modeling_llama as llama_modeling
+from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as qwen_moe_modeling
 
 from core.ablation import effective_coeffs
 
@@ -87,28 +96,55 @@ def _submodule(block, dotted):
     return module
 
 
+_LINEAR_FORWARD = torch.nn.Linear.forward
+_EMBEDDING_FORWARD = torch.nn.Embedding.forward
+_ALIGN_PRE_FORWARD = AlignDevicesHook.pre_forward
+_ALIGN_POST_FORWARD = AlignDevicesHook.post_forward
+
+
+def _capture_accelerate_wrapper_code():
+    module = torch.nn.Linear(1, 1, bias=False)
+    add_hook_to_module(module, AlignDevicesHook(execution_device="cpu"))
+    code = module.forward.func.__code__
+    remove_hook_from_module(module)
+    return code
+
+
+_ACCELERATE_WRAPPER_CODE = _capture_accelerate_wrapper_code()
+
+
+@dataclass(frozen=True, slots=True)
+class ClassContract:
+    cls: type
+    forward: object
+
+
+def class_contract(cls):
+    return ClassContract(cls, cls.forward)
+
+
 def _bound_matches(method, module, function):
     return (getattr(method, "__self__", None) is module
             and getattr(method, "__func__", None) is function)
 
 
 def _supported_accelerate_hook(hook):
-    key = (type(hook).__module__, type(hook).__name__)
-    if key == ("accelerate.hooks", "AlignDevicesHook"):
-        return True
-    if key == ("accelerate.hooks", "SequentialHook"):
-        hooks = getattr(hook, "hooks", None)
-        return isinstance(hooks, tuple) and hooks and all(
-            _supported_accelerate_hook(item) for item in hooks
-        )
-    return False
+    # SequentialHook is deliberately fail-closed: parameter inspection cannot
+    # yet prove which member owns the offload map.
+    return (type(hook) is AlignDevicesHook
+            and _bound_matches(hook.pre_forward, hook, _ALIGN_PRE_FORWARD)
+            and _bound_matches(hook.post_forward, hook, _ALIGN_POST_FORWARD))
 
 
 def validate_forward_provenance(module, expected_class, label):
     """Require the class forward or Accelerate 1.14's exact wrapper shape."""
-    if (type(module).__module__, type(module).__name__) != expected_class:
+    if not isinstance(expected_class, ClassContract):
+        raise ValueError(f"{label} has no frozen class contract")
+    if type(module) is not expected_class.cls:
         raise ValueError(f"{label} class is not audited")
-    expected = type(module).forward
+    expected = expected_class.forward
+    if type(module).forward is not expected:
+        raise ValueError(f"{label} class forward was modified")
     current = getattr(module, "forward", None)
     old = getattr(module, "_old_forward", None)
     hook = getattr(module, "_hf_hook", None)
@@ -116,25 +152,34 @@ def validate_forward_provenance(module, expected_class, label):
         if not _bound_matches(current, module, expected):
             raise ValueError(f"{label} forward provenance is not audited")
         return
-    if not _supported_accelerate_hook(hook) or not _bound_matches(old, module, expected):
+    if (not _supported_accelerate_hook(hook) or type(old) is not types.MethodType
+            or not _bound_matches(old, module, expected)):
         raise ValueError(f"{label} Accelerate wrapper is not audited")
-    if not isinstance(current, functools.partial) or current.args != (module,):
+    if (type(current) is not functools.partial or current.args != (module,)
+            or current.keywords):
         raise ValueError(f"{label} Accelerate wrapper shape is not audited")
     wrapper = current.func
-    if (getattr(wrapper, "__module__", None) != "accelerate.hooks"
-            or not getattr(wrapper, "__qualname__", "").endswith(
-                "add_hook_to_module.<locals>.new_forward")
-            or getattr(current, "__name__", None) != getattr(old, "__name__", None)
-            or not _bound_matches(getattr(current, "__wrapped__", None), module,
-                                  expected)):
+    if (type(wrapper) is not types.FunctionType
+            or wrapper.__code__ is not _ACCELERATE_WRAPPER_CODE
+            or getattr(current, "__wrapped__", None) is not old):
         raise ValueError(f"{label} Accelerate wrapper provenance is not audited")
 
 
-def _validate_direct_inventory(module, modules, parameters, label):
-    if set(module._modules) != set(modules) or set(module._parameters) != set(parameters):
+def _validate_execution_state(module, label):
+    if (module._forward_pre_hooks or module._forward_hooks or module._backward_hooks):
+        raise ValueError(f"{label} has pre-existing execution hooks")
+    if parametrize.is_parametrized(module):
+        raise ValueError(f"{label} uses unsupported parameterization")
+
+
+def _validate_direct_inventory(module, modules, parameters, label, buffers=()):
+    _validate_execution_state(module, label)
+    if (set(module._modules) != set(modules)
+            or set(module._parameters) != set(parameters)
+            or set(module._buffers) != set(buffers)):
         raise ValueError(
             f"{label} child inventory is not audited: modules={tuple(module._modules)}, "
-            f"parameters={tuple(module._parameters)}"
+            f"parameters={tuple(module._parameters)}, buffers={tuple(module._buffers)}"
         )
 
 
@@ -170,19 +215,21 @@ class RebaseCapabilities:
     exact_reason: str
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TopologySpec:
-    mixers: tuple[tuple[str, tuple[str, str], tuple[str, ...], tuple[str, ...], str | None], ...]
-    mlp_class: tuple[str, str]
+    decoder: ClassContract
+    mixers: tuple[tuple[str, ClassContract, tuple[str, ...], tuple[str, ...], str | None], ...]
+    mlp_class: ClassContract
     mlp_modules: tuple[str, ...]
     mlp_parameters: tuple[str, ...] = ()
     packed: bool = False
-    router_class: tuple[str, str] | None = None
-    experts_class: tuple[str, str] | None = None
-    shared_expert_class: tuple[str, str] | None = None
+    router_class: ClassContract | None = None
+    experts_class: ClassContract | None = None
+    shared_expert_class: ClassContract | None = None
+    norm_class: ClassContract | None = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class BlockInventory:
     index: int
     kind: str
@@ -194,7 +241,10 @@ class BlockInventory:
     exact_reason: str
 
 
-@dataclass(frozen=True)
+_INVENTORY_TOKEN = object()
+
+
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class ModelInventory:
     blocks: tuple[BlockInventory, ...]
     final_norm: object
@@ -203,30 +253,65 @@ class ModelInventory:
     exact_supported: bool
     exact_reason: str
     final_head: tuple[str, object, object]
+    embedding: tuple[str, object, object]
+    tied: bool
+    owner: object
+    layer_ids: tuple[int, ...]
+    token: object
 
 
-_LLAMA = "transformers.models.llama.modeling_llama"
-_QWEN_MOE = "transformers.models.qwen3_5_moe.modeling_qwen3_5_moe"
-_SILU = ("transformers.activations", "SiLUActivation")
+@dataclass(frozen=True, slots=True)
+class StorageSpan:
+    storage: int
+    start: int
+    end: int
+
+
+def storage_span(tensor):
+    if not isinstance(tensor, torch.Tensor) or tensor.device.type == "meta":
+        return None
+    storage = tensor.untyped_storage()
+    start = tensor.storage_offset() * tensor.element_size()
+    return StorageSpan(storage._cdata, start, start + tensor.numel() * tensor.element_size())
+
+
+def _overlaps(left, right):
+    return (left is not None and right is not None and left.storage == right.storage
+            and max(left.start, right.start) < min(left.end, right.end))
+
+
+_LINEAR = class_contract(torch.nn.Linear)
+_EMBEDDING = class_contract(torch.nn.Embedding)
+_CONV1D = class_contract(torch.nn.Conv1d)
+_SILU = class_contract(SiLUActivation)
+_LLAMA_NORM = class_contract(llama_modeling.LlamaRMSNorm)
+_QWEN_NORM = class_contract(qwen_moe_modeling.Qwen3_5MoeRMSNorm)
+_QWEN_GATED_NORM = class_contract(qwen_moe_modeling.Qwen3_5MoeRMSNormGated)
+_VALID_INVENTORIES = weakref.WeakValueDictionary()
 
 AUDITED_DECODER_SPECS = {
-    (_LLAMA, "LlamaDecoderLayer"): TopologySpec(
-        (("self_attn", (_LLAMA, "LlamaAttention"),
+    llama_modeling.LlamaDecoderLayer: TopologySpec(
+        class_contract(llama_modeling.LlamaDecoderLayer),
+        (("self_attn", class_contract(llama_modeling.LlamaAttention),
           ("q_proj", "k_proj", "v_proj", "o_proj"), (), None),),
-        (_LLAMA, "LlamaMLP"), ("gate_proj", "up_proj", "down_proj", "act_fn"),
+        class_contract(llama_modeling.LlamaMLP),
+        ("gate_proj", "up_proj", "down_proj", "act_fn"),
+        norm_class=_LLAMA_NORM,
     ),
-    (_QWEN_MOE, "Qwen3_5MoeDecoderLayer"): TopologySpec(
-        (("self_attn", (_QWEN_MOE, "Qwen3_5MoeAttention"),
+    qwen_moe_modeling.Qwen3_5MoeDecoderLayer: TopologySpec(
+        class_contract(qwen_moe_modeling.Qwen3_5MoeDecoderLayer),
+        (("self_attn", class_contract(qwen_moe_modeling.Qwen3_5MoeAttention),
           ("q_proj", "k_proj", "v_proj", "o_proj", "q_norm", "k_norm"),
           (), "full_attention"),
-         ("linear_attn", (_QWEN_MOE, "Qwen3_5MoeGatedDeltaNet"),
+         ("linear_attn", class_contract(qwen_moe_modeling.Qwen3_5MoeGatedDeltaNet),
           ("act", "conv1d", "norm", "out_proj", "in_proj_qkv", "in_proj_z",
            "in_proj_b", "in_proj_a"), ("dt_bias", "A_log"), "linear_attention")),
-        (_QWEN_MOE, "Qwen3_5MoeSparseMoeBlock"),
+        class_contract(qwen_moe_modeling.Qwen3_5MoeSparseMoeBlock),
         ("gate", "experts", "shared_expert", "shared_expert_gate"), packed=True,
-        router_class=(_QWEN_MOE, "Qwen3_5MoeTopKRouter"),
-        experts_class=(_QWEN_MOE, "Qwen3_5MoeExperts"),
-        shared_expert_class=(_QWEN_MOE, "Qwen3_5MoeMLP"),
+        router_class=class_contract(qwen_moe_modeling.Qwen3_5MoeTopKRouter),
+        experts_class=class_contract(qwen_moe_modeling.Qwen3_5MoeExperts),
+        shared_expert_class=class_contract(qwen_moe_modeling.Qwen3_5MoeMLP),
+        norm_class=_QWEN_NORM,
     ),
 }
 
@@ -298,7 +383,7 @@ def _norm_probe_device(norm, placeholder):
     return torch.device(device)
 
 
-def validate_rms_norm(norm, hidden, name="RMSNorm"):
+def validate_rms_norm(norm, hidden, name="RMSNorm", expected=None):
     """Validate the structural and functional contract used by read hooks.
 
     Phase 1 accepts only exact audited Transformers classes.  Rank-3 functional
@@ -312,6 +397,9 @@ def validate_rms_norm(norm, hidden, name="RMSNorm"):
     if weight_parameter is None or tuple(weight_parameter.shape) != (hidden,):
         raise ValueError(f"{name} has wrong hidden width")
     cls = type(norm)
+    if expected is not None:
+        validate_forward_provenance(norm, expected, name)
+        _validate_direct_inventory(norm, (), ("weight",), name)
     gain_kind = _AUDITED_RMS_NORMS.get((cls.__module__, cls.__name__))
     if gain_kind is None:
         raise ValueError(f"{name} class {cls.__module__}.{cls.__name__} is not audited")
@@ -362,11 +450,10 @@ def validate_rms_norm(norm, hidden, name="RMSNorm"):
 
 
 def _block_inventory(block, index, hidden, validated_norms):
-    key = (type(block).__module__, type(block).__name__)
-    spec = AUDITED_DECODER_SPECS.get(key)
+    spec = AUDITED_DECODER_SPECS.get(type(block))
     if spec is None:
         raise ValueError(f"layer {index} decoder class or forward is not audited")
-    validate_forward_provenance(block, key, f"layer {index} decoder")
+    validate_forward_provenance(block, spec.decoder, f"layer {index} decoder")
     for marker in _UNSUPPORTED_MARKERS:
         if getattr(block, marker, None) is not None:
             raise ValueError(f"layer {index} has unsupported residual branch {marker}")
@@ -384,31 +471,53 @@ def _block_inventory(block, index, hidden, validated_norms):
     for child_name in mixer_modules:
         child = getattr(mixer_module, child_name)
         if child_name in ("q_norm", "k_norm"):
-            child_class = (_QWEN_MOE, "Qwen3_5MoeRMSNorm")
+            child_class = _QWEN_NORM
         elif child_name == "norm":
-            child_class = (_QWEN_MOE, "Qwen3_5MoeRMSNormGated")
+            child_class = _QWEN_GATED_NORM
         elif child_name == "conv1d":
-            child_class = (torch.nn.Conv1d.__module__, torch.nn.Conv1d.__name__)
+            child_class = _CONV1D
         elif child_name == "act":
             child_class = _SILU
         else:
-            child_class = (torch.nn.Linear.__module__, torch.nn.Linear.__name__)
+            child_class = _LINEAR
         validate_forward_provenance(
             child, child_class, f"layer {index} {kind}.{child_name}"
         )
+        child_label = f"layer {index} {kind}.{child_name}"
+        if child_class == _LINEAR:
+            _validate_direct_inventory(child, (), ("weight", "bias"), child_label)
+            if child.bias is not None or child.weight.ndim != 2 or not child.weight.dtype.is_floating_point:
+                raise ValueError(f"{child_label} storage is not audited")
+        elif child_class == _SILU:
+            _validate_direct_inventory(child, (), (), child_label)
+        elif child_class.cls is torch.nn.Conv1d:
+            _validate_direct_inventory(child, (), ("weight", "bias"), child_label)
+        elif child_name in ("q_norm", "k_norm"):
+            validate_rms_norm(child, child.weight.numel(), child_label, _QWEN_NORM)
+        else:
+            _validate_direct_inventory(child, (), ("weight",), child_label)
     if discriminator is not None:
         block_discriminator = getattr(block, "layer_type", None)
         mixer_discriminator = getattr(mixer_module, "layer_type", None)
-        if (block_discriminator not in (None, discriminator) or
-                mixer_discriminator not in (None, discriminator)):
+        version = Version(transformers.__version__)
+        valid = ((block_discriminator == discriminator and mixer_discriminator is None)
+                 if version < Version("5.14") else
+                 (mixer_discriminator == discriminator and block_discriminator is None)
+                 if kind == "linear_attn" else
+                 (block_discriminator is None and mixer_discriminator is None))
+        if not valid:
             raise ValueError(
                 f"layer {index} mixer discriminator is inconsistent: "
                 f"block={block_discriminator!r}, mixer={mixer_discriminator!r}, "
                 f"expected={discriminator!r}"
             )
+    if kind == "linear_attn" and spec.packed:
+        dt_bias, a_log = mixer_module.dt_bias, mixer_module.A_log
+        if (dt_bias.ndim != 1 or a_log.ndim != 1 or dt_bias.shape != a_log.shape
+                or not dt_bias.dtype.is_floating_point or not a_log.dtype.is_floating_point):
+            raise ValueError(f"layer {index} linear attention raw parameters are modified")
     expected_children = {kind, "mlp", "input_layernorm", "post_attention_layernorm"}
-    if set(getattr(block, "_modules", {})) != expected_children:
-        raise ValueError(f"layer {index} has unlisted decoder modules")
+    _validate_direct_inventory(block, expected_children, (), f"layer {index} decoder")
     mixer = (("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj")
              if kind == "self_attn" else
              ("linear_attn.in_proj_qkv", "linear_attn.in_proj_z",
@@ -425,34 +534,43 @@ def _block_inventory(block, index, hidden, validated_norms):
             mlp.act_fn, _SILU,
             f"layer {index} mlp.act_fn"
         )
+        _validate_direct_inventory(mlp.act_fn, (), (), f"layer {index} mlp.act_fn")
     if spec.packed:
         router, experts, shared = mlp.gate, mlp.experts, mlp.shared_expert
         validate_forward_provenance(router, spec.router_class, f"layer {index} router")
         validate_forward_provenance(experts, spec.experts_class, f"layer {index} experts")
         validate_forward_provenance(shared, spec.shared_expert_class,
                                     f"layer {index} shared expert")
-        router_parameters = (("weight", "bias") if spec.router_class ==
-                             (torch.nn.Linear.__module__, torch.nn.Linear.__name__)
+        router_parameters = (("weight", "bias") if spec.router_class == _LINEAR
                              else ("weight",))
         _validate_direct_inventory(router, (), router_parameters, f"layer {index} router")
-        experts_modules = (("act_fn",) if spec.experts_class ==
-                           (_QWEN_MOE, "Qwen3_5MoeExperts") else ())
+        experts_modules = (("act_fn",) if spec.experts_class.cls is
+                           qwen_moe_modeling.Qwen3_5MoeExperts else ())
         _validate_direct_inventory(experts, experts_modules,
                                    ("gate_up_proj", "down_proj"),
                                    f"layer {index} experts")
+        gate_up, down = experts.gate_up_proj, experts.down_proj
+        if (gate_up.ndim != 3 or down.ndim != 3
+                or not gate_up.dtype.is_floating_point or not down.dtype.is_floating_point
+                or gate_up.shape[0] != down.shape[0]
+                or gate_up.shape[1] != 2 * down.shape[2]
+                or gate_up.shape[2] != hidden or down.shape[1] != hidden):
+            raise ValueError(f"layer {index} packed expert storage is modified")
         if "act_fn" in experts_modules:
             validate_forward_provenance(
                 experts.act_fn, _SILU, f"layer {index} experts.act_fn"
             )
+            _validate_direct_inventory(experts.act_fn, (), (),
+                                       f"layer {index} experts.act_fn")
         shared_modules = (("gate_proj", "up_proj", "down_proj", "act_fn")
-                          if spec.shared_expert_class == (_QWEN_MOE, "Qwen3_5MoeMLP")
+                          if spec.shared_expert_class.cls is qwen_moe_modeling.Qwen3_5MoeMLP
                           else ("gate_proj", "up_proj", "down_proj"))
         _validate_direct_inventory(shared, shared_modules, (),
                                    f"layer {index} shared expert")
         for child_name in ("gate_proj", "up_proj", "down_proj"):
             validate_forward_provenance(
                 getattr(shared, child_name),
-                (torch.nn.Linear.__module__, torch.nn.Linear.__name__),
+                _LINEAR,
                 f"layer {index} shared expert.{child_name}"
             )
         if "act_fn" in shared_modules:
@@ -460,8 +578,10 @@ def _block_inventory(block, index, hidden, validated_norms):
                 shared.act_fn, _SILU,
                 f"layer {index} shared expert.act_fn"
             )
+            _validate_direct_inventory(shared.act_fn, (), (),
+                                       f"layer {index} shared expert.act_fn")
         validate_forward_provenance(mlp.shared_expert_gate,
-                                    (torch.nn.Linear.__module__, torch.nn.Linear.__name__),
+                                    _LINEAR,
                                     f"layer {index} shared expert gate")
     targets = [TransformTarget(path + ".weight", path, "input_layernorm")
                for path in mixer]
@@ -478,7 +598,7 @@ def _block_inventory(block, index, hidden, validated_norms):
     for name in norm_names:
         norm = getattr(block, name, None)
         if id(norm) not in validated_norms:
-            validate_rms_norm(norm, hidden, f"layer {index} {name}")
+            validate_rms_norm(norm, hidden, f"layer {index} {name}", spec.norm_class)
             validated_norms.add(id(norm))
         norms.append((name, norm))
     reads = []
@@ -497,10 +617,16 @@ def _block_inventory(block, index, hidden, validated_norms):
         elif (type(module) is not torch.nn.Linear or tensor.ndim != 2):
             raise ValueError(f"layer {index} reader {target.state_suffix} is not an audited Linear")
         if isinstance(module, torch.nn.Module):
-            expected = (spec.router_class if target.accessor == "mlp.gate" else
-                        (torch.nn.Linear.__module__, torch.nn.Linear.__name__))
+            expected = spec.router_class if target.accessor == "mlp.gate" else _LINEAR
             validate_forward_provenance(module, expected,
                                         f"layer {index} reader {target.state_suffix}")
+            reader_parameters = (("weight",) if target.accessor == "mlp.gate"
+                                 and spec.packed and spec.router_class != _LINEAR
+                                 else ("weight", "bias"))
+            _validate_direct_inventory(module, (), reader_parameters,
+                                       f"layer {index} reader {target.state_suffix}")
+            if getattr(module, "bias", None) is not None:
+                raise ValueError(f"layer {index} reader {target.state_suffix} has bias")
         if not tensor.dtype.is_floating_point or tensor.shape[target.axis] != hidden:
             raise ValueError(f"layer {index} reader {target.state_suffix} has invalid storage")
         reads.append((target, tensor, getattr(block, target.norm_name)))
@@ -524,9 +650,11 @@ def _block_inventory(block, index, hidden, validated_norms):
                 exact_ok, exact_reason = False, f"residual writer {name} is unsupported"
             else:
                 validate_forward_provenance(
-                    writer, (torch.nn.Linear.__module__, torch.nn.Linear.__name__),
+                    writer, _LINEAR,
                     f"layer {index} writer {name}"
                 )
+                _validate_direct_inventory(writer, (), ("weight", "bias"),
+                                           f"layer {index} writer {name}")
             writes.append((name, writer))
     return BlockInventory(index, kind, tuple(norms), tuple(reads), tuple(writes),
                           spec.packed, exact_ok, exact_reason)
@@ -536,12 +664,16 @@ def model_inventory(jl):
     layers = getattr(jl, "layers", None)
     if not layers:
         raise ValueError("model has no decoder blocks")
-    embed_weight = getattr(getattr(jl, "_embed_tokens", None), "weight", None)
+    embed = getattr(jl, "_embed_tokens", None)
+    embed_weight = getattr(embed, "weight", None)
     if embed_weight is None or embed_weight.ndim != 2:
         raise ValueError("embedding storage is unsupported")
+    validate_forward_provenance(embed, _EMBEDDING, "embedding")
+    _validate_direct_inventory(embed, (), ("weight",), "embedding")
     hidden = embed_weight.shape[-1]
     blocks, validated_norms = [], set()
     block_ids, norm_layers, module_sites, tensor_sites, names = set(), {}, {}, {}, set()
+    decoder_spans = []
     for index, block in enumerate(layers):
         if id(block) in block_ids:
             raise ValueError("decoder block object is shared across layers")
@@ -567,15 +699,21 @@ def model_inventory(jl):
                     previous = table.setdefault(identity, (role, logical))
                     if previous != (role, logical):
                         raise ValueError(f"unsafe {role} module or parameter alias")
+                span = storage_span(tensor)
+                if any(_overlaps(span, prior) for prior in decoder_spans):
+                    raise ValueError("decoder reader/writer storage aliases another site")
+                if span is not None:
+                    decoder_spans.append(span)
         blocks.append(inventory)
     final_norm = getattr(jl, "_final_norm", None)
     if id(final_norm) in norm_layers:
         raise ValueError("final norm aliases a decoder block norm")
-    validate_rms_norm(final_norm, hidden, "final norm")
+    final_spec = AUDITED_DECODER_SPECS[type(layers[0])]
+    validate_rms_norm(final_norm, hidden, "final norm", final_spec.norm_class)
     head = getattr(jl, "_lm_head", None)
     head_weight = getattr(head, "weight", None)
     validate_forward_provenance(
-        head, (torch.nn.Linear.__module__, torch.nn.Linear.__name__), "final lm_head"
+        head, _LINEAR, "final lm_head"
     )
     _validate_direct_inventory(head, (), ("weight", "bias"), "final lm_head")
     if (head_weight is None or head_weight.ndim != 2
@@ -588,21 +726,31 @@ def model_inventory(jl):
         raise ValueError("duplicate final checkpoint target")
     if id(head) in module_sites or id(head_weight) in tensor_sites:
         raise ValueError("final lm_head aliases a decoder reader or writer")
-    if head_weight is embed_weight:
-        embed = jl._embed_tokens
-        validate_forward_provenance(
-            embed, (torch.nn.Embedding.__module__, torch.nn.Embedding.__name__),
-            "tied embedding"
-        )
-        if embed_weight.ndim != 2 or embed_weight.shape[1] != hidden:
-            raise ValueError("tied embedding/head contract is incomplete")
+    head_span, embed_span = storage_span(head_weight), storage_span(embed_weight)
+    tied = head_weight is embed_weight
+    if not tied and _overlaps(head_span, embed_span):
+        raise ValueError("distinct embedding and head parameters share storage")
+    if any(_overlaps(span, head_span) or _overlaps(span, embed_span)
+           for span in decoder_spans):
+        raise ValueError("embedding or head storage aliases decoder storage")
+    if tied:
+        config = getattr(getattr(jl, "_hf_model", None), "config", None)
+        if getattr(config, "tie_word_embeddings", None) is not True:
+            raise ValueError("embedding/head tie is not declared by model configuration")
+    if embed_weight.ndim != 2 or embed_weight.shape[1] != hidden:
+        raise ValueError("embedding/head contract is incomplete")
     packed = any(block.packed for block in blocks)
     exact_ok = not packed and all(block.exact_supported for block in blocks)
     reason = ("packed residual writers are unsupported" if packed else
               next((block.exact_reason for block in blocks
                     if not block.exact_supported), "supported"))
-    return ModelInventory(tuple(blocks), final_norm, hidden, packed, exact_ok, reason,
-                          (head_name, head, head_weight))
+    embed_name = f"{jl.layout.path}.{jl.layout.embed}.weight"
+    result = ModelInventory(tuple(blocks), final_norm, hidden, packed, exact_ok, reason,
+                            (head_name, head, head_weight),
+                            (embed_name, embed, embed_weight), tied, jl,
+                            tuple(id(block) for block in layers), _INVENTORY_TOKEN)
+    _VALID_INVENTORIES[id(result)] = result
+    return result
 
 
 def block_capabilities(block, _validated_norms=None):
@@ -623,25 +771,47 @@ PACKED_EXACT_REASON = "exact mode is unavailable for packed MoE models"
 def _deny_known_packed_exact(jl):
     """Deny only an entirely canonical packed decoder class; never grants support."""
     layers = getattr(jl, "layers", None)
-    packed_key = (_QWEN_MOE, "Qwen3_5MoeDecoderLayer")
-    if layers and all((type(block).__module__, type(block).__name__) == packed_key
-                      for block in layers):
+    packed_spec = AUDITED_DECODER_SPECS[qwen_moe_modeling.Qwen3_5MoeDecoderLayer]
+    if layers and all(type(block) is packed_spec.decoder.cls for block in layers):
         try:
             for index, block in enumerate(layers):
-                validate_forward_provenance(block, packed_key,
+                validate_forward_provenance(block, packed_spec.decoder,
                                             f"layer {index} decoder")
         except ValueError:
             return
         raise ValueError(PACKED_EXACT_REASON)
 
 
+def validate_inventory_policy(inventory, jl, *, exact=False):
+    """Authenticate an opaque inventory and authorize its requested mode."""
+    if (type(inventory) is not ModelInventory or inventory.token is not _INVENTORY_TOKEN
+            or _VALID_INVENTORIES.get(id(inventory)) is not inventory
+            or inventory.owner is not jl):
+        raise ValueError("model inventory is not authentic for this model")
+    layers = getattr(jl, "layers", None)
+    if (layers is None or len(layers) != len(inventory.layer_ids)
+            or tuple(id(block) for block in layers) != inventory.layer_ids
+            or inventory.final_norm is not getattr(jl, "_final_norm", None)
+            or inventory.final_head[1] is not getattr(jl, "_lm_head", None)
+            or inventory.embedding[1] is not getattr(jl, "_embed_tokens", None)):
+        raise ValueError("model changed after inventory validation")
+    for index, block in enumerate(layers):
+        spec = AUDITED_DECODER_SPECS.get(type(block))
+        if spec is None:
+            raise ValueError("model topology is no longer audited")
+        validate_forward_provenance(block, spec.decoder, f"layer {index} decoder")
+    if exact and inventory.packed:
+        raise ValueError(PACKED_EXACT_REASON)
+    if exact and not inventory.exact_supported:
+        raise ValueError("exact mode is unavailable for this model: " + inventory.exact_reason)
+    return inventory
+
+
 def model_preflight(jl, *, exact=False):
     if exact:
         _deny_known_packed_exact(jl)
     inventory = model_inventory(jl)
-    if exact and not inventory.exact_supported:
-        raise ValueError("exact mode is unavailable for this model: " + inventory.exact_reason)
-    return inventory
+    return validate_inventory_policy(inventory, jl, exact=exact)
 
 
 def has_packed_read_parameters(jl):
@@ -816,7 +986,10 @@ def build_plan(rules, jl, scale, exact=False, *, inventory=None):
     done by the export."""
     from core.capabilities import ensure_unquantized
     ensure_unquantized(jl)
-    inventory = inventory or model_preflight(jl, exact=exact)
+    if inventory is None:
+        inventory = model_preflight(jl, exact=exact)
+    else:
+        validate_inventory_policy(inventory, jl, exact=exact)
     active = [r for r in rules if r["layers"]]
     if not active:
         raise ValueError("no active rule (all have 0 layers): nothing to export")
@@ -853,11 +1026,10 @@ def build_plan(rules, jl, scale, exact=False, *, inventory=None):
     lm_head_key, _head, _head_weight = inventory.final_head
     transforms[lm_head_key] = ("read", Ug, Vg)
 
-    tied = jl._lm_head.weight.data_ptr() == jl._embed_tokens.weight.data_ptr()
     info = {
-        "tied": tied,
+        "tied": inventory.tied,
         "lm_head_key": lm_head_key,
-        "embed_key": f"{path}.{jl.layout.embed}.weight",
+        "embed_key": inventory.embedding[0],
         "path": path,
         "rank_final": cums[n_layers][0].shape[1],
         "layers_span": [min(cums), n_layers - 1],

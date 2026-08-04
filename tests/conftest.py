@@ -10,11 +10,10 @@ def synthetic_decoder_specs(monkeypatch):
                          SYNTHETIC_DENSE_SPEC, SYNTHETIC_PACKED_SPEC)
     before = dict(rebase.AUDITED_DECODER_SPECS)
     monkeypatch.setitem(rebase.AUDITED_DECODER_SPECS,
-                        (SyntheticDecoderBlock.__module__, SyntheticDecoderBlock.__name__),
+                        SyntheticDecoderBlock,
                         SYNTHETIC_DENSE_SPEC)
     monkeypatch.setitem(rebase.AUDITED_DECODER_SPECS,
-                        (SyntheticPackedDecoderBlock.__module__,
-                         SyntheticPackedDecoderBlock.__name__),
+                        SyntheticPackedDecoderBlock,
                         SYNTHETIC_PACKED_SPEC)
     yield
     assert all(rebase.AUDITED_DECODER_SPECS[key] is value

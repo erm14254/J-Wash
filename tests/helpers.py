@@ -106,22 +106,27 @@ class SyntheticPackedDecoderBlock(SyntheticDecoderBlock):
 
 
 SYNTHETIC_DENSE_SPEC = rebase.TopologySpec(
-    (("self_attn", (nn.Module.__module__, nn.Module.__name__),
+    rebase.class_contract(SyntheticDecoderBlock),
+    (("self_attn", rebase.class_contract(nn.Module),
       ("q_proj", "k_proj", "v_proj", "o_proj"), (), None),
-     ("linear_attn", (nn.Module.__module__, nn.Module.__name__),
+     ("linear_attn", rebase.class_contract(nn.Module),
       ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"),
       (), None)),
-    (nn.Module.__module__, nn.Module.__name__),
+    rebase.class_contract(nn.Module),
     ("gate_proj", "up_proj", "down_proj"),
+    norm_class=rebase.class_contract(__import__("transformers.models.llama.modeling_llama",
+                                                fromlist=["LlamaRMSNorm"]).LlamaRMSNorm),
 )
 
 SYNTHETIC_PACKED_SPEC = rebase.TopologySpec(
+    rebase.class_contract(SyntheticPackedDecoderBlock),
     SYNTHETIC_DENSE_SPEC.mixers,
-    (nn.Module.__module__, nn.Module.__name__),
+    rebase.class_contract(nn.Module),
     ("gate", "experts", "shared_expert", "shared_expert_gate"), packed=True,
-    router_class=(nn.Linear.__module__, nn.Linear.__name__),
-    experts_class=(nn.Module.__module__, nn.Module.__name__),
-    shared_expert_class=(nn.Module.__module__, nn.Module.__name__),
+    router_class=rebase.class_contract(nn.Linear),
+    experts_class=rebase.class_contract(nn.Module),
+    shared_expert_class=rebase.class_contract(nn.Module),
+    norm_class=SYNTHETIC_DENSE_SPEC.norm_class,
 )
 
 
@@ -221,11 +226,11 @@ def capture_moe(model):
 
 
 def run_variant(model, ids, rules=None, kind="base", past=None):
-    captures, capture_handles = capture_moe(model); handles = []
-    iv = None
-    if rules and kind == "oracle": handles = oracle_handles(model, rules)
+    handles = []; iv = None
     if rules and kind == "production":
         iv = Interventions(); iv._rules = rules; iv.set_mode("readthrough"); iv.attach(lens(model))
+    captures, capture_handles = capture_moe(model)
+    if rules and kind == "oracle": handles = oracle_handles(model, rules)
     try:
         with torch.no_grad(): out = model(ids, past_key_values=past, use_cache=True)
         captures["logits"] = out.logits.detach()
