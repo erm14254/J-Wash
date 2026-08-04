@@ -132,6 +132,7 @@ def test_nonstring_index_key_is_controlled(tiny, tmp_path, monkeypatch):
 
 def test_transaction_rolls_back_index_write_failure(tmp_path, monkeypatch):
     jl = dense_lens(); jl._lm_head.weight = jl._embed_tokens.weight
+    jl._hf_model.config = SimpleNamespace(tie_word_embeddings=True)
     direction = torch.randn(8); direction /= direction.norm()
     rules = [{"id": 1, "token_id": 1, "token": "x", "mode": "scale", "factor": 0.5,
               "replacement_id": None, "replacement": None, "layers": [0],

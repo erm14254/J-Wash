@@ -1,5 +1,36 @@
 import pytest
 import torch
+import sys
+
+
+@pytest.fixture(autouse=True)
+def synthetic_decoder_specs(monkeypatch):
+    from core import rebase
+    from helpers import (SyntheticDecoderBlock, SyntheticPackedDecoderBlock,
+                         SYNTHETIC_DENSE_SPEC, SYNTHETIC_PACKED_SPEC)
+    before = dict(rebase.AUDITED_DECODER_SPECS)
+    monkeypatch.setitem(rebase.AUDITED_DECODER_SPECS,
+                        SyntheticDecoderBlock,
+                        SYNTHETIC_DENSE_SPEC)
+    monkeypatch.setitem(rebase.AUDITED_DECODER_SPECS,
+                        SyntheticPackedDecoderBlock,
+                        SYNTHETIC_PACKED_SPEC)
+    yield
+    assert all(rebase.AUDITED_DECODER_SPECS[key] is value
+               for key, value in before.items())
+
+
+@pytest.fixture(autouse=True)
+def restore_api_gguf_state():
+    app = sys.modules.get("api.app")
+    original = (dict(app._gguf_state) if app is not None else
+                {"state": "idle", "name": None, "step": None,
+                 "error": None, "result": None})
+    yield
+    app = sys.modules.get("api.app")
+    if app is not None:
+        app._gguf_state.clear()
+        app._gguf_state.update(original)
 
 @pytest.fixture(scope="module")
 def tiny():

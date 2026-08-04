@@ -437,25 +437,12 @@ def _sample(logits, temperature, top_p, top_k, generator=None, penalty=1.0, pena
 
 
 def _rebase_capability_meta(jl):
-    """Public metadata contract, kept testable without loading a checkpoint."""
-    from core import rebase
-    try:
-        rebase.model_preflight(jl, exact=False)
-        readthrough_supported, readthrough_reason = True, "supported"
-    except ValueError as exc:
-        readthrough_supported, readthrough_reason = False, str(exc)
-    try:
-        rebase.model_preflight(jl, exact=True)
-        exact_supported, exact_reason = True, "supported"
-    except ValueError as exc:
-        exact_supported, exact_reason = False, str(exc)
-    return {
-        "rebase_supported": readthrough_supported,
-        "readthrough_supported": readthrough_supported,
-        "readthrough_reason": readthrough_reason,
-        "exact_supported": exact_supported,
-        "exact_reason": exact_reason,
-    }
+    """Compatibility wrapper around the single production policy."""
+    from core import capabilities
+    profile = capabilities.build_profile(
+        jl, getattr(jl, "_jwash_declared_quant", None)
+    )
+    return capabilities.legacy(profile, loaded=True)
 
 
 class ModelManager:
@@ -465,6 +452,7 @@ class ModelManager:
         self.tokenizer = None
         self.jl = None
         self.meta = None
+        self.capability_profile = None
         self.busy = None
 
     def list_models(self):
@@ -520,10 +508,13 @@ class ModelManager:
                 self.hf_model = hf_model
                 self.tokenizer = tokenizer
                 self.jl = jlens.from_hf(hf_model, tokenizer)
-                # Read-projection support: write-norm architectures (Gemma
-                # style) can't take the reads change of basis — the UI falls
-                # back to the global abliteration for pure-weights edits.
-                capability_meta = _rebase_capability_meta(self.jl)
+                self.jl._jwash_declared_quant = quant
+                # Cache the authoritative fail-closed editing policy once.  In
+                # particular, global projection remains disabled for every topology.
+                from core.capabilities import build_profile, legacy, normalize_profile
+                self.capability_profile = build_profile(self.jl, quant)
+                capability_meta = legacy(self.capability_profile, loaded=True)
+                normalized_profile = normalize_profile(self.capability_profile)
                 self.meta = {
                     "model_id": model_id,
                     "revision": _resolve_revision(source),
@@ -532,6 +523,10 @@ class ModelManager:
                     "device": device,
                     "n_layers": text_config.num_hidden_layers,
                     "d_model": text_config.hidden_size,
+                    "has_packed_read_parameters": (
+                        normalized_profile["has_packed_read_parameters"]
+                        if normalized_profile is not None else False
+                    ),
                     # Includes legacy rebase_supported = safe readthrough support.
                     **capability_meta,
                     "chat_template_source": chat_template_source,
@@ -543,6 +538,7 @@ class ModelManager:
                 # failure (often OOM): drop any partial allocation and return the
                 # reserved blocks, otherwise they linger until the server restarts
                 self.hf_model = self.tokenizer = self.jl = self.meta = None
+                self.capability_profile = None
                 hf_model = None
                 tokenizer = None
                 _free_cuda()
@@ -556,12 +552,15 @@ class ModelManager:
 
     def _unload_locked(self):
         if self.hf_model is None:
+            self.tokenizer = self.jl = self.meta = None
+            self.capability_profile = None
             return {"unloaded": False, "vram_allocated": _torch_allocated()}
         before = _torch_allocated()
         self.hf_model = None
         self.tokenizer = None
         self.jl = None
         self.meta = None
+        self.capability_profile = None
         _free_cuda()
         return {
             "unloaded": True,

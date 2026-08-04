@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 import config
 from core import editing, registry
+from core import capabilities
 from core.ablation import Interventions
 from core.neighbors import TokenNeighbors
 from core import fitting
@@ -227,8 +228,17 @@ def api_models():
 
 @app.get("/api/status")
 def api_status():
+    scale, mode = interventions.state_snapshot()
+    loaded = manager.hf_model is not None or manager.meta is not None
+    capability_snapshot = capabilities.snapshot(
+        manager.capability_profile, mode, loaded=loaded
+    )
+    loaded_meta = ({**(manager.meta if isinstance(manager.meta, dict) else {}),
+                    **capabilities.legacy(manager.capability_profile, loaded=True)}
+                   if loaded else None)
     return {
-        "loaded": manager.meta,
+        "loaded": loaded_meta,
+        "capabilities": capability_snapshot,
         "busy": manager.busy,
         "lens": lens_manager.meta,
         "gpus": gpu_stats(),
@@ -237,8 +247,8 @@ def api_status():
         "fit": fit_manager.state,
         "gguf": dict(_gguf_state),
         "interventions": interventions.summary(),
-        "interventions_scale": interventions.global_scale,
-        "interventions_mode": interventions.mode,
+        "interventions_scale": scale,
+        "interventions_mode": mode,
         "last_generation": _last_generation,
     }
 
@@ -403,6 +413,7 @@ def api_interventions_add(req: InterventionRequest):
     if manager.hf_model is None or lens_manager.lens is None:
         raise HTTPException(422, "model and lens required")
     try:
+        capabilities.require(manager.capability_profile, "modes", "standard", loaded=True)
         return {
             "rules": interventions.add(
                 lens_manager,
@@ -443,22 +454,17 @@ def api_interventions_patch(rule_id: int, req: InterventionPatch):
 
 @app.patch("/api/interventions")
 def api_interventions_scale(req: InterventionsScale):
-    if req.scale is not None:
-        interventions.set_scale(req.scale)
     try:
         if req.mode is not None:
-            capability = f"{req.mode}_supported" if req.mode in ("readthrough", "exact") else None
-            if capability and manager.meta is not None and manager.meta.get(capability, manager.meta.get("rebase_supported")) is False:
-                raise HTTPException(
-                    422,
-                    manager.meta.get(f"{req.mode}_reason", "read projection unavailable on this architecture"),
-                )
-            interventions.set_mode(req.mode)
+            capabilities.require(manager.capability_profile, "modes", req.mode,
+                                 loaded=(manager.hf_model is not None
+                                         or manager.meta is not None))
+        scale, mode = interventions.set_scale_and_mode(scale=req.scale, mode=req.mode)
     except ValueError as exc:
         raise HTTPException(422, str(exc))
     return {
-        "scale": interventions.global_scale,
-        "mode": interventions.mode,
+        "scale": scale,
+        "mode": mode,
     }
 
 
@@ -498,6 +504,10 @@ def api_presets_apply(name: str):
         preset = editing.load_preset(name)
     except ValueError as exc:
         raise HTTPException(404, str(exc))
+    try:
+        capabilities.ensure_unquantized(manager.jl, manager.meta)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
     warnings = []
     if preset.get("model_id") and manager.meta and preset["model_id"] != manager.meta["model_id"]:
         warnings.append(
@@ -544,7 +554,13 @@ async def api_edit_export(req: ExportRequest):
     if req.format not in ("layers", "lora", "full"):
         raise HTTPException(422, f"unknown format: {req.format}")
     source_dir = resolve_local_dir(manager.meta["model_id"])
-    mode = interventions.mode
+    scale, mode = interventions.state_snapshot()
+    try:
+        capabilities.ensure_unquantized(manager.jl, manager.meta)
+        capabilities.require(manager.capability_profile, "exports", req.format, mode,
+                             loaded=True)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
     kwargs = {}
     if mode in ("readthrough", "exact"):
         export_fn = editing.export_rebase
@@ -567,7 +583,7 @@ async def api_edit_export(req: ExportRequest):
             fmt=req.format,
             name=req.name,
             source_dir=source_dir,
-            scale=interventions.global_scale,
+            scale=scale,
             **kwargs,
         )
     except ValueError as exc:
@@ -731,7 +747,13 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
         rules = interventions.active_rules_full()
         if not rules:
             raise HTTPException(422, "no active intervention to export")
-        mode = interventions.mode
+        scale, mode = interventions.state_snapshot()
+        try:
+            capabilities.ensure_unquantized(manager.jl, manager.meta)
+            capabilities.require(manager.capability_profile, "exports", "gguf", mode,
+                                 loaded=True)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc))
         if mode in ("readthrough", "exact"):
             export_fn, kwargs = editing.export_rebase, {"exact": mode == "exact"}
         elif mode == "abliteration":
@@ -743,7 +765,7 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
             await asyncio.to_thread(
                 export_fn, rules, manager.jl, manager.meta,
                 fmt="full", name="/".join((*name_parts, "hf")), source_dir=source_dir,
-                scale=interventions.global_scale, **kwargs,
+                scale=scale, **kwargs,
             )
         except ValueError as exc:
             raise HTTPException(422, str(exc))

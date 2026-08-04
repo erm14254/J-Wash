@@ -96,6 +96,40 @@ class CallableNotHookable:
     def __call__(self, x): return x
 
 
+class SyntheticDecoderBlock(nn.Module):
+    def forward(self, hidden_states):
+        return hidden_states
+
+
+class SyntheticPackedDecoderBlock(SyntheticDecoderBlock):
+    pass
+
+
+SYNTHETIC_DENSE_SPEC = rebase.TopologySpec(
+    rebase.class_contract(SyntheticDecoderBlock),
+    (("self_attn", rebase.class_contract(nn.Module),
+      ("q_proj", "k_proj", "v_proj", "o_proj"), (), None),
+     ("linear_attn", rebase.class_contract(nn.Module),
+      ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "out_proj"),
+      (), None)),
+    rebase.class_contract(nn.Module),
+    ("gate_proj", "up_proj", "down_proj"),
+    norm_class=rebase.class_contract(__import__("transformers.models.llama.modeling_llama",
+                                                fromlist=["LlamaRMSNorm"]).LlamaRMSNorm),
+)
+
+SYNTHETIC_PACKED_SPEC = rebase.TopologySpec(
+    rebase.class_contract(SyntheticPackedDecoderBlock),
+    SYNTHETIC_DENSE_SPEC.mixers,
+    rebase.class_contract(nn.Module),
+    ("gate", "experts", "shared_expert", "shared_expert_gate"), packed=True,
+    router_class=rebase.class_contract(nn.Linear),
+    experts_class=rebase.class_contract(nn.Module),
+    shared_expert_class=rebase.class_contract(nn.Module),
+    norm_class=SYNTHETIC_DENSE_SPEC.norm_class,
+)
+
+
 def block(linear=False, hidden=8, sparse=True):
     from transformers.models.llama.modeling_llama import LlamaRMSNorm
     mixer = nn.Module()
@@ -114,7 +148,8 @@ def block(linear=False, hidden=8, sparse=True):
     else:
         mlp.gate_proj = nn.Linear(hidden, 3, False); mlp.up_proj = nn.Linear(hidden, 3, False)
         mlp.down_proj = nn.Linear(3, hidden, False)
-    result = nn.Module(); setattr(result, "linear_attn" if linear else "self_attn", mixer)
+    result = (SyntheticPackedDecoderBlock() if sparse else SyntheticDecoderBlock())
+    setattr(result, "linear_attn" if linear else "self_attn", mixer)
     result.mlp = mlp; result.input_layernorm = LlamaRMSNorm(hidden)
     result.post_attention_layernorm = LlamaRMSNorm(hidden)
     return result
@@ -191,11 +226,11 @@ def capture_moe(model):
 
 
 def run_variant(model, ids, rules=None, kind="base", past=None):
-    captures, capture_handles = capture_moe(model); handles = []
-    iv = None
-    if rules and kind == "oracle": handles = oracle_handles(model, rules)
+    handles = []; iv = None
     if rules and kind == "production":
         iv = Interventions(); iv._rules = rules; iv.set_mode("readthrough"); iv.attach(lens(model))
+    captures, capture_handles = capture_moe(model)
+    if rules and kind == "oracle": handles = oracle_handles(model, rules)
     try:
         with torch.no_grad(): out = model(ids, past_key_values=past, use_cache=True)
         captures["logits"] = out.logits.detach()

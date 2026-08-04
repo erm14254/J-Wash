@@ -108,6 +108,22 @@ class Interventions:
             self._mode = mode
             return self._mode
 
+    def set_scale_and_mode(self, *, scale=None, mode=None):
+        """Validate the complete patch before atomically changing either field."""
+        if mode is not None and mode not in MODES:
+            raise ValueError(f"unknown intervention mode: {mode}")
+        new_scale = None if scale is None else float(scale)
+        with self._lock:
+            if new_scale is not None:
+                self._scale = new_scale
+            if mode is not None:
+                self._mode = mode
+            return self._scale, self._mode
+
+    def state_snapshot(self):
+        with self._lock:
+            return self._scale, self._mode
+
     def rules_full(self):
         return list(self._rules)
 
@@ -154,6 +170,8 @@ class Interventions:
 
     def add(self, lens_manager, jl, *, token_id, mode="scale", factor=0.0,
             replacement_id=None, layers=None, enabled=True):
+        from core.capabilities import ensure_unquantized
+        ensure_unquantized(jl)
         with self._lock:
             lens = lens_manager.lens
             if lens is None:
@@ -192,6 +210,10 @@ class Interventions:
     def update(self, rule_id, *, factor=None, layers=None, enabled=None,
                token_id=None, replacement_id=None, mode=None,
                lens_manager=None, jl=None):
+        needs_dirs = any(x is not None for x in (layers, token_id, replacement_id, mode))
+        if needs_dirs:
+            from core.capabilities import ensure_unquantized
+            ensure_unquantized(jl)
         with self._lock:
             for rule in self._rules:
                 if rule["id"] != rule_id:
@@ -202,7 +224,6 @@ class Interventions:
                     rule["enabled"] = bool(enabled)
                 # token / replacement / mode / layers change the directions →
                 # the lens and model are required to re-resolve them
-                needs_dirs = any(x is not None for x in (layers, token_id, replacement_id, mode))
                 if not needs_dirs:
                     return self.summary()
                 if lens_manager is None or jl is None:
@@ -250,10 +271,11 @@ class Interventions:
             return self.summary()
 
     def attach(self, jl):
-        if not self._rules:
-            return
+        from core.capabilities import ensure_unquantized, PUBLIC_REASONS
+        ensure_unquantized(jl)
         if self._mode == "abliteration":
-            self._attach_abliteration(jl)
+            raise ValueError(PUBLIC_REASONS["global_projection_unvalidated"])
+        if not self._rules:
             return
         if self._mode in ("readthrough", "exact"):
             self._attach_rebase(jl, exact=self._mode == "exact")
@@ -287,37 +309,8 @@ class Interventions:
         ]
 
     def _attach_abliteration(self, jl):
-        # Abliteration-mode preview: the SAME projection on every residual write
-        # (embed + each block's output), mirroring the pure-weight bake. A rule's
-        # layers make no sense here (global projection), but layers=[] stays THE
-        # "rule disabled" gesture: we honor it too.
-        active = self._active_rules()
-        if not active:
-            return
-        weight_u = jl._lm_head.weight
-        dirs = [(abliteration_direction(weight_u, r), r) for r in active]
-
-        def apply(h):
-            g = self._scale
-            for (v_a, v_b), rule in dirs:
-                alpha, beta = effective_coeffs(rule["mode"], rule["factor"], g)
-                va = v_a.to(h.device, h.dtype)
-                coef = (h * va).sum(-1, keepdim=True)
-                h = h + alpha * coef * va
-                if beta:
-                    h = h + beta * coef * v_b.to(h.device, h.dtype)
-            return h
-
-        def emb_hook(module, inputs, output):
-            return apply(output)
-
-        def blk_hook(module, inputs, output):
-            h = output[0] if isinstance(output, tuple) else output
-            h = apply(h)
-            return (h,) + tuple(output[1:]) if isinstance(output, tuple) else h
-
-        self._handles = [jl._embed_tokens.register_forward_hook(emb_hook)]
-        self._handles += [blk.register_forward_hook(blk_hook) for blk in jl.layers]
+        from core.capabilities import PUBLIC_REASONS
+        raise ValueError(PUBLIC_REASONS["global_projection_unvalidated"])
 
     def _attach_rebase(self, jl, exact):
         # readthrough/exact preview: the SAME transform as the bake (core/rebase),
@@ -333,7 +326,7 @@ class Interventions:
         # Model-wide Phase-1 contract: capability does not depend on which rule
         # happens to be last.  This also validates the final norm before any
         # hook registration is attempted.
-        rebase.model_preflight(jl, exact=exact)
+        inventory = rebase.model_preflight(jl, exact=exact)
         cums = rebase.cumulative(active, self._scale, n_layers)
         if not cums:
             return
@@ -368,17 +361,19 @@ class Interventions:
         for m in sorted(k for k in cums if k < n_layers):
             U, V = cums[m]
             block = jl.layers[m]
+            block_inventory = inventory.blocks[m]
             norms = {}
-            for _suffix, _module, norm in rebase.iter_reads(block):
+            for _suffix, _module, norm in block_inventory.reads:
                 norms[id(norm)] = norm
             for norm in norms.values():
                 sites.append((norm, read_hook_for(norm, U, V)))
             if exact:
                 U_inv, Vw, _regularized = rebase.inverse_uv(U, V)
-                for _suffix, module in rebase.iter_writes(block):
+                for _suffix, module in block_inventory.writes:
                     sites.append((module, write_hook_for(module, U_inv, Vw)))
         U, V = cums[n_layers]
-        sites.append((jl._final_norm, read_hook_for(jl._final_norm, U, V)))
+        sites.append((inventory.final_norm,
+                      read_hook_for(inventory.final_norm, U, V)))
         handles = []
         try:
             for module, hook in sites:

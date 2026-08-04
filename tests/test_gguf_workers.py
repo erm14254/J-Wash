@@ -11,11 +11,35 @@ from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 from torch import nn
 
-from core import editing, rebase
+from core import capabilities, editing, rebase
 from core.ablation import Interventions
 from core.model_manager import _rebase_capability_meta
 from helpers import *
 from helpers import _deferred_threads, _gguf_test_tools
+
+
+def _mock_loaded_readthrough(app, monkeypatch):
+    """Install the complete invariant produced by a successful unquantized load."""
+    supported = capabilities.decision(True, "supported")
+    monkeypatch.setattr(app.manager, "hf_model", object())
+    monkeypatch.setattr(app.manager, "jl", object())
+    monkeypatch.setattr(app.manager, "meta", {"model_id": "local", "quant": None})
+    monkeypatch.setattr(app.manager, "capability_profile", {
+        "declared_quantization": None,
+        "has_packed_read_parameters": False,
+        "modes": {
+            "standard": dict(supported),
+            "readthrough": dict(supported),
+            "exact": dict(supported),
+            "abliteration": capabilities.decision(
+                False, "global_projection_unvalidated"
+            ),
+        },
+    })
+    monkeypatch.setattr(app.interventions, "active_rules_full", lambda: [{"layers": [0]}])
+    monkeypatch.setattr(app.interventions, "_mode", "readthrough")
+    monkeypatch.setattr(app.interventions, "_scale", 1.0)
+
 
 def test_api_gguf_preparation_uses_nested_hf_name(tmp_path, monkeypatch):
     import api.app as app
@@ -23,12 +47,7 @@ def test_api_gguf_preparation_uses_nested_hf_name(tmp_path, monkeypatch):
     monkeypatch.setattr(app.editing, "EDITS_DIR", tmp_path / "edits")
     monkeypatch.setattr(app, "_llamacpp_paths", lambda: (tmp_path / "convert.py", None, None))
     monkeypatch.setattr(app, "resolve_local_dir", lambda _model: tmp_path / "source")
-    monkeypatch.setattr(app.manager, "hf_model", object())
-    monkeypatch.setattr(app.manager, "jl", object())
-    monkeypatch.setattr(app.manager, "meta", {"model_id": "local"})
-    monkeypatch.setattr(app.interventions, "active_rules_full", lambda: [{"layers": [0]}])
-    monkeypatch.setattr(app.interventions, "_mode", "readthrough")
-    monkeypatch.setattr(app.interventions, "_scale", 1.0)
+    _mock_loaded_readthrough(app, monkeypatch)
     def fake_export(*_args, **kwargs):
         captured["name"] = kwargs["name"]
         target = app.editing.EDITS_DIR / kwargs["name"]
@@ -47,15 +66,58 @@ def test_api_gguf_maps_generic_export_error_to_500(tmp_path, monkeypatch):
     monkeypatch.setattr(app.editing, "EDITS_DIR", tmp_path / "edits")
     monkeypatch.setattr(app, "_llamacpp_paths", lambda: (tmp_path / "convert.py", None, None))
     monkeypatch.setattr(app, "resolve_local_dir", lambda _model: tmp_path / "source")
-    monkeypatch.setattr(app.manager, "hf_model", object()); monkeypatch.setattr(app.manager, "jl", object())
-    monkeypatch.setattr(app.manager, "meta", {"model_id": "local"})
-    monkeypatch.setattr(app.interventions, "active_rules_full", lambda: [{"layers": [0]}])
-    monkeypatch.setattr(app.interventions, "_mode", "readthrough")
+    _mock_loaded_readthrough(app, monkeypatch)
     monkeypatch.setattr(app.editing, "export_rebase", lambda *_a, **_k: (_ for _ in ()).throw(OSError("disk failed")))
     app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
     with pytest.raises(app.HTTPException) as exc:
         asyncio.run(app.api_edit_export_gguf(SimpleNamespace(name="job", gguf_type="bf16")))
     assert exc.value.status_code == 500 and exc.value.detail == "disk failed"
+
+
+def test_fresh_gguf_bake_requires_capability_profile(tmp_path, monkeypatch):
+    import api.app as app
+    monkeypatch.setattr(app.editing, "EDITS_DIR", tmp_path / "edits")
+    monkeypatch.setattr(app, "_llamacpp_paths", lambda: (tmp_path / "convert.py", None, None))
+    monkeypatch.setattr(app.manager, "hf_model", object())
+    monkeypatch.setattr(app.manager, "jl", object())
+    monkeypatch.setattr(app.manager, "meta", {"model_id": "local", "quant": None})
+    monkeypatch.setattr(app.manager, "capability_profile", None)
+    monkeypatch.setattr(app.interventions, "active_rules_full", lambda: [{"layers": [0]}])
+    monkeypatch.setattr(app.interventions, "_mode", "readthrough")
+    forbidden = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("export must not run without a capability profile")
+    )
+    monkeypatch.setattr(app.editing, "export_rebase", forbidden)
+    app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(app.api_edit_export_gguf(
+            SimpleNamespace(name="job", gguf_type="bf16")
+        ))
+    assert exc.value.status_code == 422
+    assert exc.value.detail == "Capability data is unavailable for this model."
+
+
+def test_fresh_gguf_abliteration_rejected_before_dispatch_or_state(tmp_path, monkeypatch):
+    import api.app as app
+    monkeypatch.setattr(app.editing, "EDITS_DIR", tmp_path / "edits")
+    monkeypatch.setattr(app, "_llamacpp_paths",
+                        lambda: (tmp_path / "convert.py", None, None))
+    _mock_loaded_readthrough(app, monkeypatch)
+    monkeypatch.setattr(app.manager, "jl", dense_lens())
+    monkeypatch.setattr(app.interventions, "_mode", "abliteration")
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("global export or worker dispatch must not run")
+    monkeypatch.setattr(app.editing, "export_abliteration", forbidden)
+    monkeypatch.setattr(app, "threading", SimpleNamespace(Thread=forbidden))
+    original = {"state": "idle", "name": None, "step": None,
+                "error": None, "result": None}
+    app._gguf_state.update(original)
+    with pytest.raises(app.HTTPException) as exc:
+        asyncio.run(app.api_edit_export_gguf(
+            SimpleNamespace(name="global", gguf_type="bf16")
+        ))
+    assert exc.value.status_code == 422
+    assert app._gguf_state == original
 
 
 @pytest.mark.parametrize("name", ["COM¹", "com²", "COM³.txt", "LPT¹", "lpt².json", "folder/LPT³"])
@@ -133,12 +195,7 @@ def test_gguf_nested_worker_outputs_use_leaf_stem(
     convert, quantize = _gguf_test_tools(tmp_path)
     monkeypatch.setattr(app, "_llamacpp_paths", lambda: (convert, quantize, None))
     if not cached:
-        monkeypatch.setattr(app.manager, "hf_model", object())
-        monkeypatch.setattr(app.manager, "jl", object())
-        monkeypatch.setattr(app.manager, "meta", {"model_id": "local"})
-        monkeypatch.setattr(app.interventions, "active_rules_full", lambda: [{"layers": [0]}])
-        monkeypatch.setattr(app.interventions, "_mode", "readthrough")
-        monkeypatch.setattr(app.interventions, "_scale", 1.0)
+        _mock_loaded_readthrough(app, monkeypatch)
         monkeypatch.setattr(app, "resolve_local_dir", lambda _model: tmp_path / "source")
         def fake_export(*_args, **kwargs):
             assert kwargs["name"] == name + "/hf"
@@ -202,12 +259,7 @@ def test_gguf_atomic_partial_failure_then_retry(name, cached, gguf_type, tmp_pat
     monkeypatch.setattr(app, "_llamacpp_paths", lambda: (convert, quantize, None))
     baked = []
     if not cached:
-        monkeypatch.setattr(app.manager, "hf_model", object())
-        monkeypatch.setattr(app.manager, "jl", object())
-        monkeypatch.setattr(app.manager, "meta", {"model_id": "local"})
-        monkeypatch.setattr(app.interventions, "active_rules_full", lambda: [{"layers": [0]}])
-        monkeypatch.setattr(app.interventions, "_mode", "readthrough")
-        monkeypatch.setattr(app.interventions, "_scale", 1.0)
+        _mock_loaded_readthrough(app, monkeypatch)
         monkeypatch.setattr(app, "resolve_local_dir", lambda _model: tmp_path / "source")
         def fake_export(*_args, **_kwargs):
             baked.append(True); hf_dir.mkdir(parents=True); sentinel.write_text('{"baked": true}')
