@@ -322,6 +322,41 @@ def test_exact_writer_hook_uses_runtime_output_dtype():
     assert iv._handles == [] and len(writer._forward_hooks) == 0
 
 
+@pytest.mark.parametrize("exact", [False, True])
+def test_dense_live_hooks_match_baked_reader_and_writer_transforms(exact):
+    jl = dense_lens()
+    direction = torch.randn(8); direction /= direction.norm()
+    rules = [{"id": 1, "token_id": 1, "token": "x", "mode": "scale",
+              "factor": 0.8, "replacement_id": None, "replacement": None,
+              "layers": [0], "dirs_a": {0: direction}, "dirs_b": None}]
+    transforms, _ = rebase.build_plan(rules, jl, 1.0, exact=exact)
+    reader = jl.layers[1].self_attn.q_proj
+    reader_weight = reader.weight.detach().clone()
+    reader_baked = rebase.apply_transform(
+        transforms["model.layers.1.self_attn.q_proj.weight"], reader_weight
+    )[0]
+    writer = jl.layers[1].self_attn.o_proj
+    writer_weight = writer.weight.detach().clone()
+    writer_baked = (rebase.apply_transform(
+        transforms["model.layers.1.self_attn.o_proj.weight"], writer_weight
+    )[0] if exact else None)
+    iv = Interventions(); iv._rules = rules
+    iv.set_mode("exact" if exact else "readthrough"); iv.attach(jl)
+    h = torch.randn(2, 3, 8)
+    try:
+        live_reader = reader(jl.layers[1].input_layernorm(h))
+        live_writer = writer(h)
+    finally:
+        iv.detach()
+    baked_reader = torch.nn.functional.linear(
+        jl.layers[1].input_layernorm(h), reader_baked
+    )
+    torch.testing.assert_close(live_reader, baked_reader, rtol=2e-5, atol=2e-6)
+    if exact:
+        baked_writer = torch.nn.functional.linear(h, writer_baked)
+        torch.testing.assert_close(live_writer, baked_writer, rtol=2e-5, atol=2e-6)
+
+
 @pytest.mark.parametrize("base", ["COM¹", "COM²", "COM³", "LPT¹", "LPT²", "LPT³"])
 @pytest.mark.parametrize("style", ["bare", "mixed", "extension", "nested"])
 def test_superscript_reserved_names_fail_core_and_api(base, style, tmp_path):
