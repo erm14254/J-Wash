@@ -130,6 +130,32 @@ class Store:
             self._local.conn = conn
         return conn
 
+    def _discard_conn(self, conn=None):
+        conn = conn or getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if hasattr(self._local, "conn"):
+            del self._local.conn
+
+    def _rollback_or_discard(self, conn):
+        try:
+            if conn.in_transaction:
+                conn.rollback()
+            return True
+        except Exception:
+            log.warning("discarding poisoned sqlite connection after rollback failure", exc_info=True)
+            self._discard_conn(conn)
+            return False
+
+    def _fresh_conn(self):
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
     def create_conversation(self, title, tags=None):
         conn = self._conn()
         now = _now()

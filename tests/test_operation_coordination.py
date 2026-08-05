@@ -1,3 +1,4 @@
+import json
 import threading
 
 import pytest
@@ -942,7 +943,10 @@ def test_mark_frame_publication_failed_marks_pending_without_rewriting_content(t
     assert current["content"] == "T"
     assert current["frames_file"] is None
     assert current["version"] == version + 1
-    assert current["meta"]["publication_state"] == "frames_publication_failed"
+    meta = current["meta"]
+    if isinstance(meta, str):
+        meta = json.loads(meta)
+    assert meta["publication_state"] == "frames_publication_failed"
 
 
 def test_load_frames_state_taxonomy(tmp_path, monkeypatch):
