@@ -51,8 +51,19 @@ def _install_loaded_bundle(app, monkeypatch, *, jl=None, profile="__default__", 
 
 
 def _mock_loaded_readthrough(app, monkeypatch):
-    _install_loaded_bundle(app, monkeypatch)
     rules = [{"id": 1, "layers": [0], "enabled": True, "mode": "scale", "factor": 0.0}]
+    _install_loaded_bundle(app, monkeypatch)
+    app.manager.coordinator.bootstrap_interventions_for_test({
+        "revision": 1,
+        "model_session_id": app.manager.coordinator.status_snapshot().model_session_id,
+        "lens_binding_id": None,
+        "scale": 1.0,
+        "mode": "readthrough",
+        "rules": rules,
+        "active_rules": rules,
+        "summary": rules,
+        "active_summary": rules,
+    })
     monkeypatch.setattr(app.interventions, "active_rules_full", lambda: rules)
     monkeypatch.setattr(app.interventions, "snapshot", lambda: {
         "revision": 1,
@@ -106,6 +117,17 @@ def test_fresh_gguf_bake_requires_capability_profile(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "_llamacpp_paths", lambda: (tmp_path / "convert.py", None, None))
     _install_loaded_bundle(app, monkeypatch, profile=None)
     rules = [{"id": 1, "layers": [0], "enabled": True, "mode": "scale", "factor": 0.0}]
+    app.manager.coordinator.bootstrap_interventions_for_test({
+        "revision": 1,
+        "model_session_id": app.manager.coordinator.status_snapshot().model_session_id,
+        "lens_binding_id": None,
+        "scale": 1.0,
+        "mode": "readthrough",
+        "rules": rules,
+        "active_rules": rules,
+        "summary": rules,
+        "active_summary": rules,
+    })
     monkeypatch.setattr(app.interventions, "active_rules_full", lambda: rules)
     monkeypatch.setattr(app.interventions, "snapshot", lambda: {
         "revision": 1, "scale": 1.0, "mode": "readthrough",

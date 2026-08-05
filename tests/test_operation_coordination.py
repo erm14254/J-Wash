@@ -219,7 +219,7 @@ def test_model_transition_cleanup_does_not_restore_rules_after_publication_failu
             "dirs_a": {0: object()}, "dirs_b": None,
         }]
         app.interventions._revision = 1
-        app.interventions.global_scale = 2.5
+        app.interventions._scale = 2.5
         app.interventions.mode = "readthrough"
 
         def fail_update(_token, _snapshot):
