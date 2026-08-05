@@ -406,7 +406,7 @@ class Store:
         ).fetchone()
         if row is None or row["frames_file"] is None:
             raise ValueError(f"no frames for message {message_id}")
-        data = msgpack.unpackb((FRAMES_DIR / row["frames_file"]).read_bytes())
+        data = msgpack.unpackb((FRAMES_DIR / row["frames_file"]).read_bytes(), strict_map_key=False)
         vocab = data["vocab"]
         frames = []
         for entry in data["frames"]:
