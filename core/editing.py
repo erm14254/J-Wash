@@ -1055,9 +1055,22 @@ def list_presets():
     return out
 
 
-def save_preset(name, rules, model_id, scale=1.0):
+def save_preset(name, rules, model_id, scale=1.0, **provenance):
     PRESETS_DIR.mkdir(parents=True, exist_ok=True)
-    payload = {"model_id": model_id, "saved_at": _now(), "scale": scale, "rules": rules}
+    payload = {
+        "schema_version": 2,
+        "model_id": model_id,
+        "saved_at": _now(),
+        "scale": scale,
+        "intervention_scale": provenance.get("intervention_scale", scale),
+        "rules": rules,
+    }
+    for key in (
+        "model_revision", "intervention_mode", "intervention_revision",
+        "model_session_id", "lens_binding_id",
+    ):
+        if key in provenance:
+            payload[key] = provenance[key]
     (PRESETS_DIR / f"{name}.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8"
     )

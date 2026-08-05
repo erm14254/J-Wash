@@ -1472,6 +1472,8 @@ def test_healthy_worker_not_killed_by_cleanup_timeout(fit_env, monkeypatch):
         return proc
 
     monkeypatch.setattr(fitting.subprocess, "Popen", popen)
+    shutdown_calls = []
+    monkeypatch.setattr(fitting.FitManager, "_request_process_shutdown", staticmethod(lambda proc, **kwargs: shutdown_calls.append(kwargs) or True))
     manager = fitting.FitManager(heartbeat_interval=0.01)
     _start(manager)
     _wait(popen_started, "fit worker was not started")
@@ -1483,6 +1485,7 @@ def test_healthy_worker_not_killed_by_cleanup_timeout(fit_env, monkeypatch):
     assert not run.done.wait(0.05)
     assert manager.state["state"] in {"loading", "running"}
     assert not proc.terminated
+    assert shutdown_calls == []
 
     release_stdout.set()
     release_wait.set()

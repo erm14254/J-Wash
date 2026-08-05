@@ -449,7 +449,85 @@ def test_persisted_continue_records_segment_provenance(monkeypatch):
     assert saved_meta["intervention_provenance"]["revision"] == 2
     assert saved_meta["intervention_provenance"]["mode"] == "readthrough"
     assert saved_meta["intervention_provenance"]["scale"] == 1.5
+    assert saved_meta["continuations"][0]["start_offset"] == 0
+    assert saved_meta["continuations"][0]["end_offset"] == 3
+    assert saved_meta["continuations"][0]["meta"]["intervention_provenance"]["revision"] == 1
     assert saved_meta["continuations"][-1]["start_offset"] == 3
     assert saved_meta["continuations"][-1]["end_offset"] == 7
     assert saved_meta["continuations"][-1]["meta"]["intervention_provenance"]["revision"] == 2
     assert emitted[-1]["meta"]["intervention_provenance"]["revision"] == 2
+
+
+def test_zero_length_continuation_does_not_reattribute_existing_text(monkeypatch):
+    import json
+    import threading
+    from types import SimpleNamespace
+    from api import app
+
+    class FakeStore:
+        def __init__(self):
+            self.meta = {"intervention_provenance": {"revision": 1}}
+            self.updated = None
+        def get_message(self, message_id):
+            return {"id": message_id, "conversation_id": 1, "parent_id": None, "role": "assistant", "content": "old", "meta": json.dumps(self.meta), "frames_file": None}
+        def path_to_root(self, message_id):
+            return [{"role": "assistant", "content": "old"}]
+        def update_message_and_frames_if_unchanged(self, message_id, expected_content, expected_meta, content, meta=None, **kwargs):
+            self.updated = (content, meta)
+            return True
+
+    def fake_generate(**kwargs):
+        kwargs["emit"]({"type": "done", "text": "", "stats": {"tokens": 0}, "stopped": True, "meta": {"intervention_provenance": {"revision": 2}}})
+
+    fake_store = FakeStore()
+    monkeypatch.setattr(app, "store", fake_store)
+    monkeypatch.setattr(app.manager, "generate", fake_generate)
+    app._persisted_continue({}, 1, threading.Event(), lambda frame: None, SimpleNamespace(lens=None, intervention_snapshot={"rules": []}))
+    assert fake_store.updated[0] == "old"
+    meta = fake_store.updated[1]
+    assert meta["intervention_provenance"]["revision"] == 1
+    assert meta["continuations"][0]["meta"]["intervention_provenance"]["revision"] == 1
+    assert meta["continuation_attempts"][-1]["meta"]["intervention_provenance"]["revision"] == 2
+
+
+def test_preset_save_persists_coordinated_provenance(monkeypatch):
+    from api import app
+    from core.model_session import LoadedModelBundle, ModelSessionCoordinator, OperationType
+
+    coordinator = ModelSessionCoordinator()
+    monkeypatch.setattr(app.manager, "coordinator", coordinator)
+    token, snap = coordinator.acquire(OperationType.LOAD)
+    coordinator.publish_loaded(
+        token,
+        LoadedModelBundle.from_parts(object(), object(), object(), {"model_id": "m", "revision": "r1"}, {"ok": True}),
+        expected_unloaded_session=snap.model_session_id,
+    )
+    coordinator.release(token)
+    session_id = coordinator.status_snapshot().model_session_id
+    coordinator.bootstrap_interventions_for_test({
+        "revision": 12,
+        "model_session_id": session_id,
+        "lens_binding_id": 44,
+        "scale": 1.75,
+        "mode": "readthrough",
+        "rules": [{"id": 1, "token_id": 1, "token": "a", "mode": "scale", "factor": 0.1, "layers": [0], "enabled": True}],
+        "active_rules": [],
+        "summary": [{"id": 1, "token_id": 1, "token": "a", "mode": "scale", "factor": 0.1, "layers": [0], "enabled": True}],
+        "active_summary": [],
+    })
+    captured = {}
+
+    def save_preset(name, rules, model_id, scale=1.0, **provenance):
+        captured.update(name=name, rules=rules, model_id=model_id, scale=scale, **provenance)
+        return dict(captured, schema_version=2)
+
+    monkeypatch.setattr(app.editing, "save_preset", save_preset)
+    result = app.api_presets_save("preset")
+    assert result["schema_version"] == 2
+    assert captured["model_id"] == "m"
+    assert captured["model_revision"] == "r1"
+    assert captured["intervention_mode"] == "readthrough"
+    assert captured["intervention_revision"] == 12
+    assert captured["model_session_id"] == session_id
+    assert captured["lens_binding_id"] == 44
+    assert captured["rules"][0]["id"] == 1

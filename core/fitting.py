@@ -259,6 +259,7 @@ class FitManager:
                 "params": params,
                 "error": None,
             }
+            started_response = dict(self.state)
             run = _FitRun()
             run.reservation_release = reservation_release
             self._active_run = run
@@ -277,7 +278,7 @@ class FitManager:
                     pass
             run.done.set()
             raise
-        return dict(self.state)
+        return started_response
 
     def stop(self):
         with self._lock:
@@ -482,24 +483,41 @@ class FitManager:
             return
 
         def reaper():
-            while True:
-                run.heartbeat_stop.set()
-                if self._join_run_helpers(run):
-                    self._finalize_quiesced_run(run)
-                    return
-                with self._lock:
-                    if self._active_run is not run:
-                        return
-                    self.state.update(state="reaping", phase="cleanup", eta_seconds=None)
-                try:
-                    self._emit()
-                except Exception:
-                    pass
-                if run.done.wait(FIT_PROCESS_SHUTDOWN_TIMEOUT):
-                    return
+            self._cleanup_reaper_loop(run)
 
-        run.cleanup_thread = threading.Thread(target=reaper, daemon=True)
-        run.cleanup_thread.start()
+        try:
+            thread = threading.Thread(target=reaper, daemon=True)
+            thread.start()
+            run.cleanup_thread = thread
+        except Exception as exc:
+            with self._lock:
+                if self._active_run is run:
+                    self.state.update(
+                        state="cleanup_pending", phase="cleanup",
+                        error=f"cleanup reaper start failed: {exc}", eta_seconds=None,
+                    )
+            try:
+                self._emit()
+            except Exception:
+                pass
+            self._cleanup_reaper_loop(run)
+
+    def _cleanup_reaper_loop(self, run):
+        while True:
+            run.heartbeat_stop.set()
+            if self._join_run_helpers(run):
+                self._finalize_quiesced_run(run)
+                return
+            with self._lock:
+                if self._active_run is not run:
+                    return
+                self.state.update(state="reaping", phase="cleanup", eta_seconds=None)
+            try:
+                self._emit()
+            except Exception:
+                pass
+            if run.done.wait(FIT_PROCESS_SHUTDOWN_TIMEOUT):
+                return
 
     def _helper_exception(self, run):
         with run.helper_error_lock:

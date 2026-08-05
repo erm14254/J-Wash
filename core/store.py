@@ -247,6 +247,63 @@ class Store:
         )
         conn.commit()
 
+
+    def update_message_if_unchanged(self, message_id, expected_content, expected_meta, content, meta=None):
+        conn = self._conn()
+        row = conn.execute(
+            "SELECT conversation_id, content, meta FROM messages WHERE id = ?",
+            (message_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown message {message_id}")
+        if row["content"] != expected_content or row["meta"] != expected_meta:
+            return False
+        meta_json = json.dumps(meta, ensure_ascii=False) if meta is not None else None
+        conn.execute(
+            "UPDATE messages SET content = ?, meta = ? WHERE id = ?",
+            (content, meta_json, message_id),
+        )
+        conn.execute(
+            "UPDATE conversations SET updated_at = ? WHERE id = ?",
+            (_now(), row["conversation_id"]),
+        )
+        conn.commit()
+        return True
+
+    def update_message_and_frames_if_unchanged(self, message_id, expected_content, expected_meta, content, meta=None, *, frames=None, layers=None, k=0):
+        frame_blob = None
+        frame_file = None
+        if frames:
+            frame_blob = self._pack_frames_blob(frames, layers or [], k)
+            frame_file = f"{message_id}.msgpack"
+        conn = self._conn()
+        row = conn.execute(
+            "SELECT conversation_id, content, meta, frames_file FROM messages WHERE id = ?",
+            (message_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown message {message_id}")
+        if row["content"] != expected_content or row["meta"] != expected_meta:
+            return False
+        old_file = row["frames_file"]
+        if frame_blob is not None:
+            tmp = FRAMES_DIR / f".{frame_file}.tmp"
+            tmp.write_bytes(frame_blob)
+            tmp.replace(FRAMES_DIR / frame_file)
+        meta_json = json.dumps(meta, ensure_ascii=False) if meta is not None else None
+        conn.execute(
+            "UPDATE messages SET content = ?, meta = ?, frames_file = COALESCE(?, frames_file) WHERE id = ?",
+            (content, meta_json, frame_file, message_id),
+        )
+        conn.execute(
+            "UPDATE conversations SET updated_at = ? WHERE id = ?",
+            (_now(), row["conversation_id"]),
+        )
+        conn.commit()
+        if frame_file and old_file and old_file != frame_file:
+            (FRAMES_DIR / old_file).unlink(missing_ok=True)
+        return True
+
     def path_to_root(self, message_id):
         conn = self._conn()
         path = []
@@ -263,7 +320,8 @@ class Store:
         path.reverse()
         return path
 
-    def save_frames(self, message_id, frames, layers, k):
+    @staticmethod
+    def _pack_frames_blob(frames, layers, k):
         vocab = {}
         packed = []
         for frame in frames:
@@ -287,22 +345,18 @@ class Store:
                     "m_rank": np.asarray(d["m_rank"], np.int32).tobytes(),
                 }
             packed.append(entry)
-        blob = msgpack.packb(
-            {
-                "version": 1,
-                "k": k,
-                # generation id of the server-side residual store: lets pins
-                # keep working after a page reload (same server session); a
-                # restarted server simply reports the store as expired. Last
-                # frame: after a continuation merge it's the freshest gen.
-                "gen": frames[-1].get("gen") if frames else None,
-                "layers": [int(l) for l in layers],
-                "frames": packed,
-                "vocab": {str(t): s for t, s in vocab.items()},
-            }
-        )
+        return msgpack.packb({
+            "version": 1,
+            "k": k,
+            "gen": frames[-1].get("gen") if frames else None,
+            "layers": [int(l) for l in layers],
+            "frames": packed,
+            "vocab": {str(t): s for t, s in vocab.items()},
+        })
+
+    def save_frames(self, message_id, frames, layers, k):
         filename = f"{message_id}.msgpack"
-        (FRAMES_DIR / filename).write_bytes(blob)
+        (FRAMES_DIR / filename).write_bytes(self._pack_frames_blob(frames, layers, k))
         conn = self._conn()
         conn.execute(
             "UPDATE messages SET frames_file = ? WHERE id = ?", (filename, message_id)
