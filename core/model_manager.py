@@ -490,9 +490,9 @@ class ModelManager:
                 old_bundle, expected_session, _ = self.coordinator.withdraw_loaded(token)
                 with self._lock:
                     self._sync_from_bundle(None)
+                del old_bundle
                 if self.on_model_withdraw is not None:
                     self.on_model_withdraw(expected_session, token)
-                del old_bundle
                 _free_cuda()
             torch_dtype = torch.bfloat16 if dtype == "bf16" else torch.float16
             source = resolve_source(model_id)
@@ -573,11 +573,11 @@ class ModelManager:
                 self._sync_from_bundle(None)
             return {"unloaded": False, "vram_allocated": _torch_allocated()}
         before = _torch_allocated()
-        if self.on_model_withdraw is not None:
-            self.on_model_withdraw(session_id, token)
         with self._lock:
             self._sync_from_bundle(None)
         del old
+        if self.on_model_withdraw is not None:
+            self.on_model_withdraw(session_id, token)
         _free_cuda()
         return {
             "unloaded": True,
