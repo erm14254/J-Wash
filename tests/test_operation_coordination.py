@@ -138,3 +138,40 @@ def test_publication_gate_rename_wins_before_cancellation():
     assert gate.cancel() is False
     assert published == ["renamed"]
     assert gate.state == "published"
+
+
+def test_dispatch_payload_cleared_on_cancellation_before_claim():
+    import weakref
+    from core.model_session import WorkerDispatch
+
+    class Payload:
+        pass
+
+    c = ModelSessionCoordinator()
+    token, _ = c.acquire(OperationType.GENERATE)
+    payload = Payload()
+    ref = weakref.ref(payload)
+    dispatch = WorkerDispatch(c, token, payload=payload)
+    del payload
+    assert dispatch.cancel_from_awaiter() is True
+    import gc
+    gc.collect()
+    assert ref() is None
+    assert c.snapshot().operation is None
+
+
+def test_intervention_update_invalid_replace_is_transactional():
+    import pytest
+    from core.ablation import Interventions
+
+    iv = Interventions()
+    iv._rules = [{
+        "id": 1, "token_id": 1, "token": "a", "mode": "scale", "factor": 0.0,
+        "replacement_id": None, "replacement": None, "layers": [0], "enabled": True,
+        "dirs_a": {0: object()}, "dirs_b": None,
+    }]
+    iv._revision = 1
+    before = iv.state_record()
+    with pytest.raises(ValueError, match="replacement_id required"):
+        iv.update(1, mode="replace", lens_manager=type("LM", (), {"lens": object()})(), jl=type("JL", (), {"tokenizer": object(), "layers": [object()], "_lm_head": None})())
+    assert iv.state_record() == before

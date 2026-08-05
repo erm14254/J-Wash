@@ -107,10 +107,11 @@ class GenerationContext:
 class WorkerDispatch:
     """Ownership handoff for async handlers that dispatch synchronous workers."""
 
-    def __init__(self, coordinator: "ModelSessionCoordinator", token: OperationToken, stop_event: Any = None):
+    def __init__(self, coordinator: "ModelSessionCoordinator", token: OperationToken, stop_event: Any = None, payload: Any = None):
         self.coordinator = coordinator
         self.token = token
         self.stop_event = stop_event
+        self._payload = payload
         self._lock = threading.Lock()
         self._claimed = False
         self._released_before_claim = False
@@ -127,10 +128,20 @@ class WorkerDispatch:
             self._claimed = True
             return True
 
+    def take_payload(self):
+        with self._lock:
+            payload, self._payload = self._payload, None
+            return payload
+
+    def clear_payload(self):
+        with self._lock:
+            self._payload = None
+
     def cancel_from_awaiter(self) -> bool:
         with self._lock:
             if not self._claimed:
                 self._released_before_claim = True
+                self._payload = None
                 return self.coordinator.release(self.token)
             self.coordinator.request_cancel(self.token)
             if self.stop_event is not None:
@@ -154,10 +165,66 @@ class ModelSessionCoordinator:
         self._last_generation = None
         self._lens_binding_id = 0
         self._intervention_revision = 0
+        self._copy_hook = None
 
     def snapshot(self, *, include_bundle: bool = True) -> ModelSessionSnapshot:
         with self._lock:
             return self._snapshot_locked(include_bundle=include_bundle)
+
+    def _copy_small(self, value):
+        if self._copy_hook is not None:
+            self._copy_hook(value)
+        return copy.deepcopy(value)
+
+    @staticmethod
+    def _clone_rule_container(rule):
+        cloned = dict(rule)
+        if "layers" in cloned and cloned["layers"] is not None:
+            cloned["layers"] = list(cloned["layers"])
+        if "dirs_a" in cloned and cloned["dirs_a"] is not None:
+            cloned["dirs_a"] = dict(cloned["dirs_a"])
+        if "dirs_b" in cloned and cloned["dirs_b"] is not None:
+            cloned["dirs_b"] = dict(cloned["dirs_b"])
+        return cloned
+
+    @classmethod
+    def _freeze_intervention_record(cls, record):
+        if record is None:
+            return None
+        if not isinstance(record, dict):
+            return record
+        frozen = {
+            "revision": record.get("revision"),
+            "model_session_id": record.get("model_session_id"),
+            "lens_binding_id": record.get("lens_binding_id"),
+            "scale": record.get("scale"),
+            "mode": record.get("mode"),
+            "summary": copy.deepcopy(record.get("summary") or []),
+            "active_summary": copy.deepcopy(record.get("active_summary") or []),
+            "rules": [cls._clone_rule_container(r) for r in record.get("rules") or []],
+            "active_rules": [cls._clone_rule_container(r) for r in record.get("active_rules") or []],
+        }
+        return MappingProxyType(frozen)
+
+    @staticmethod
+    def _copy_intervention_record(record):
+        if record is None:
+            return None
+        if isinstance(record, MappingProxyType):
+            record = dict(record)
+        if isinstance(record, dict):
+            return {
+                "revision": record.get("revision"),
+                "model_session_id": record.get("model_session_id"),
+                "lens_binding_id": record.get("lens_binding_id"),
+                "scale": record.get("scale"),
+                "mode": record.get("mode"),
+                "summary": copy.deepcopy(record.get("summary") or []),
+                "active_summary": copy.deepcopy(record.get("active_summary") or []),
+                "rules": [ModelSessionCoordinator._clone_rule_container(r) for r in record.get("rules") or []],
+                "active_rules": [ModelSessionCoordinator._clone_rule_container(r) for r in record.get("active_rules") or []],
+            }
+        return record
 
     def _operation_status_locked(self):
         op = None
@@ -185,6 +252,8 @@ class ModelSessionCoordinator:
     def _light_interventions(record):
         if record is None:
             return None
+        if isinstance(record, MappingProxyType):
+            record = dict(record)
         if isinstance(record, dict):
             return {
                 "revision": record.get("revision"),
@@ -205,14 +274,14 @@ class ModelSessionCoordinator:
             bundle=self._bundle if include_bundle else None,
             loaded=self._bundle is not None,
             lens_binding=(
-                copy.deepcopy(self._lens_binding)
+                self._copy_small(self._lens_binding)
                 if include_bundle else self._light_lens(self._lens_binding)
             ),
             interventions=(
-                copy.deepcopy(self._interventions)
+                self._copy_intervention_record(self._interventions)
                 if include_bundle else self._light_interventions(self._interventions)
             ),
-            last_generation=copy.deepcopy(self._last_generation),
+            last_generation=self._copy_small(self._last_generation),
             operation=op,
         )
 
@@ -223,16 +292,16 @@ class ModelSessionCoordinator:
                 model_state="loaded" if self._bundle is not None else "unloaded",
                 loaded=self._bundle is not None,
                 model_meta=(
-                    MappingProxyType(copy.deepcopy(dict(self._bundle.meta)))
+                    MappingProxyType(self._copy_small(dict(self._bundle.meta)))
                     if self._bundle is not None else None
                 ),
                 capability_profile=(
-                    copy.deepcopy(self._bundle.capability_profile)
+                    self._copy_small(self._bundle.capability_profile)
                     if self._bundle is not None else None
                 ),
                 lens=self._light_lens(self._lens_binding),
                 interventions=self._light_interventions(self._interventions),
-                last_generation=copy.deepcopy(self._last_generation),
+                last_generation=self._copy_small(self._last_generation),
                 operation=self._operation_status_locked(),
             )
 
@@ -254,7 +323,13 @@ class ModelSessionCoordinator:
             token = OperationToken(next(self._op_ids), op_type, self._model_session_id, self._model_session_id, requires_loaded)
             self._operation = token
             self._cancelled.discard(token.id)
-            return token, self._snapshot_locked(include_bundle=include_bundle)
+            try:
+                return token, self._snapshot_locked(include_bundle=include_bundle)
+            except Exception:
+                if self._operation == token:
+                    self._operation = None
+                    self._cancelled.discard(token.id)
+                raise
 
     def is_current(self, token: OperationToken) -> bool:
         with self._lock:
@@ -307,23 +382,27 @@ class ModelSessionCoordinator:
             return old, self._model_session_id, True
 
     def update_lens_binding(self, token: OperationToken, binding: Any) -> int:
+        prepared = self._copy_small(binding)
         with self._lock:
             if self._operation != token:
                 raise OperationConflict("stale lens operation")
             self._lens_binding_id += 1
-            self._lens_binding = copy.deepcopy(binding)
+            self._lens_binding = prepared
             return self._lens_binding_id
 
-    def clear_lens_binding(self):
+    def clear_lens_binding(self, token: OperationToken | None = None):
         with self._lock:
+            if token is not None and self._operation != token:
+                raise OperationConflict("stale lens operation")
             self._lens_binding = None
 
     def update_interventions(self, token: OperationToken, snapshot: Any) -> int:
+        prepared = self._freeze_intervention_record(snapshot)
         with self._lock:
             if self._operation != token:
                 raise OperationConflict("stale intervention operation")
             self._intervention_revision += 1
-            self._interventions = copy.deepcopy(snapshot)
+            self._interventions = prepared
             return self._intervention_revision
 
     def bootstrap_interventions_for_test(self, snapshot: Any) -> int:
@@ -332,14 +411,16 @@ class ModelSessionCoordinator:
         This is intentionally reserved for tests/bootstrap data where no
         production request is mutating live model-bound state.
         """
+        prepared = self._freeze_intervention_record(snapshot)
         with self._lock:
             self._intervention_revision += 1
-            self._interventions = copy.deepcopy(snapshot)
+            self._interventions = prepared
             return self._intervention_revision
 
     def publish_last_generation(self, token: OperationToken, session_id: int, data: Any) -> bool:
+        prepared = self._copy_small(data)
         with self._lock:
             if self._operation != token or self._model_session_id != session_id:
                 return False
-            self._last_generation = copy.deepcopy(data)
+            self._last_generation = prepared
             return True

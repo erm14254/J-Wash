@@ -45,14 +45,37 @@ neighbors = TokenNeighbors()
 
 
 def _cleanup_model_bound_state(_session_id=None, token=None):
-    lens_manager.unload()
-    neighbors.reset()
-    interventions.clear_for_model_transition()
-    snapshot = interventions.snapshot()
-    snapshot["model_session_id"] = _session_id
-    snapshot["lens_binding_id"] = None
-    if token is not None:
-        manager.coordinator.update_interventions(token, snapshot)
+    errors = []
+    old_lens = None
+    try:
+        old_lens = lens_manager.withdraw()
+        manager.coordinator.clear_lens_binding(token)
+    except Exception as exc:
+        errors.append(exc)
+    try:
+        neighbors.reset()
+    except Exception as exc:
+        errors.append(exc)
+    previous = interventions.state_record()
+    try:
+        interventions.clear_for_model_transition()
+        snapshot = interventions.snapshot()
+        snapshot["model_session_id"] = _session_id
+        snapshot["lens_binding_id"] = None
+        if token is not None:
+            manager.coordinator.update_interventions(token, snapshot)
+    except Exception as exc:
+        interventions.restore_state_record(previous)
+        errors.append(exc)
+    cleanup_error = lens_manager.cleanup_withdrawn(old_lens)
+    if cleanup_error is not None:
+        errors.append(cleanup_error)
+    if errors:
+        first = errors[0]
+        logging.getLogger(__name__).warning(
+            "model-bound cleanup completed with %d non-fatal error(s)", len(errors),
+            exc_info=(type(first), first, first.__traceback__),
+        )
 
 
 manager.on_model_withdraw = _cleanup_model_bound_state
@@ -308,6 +331,17 @@ def _publish_intervention_snapshot(token, snap):
     manager.coordinator.update_interventions(token, data)
     return data
 
+
+def _run_intervention_transaction(token, snap, mutate):
+    previous = interventions.state_record()
+    try:
+        result = mutate()
+        published = _publish_intervention_snapshot(token, snap)
+        return result, published
+    except Exception:
+        interventions.restore_state_record(previous)
+        raise
+
 @app.post("/api/load")
 async def api_load(req: LoadRequest):
     if req.dtype not in config.DTYPES:
@@ -458,21 +492,31 @@ async def api_lens_load(req: LensLoadRequest):
         raise _conflict(exc)
     except ModelStateError as exc:
         raise HTTPException(422, str(exc))
-    dispatch = WorkerDispatch(manager.coordinator, token, stop_event)
+    payload = {
+        "repo_id": req.repo_id,
+        "filename": req.filename,
+        "revision": req.revision,
+        "path": req.path,
+        "layers": req.layers,
+        "k": req.k,
+    }
+    dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+    payload = None
 
     def worker():
         if not dispatch.claim():
             return None
+        payload = dispatch.take_payload()
         old_state = lens_manager.state_record()
         try:
             result = lens_manager.load(
                 manager,
-                repo_id=req.repo_id,
-                filename=req.filename,
-                revision=req.revision,
-                path=req.path,
-                layers=req.layers,
-                k=req.k,
+                repo_id=payload["repo_id"],
+                filename=payload["filename"],
+                revision=payload["revision"],
+                path=payload["path"],
+                layers=payload["layers"],
+                k=payload["k"],
             )
             try:
                 manager.coordinator.update_lens_binding(token, result)
@@ -481,6 +525,7 @@ async def api_lens_load(req: LensLoadRequest):
                 raise
             return result
         finally:
+            payload = old_state = None
             dispatch.release_from_worker()
 
     try:
@@ -503,9 +548,19 @@ def api_lens_unload():
     token = None
     try:
         token, _ = manager.coordinator.acquire(OperationType.LENS_UPDATE)
-        result = lens_manager.unload()
-        manager.coordinator.clear_lens_binding()
-        return result
+        old = lens_manager.withdraw()
+        try:
+            manager.coordinator.clear_lens_binding(token)
+        except Exception:
+            lens_manager.restore_withdrawn(old)
+            raise
+        cleanup_error = lens_manager.cleanup_withdrawn(old)
+        if cleanup_error is not None:
+            logging.getLogger(__name__).warning(
+                "lens cleanup failed after authoritative unload",
+                exc_info=(type(cleanup_error), cleanup_error, cleanup_error.__traceback__),
+            )
+        return {"unloaded": True}
     except OperationConflict as exc:
         raise _conflict(exc)
     finally:
@@ -551,7 +606,8 @@ def api_interventions_add(req: InterventionRequest):
         if lens_manager.lens is None:
             raise HTTPException(422, "model and lens required")
         capabilities.require(bundle.capability_profile, "modes", "standard", loaded=True)
-        rules = interventions.add(
+        def mutate():
+            return interventions.add(
                 lens_manager,
                 bundle.jl,
                 token_id=req.token_id,
@@ -560,7 +616,7 @@ def api_interventions_add(req: InterventionRequest):
                 replacement_id=req.replacement_id,
                 layers=req.layers,
             )
-        _publish_intervention_snapshot(token, snap)
+        rules, _ = _run_intervention_transaction(token, snap, mutate)
         return {"rules": rules}
     except OperationConflict as exc:
         raise _conflict(exc)
@@ -584,7 +640,8 @@ def api_interventions_patch(rule_id: int, req: InterventionPatch):
             OperationType.INTERVENTION_UPDATE, requires_loaded=True if needs_dirs else None
         )
         bundle = _bundle_from_snapshot_or_legacy(snap) if needs_dirs else None
-        rules = interventions.update(
+        def mutate():
+            return interventions.update(
                 rule_id,
                 factor=req.factor,
                 layers=req.layers,
@@ -595,7 +652,7 @@ def api_interventions_patch(rule_id: int, req: InterventionPatch):
                 lens_manager=lens_manager if needs_dirs else None,
                 jl=bundle.jl if needs_dirs else None,
             )
-        _publish_intervention_snapshot(token, snap)
+        rules, _ = _run_intervention_transaction(token, snap, mutate)
         return {"rules": rules}
     except OperationConflict as exc:
         raise _conflict(exc)
@@ -617,8 +674,9 @@ def api_interventions_scale(req: InterventionsScale):
             status = manager.coordinator.status_snapshot()
             capabilities.require(status.capability_profile, "modes", req.mode,
                                  loaded=status.loaded)
-        scale, mode = interventions.set_scale_and_mode(scale=req.scale, mode=req.mode)
-        _publish_intervention_snapshot(token, snap)
+        def mutate():
+            return interventions.set_scale_and_mode(scale=req.scale, mode=req.mode)
+        (scale, mode), _ = _run_intervention_transaction(token, snap, mutate)
     except ValueError as exc:
         raise HTTPException(422, str(exc))
     except OperationConflict as exc:
@@ -637,8 +695,9 @@ def api_interventions_remove(rule_id: int):
     token = snap = None
     try:
         token, snap = manager.coordinator.acquire(OperationType.INTERVENTION_UPDATE)
-        rules = interventions.remove(rule_id)
-        _publish_intervention_snapshot(token, snap)
+        def mutate():
+            return interventions.remove(rule_id)
+        rules, _ = _run_intervention_transaction(token, snap, mutate)
         return {"rules": rules}
     except OperationConflict as exc:
         raise _conflict(exc)
@@ -652,8 +711,9 @@ def api_interventions_clear():
     token = snap = None
     try:
         token, snap = manager.coordinator.acquire(OperationType.INTERVENTION_UPDATE)
-        rules = interventions.remove()
-        _publish_intervention_snapshot(token, snap)
+        def mutate():
+            return interventions.remove()
+        rules, _ = _run_intervention_transaction(token, snap, mutate)
         return {"rules": rules}
     except OperationConflict as exc:
         raise _conflict(exc)
@@ -698,24 +758,26 @@ def api_presets_apply(name: str):
             warnings.append(
                 f"preset saved for {preset['model_id']}, loaded model: {bundle.meta['model_id']}"
             )
-        rules = None
-        for rule in preset.get("rules", []):
-            try:
-                rules = interventions.add(
-                    lens_manager,
-                    bundle.jl,
-                    token_id=rule["token_id"],
-                    mode=rule["mode"],
-                    factor=rule["factor"],
-                    replacement_id=rule.get("replacement_id"),
-                    layers=rule.get("layers"),
-                    enabled=rule.get("enabled", True),
-                )
-            except ValueError as exc:
-                warnings.append(f"rule {rule.get('token')!r} skipped: {exc}")
-        if preset.get("scale") is not None:
-            interventions.set_scale(preset["scale"])
-        _publish_intervention_snapshot(token, snap)
+        def mutate():
+            rules = None
+            for rule in preset.get("rules", []):
+                try:
+                    rules = interventions.add(
+                        lens_manager,
+                        bundle.jl,
+                        token_id=rule["token_id"],
+                        mode=rule["mode"],
+                        factor=rule["factor"],
+                        replacement_id=rule.get("replacement_id"),
+                        layers=rule.get("layers"),
+                        enabled=rule.get("enabled", True),
+                    )
+                except ValueError as exc:
+                    warnings.append(f"rule {rule.get('token')!r} skipped: {exc}")
+            if preset.get("scale") is not None:
+                interventions.set_scale(preset["scale"])
+            return rules
+        rules, _ = _run_intervention_transaction(token, snap, mutate)
         return {
             "rules": rules or interventions.summary(),
             "scale": interventions.global_scale,
@@ -749,7 +811,7 @@ async def api_edit_export(req: ExportRequest):
         token, snap = manager.coordinator.acquire(OperationType.EXPORT, requires_loaded=True)
         bundle = snap.bundle
         meta = dict(bundle.meta)
-        intervention_snapshot = interventions.snapshot()
+        intervention_snapshot = snap.interventions or interventions.snapshot()
         rules = intervention_snapshot["active_rules"]
         if not rules:
             raise HTTPException(422, "no active intervention to export (rules disabled or without layers?)")
@@ -787,28 +849,40 @@ async def api_edit_export(req: ExportRequest):
             manager.coordinator.release(token)
         raise
 
-    dispatch = WorkerDispatch(manager.coordinator, token, stop_event)
     publication_gate = editing.PublicationGate(
         lambda: not manager.coordinator.is_cancelled(token) and manager.coordinator.is_current(token)
     )
-
-    def guard():
-        if publication_gate.state != "pending" or manager.coordinator.is_cancelled(token) or not manager.coordinator.is_current(token):
-            raise RuntimeError("export ownership was cancelled or superseded before publication")
+    payload = {
+        "bundle": bundle,
+        "meta": meta,
+        "rules": rules,
+        "source_dir": source_dir,
+        "scale": scale,
+        "kwargs": kwargs,
+        "export_fn": export_fn,
+        "format": req.format,
+        "name": req.name,
+        "publication_gate": publication_gate,
+    }
+    dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+    snap = bundle = meta = intervention_snapshot = rules = source_dir = kwargs = export_fn = payload = None
 
     def worker():
         if not dispatch.claim():
             return None
+        payload = dispatch.take_payload()
         try:
-            call_kwargs = dict(kwargs)
-            if export_fn is editing.export_rebase:
-                call_kwargs["publication_guard"] = publication_gate
-            return export_fn(
-                rules, bundle.jl, meta, fmt=req.format, name=req.name,
-                source_dir=source_dir, scale=scale, **call_kwargs,
+            call_kwargs = dict(payload["kwargs"])
+            if payload["export_fn"] is editing.export_rebase:
+                call_kwargs["publication_guard"] = payload["publication_gate"]
+            return payload["export_fn"](
+                payload["rules"], payload["bundle"].jl, payload["meta"],
+                fmt=payload["format"], name=payload["name"],
+                source_dir=payload["source_dir"], scale=payload["scale"], **call_kwargs,
             )
         finally:
             import gc
+            payload = None
             gc.collect()
             dispatch.release_from_worker()
 
@@ -980,7 +1054,7 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
             token, snap = manager.coordinator.acquire(OperationType.GGUF_BAKE, requires_loaded=True)
             bundle = _bundle_from_snapshot_or_legacy(snap)
             meta = dict(bundle.meta)
-            intervention_snapshot = interventions.snapshot()
+            intervention_snapshot = snap.interventions or interventions.snapshot()
             rules = intervention_snapshot["active_rules"]
             if not rules:
                 raise HTTPException(422, "no active intervention to export")
@@ -1010,27 +1084,38 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
             if token is not None:
                 manager.coordinator.release(token)
             raise
-        dispatch = WorkerDispatch(manager.coordinator, token, stop_event)
         publication_gate = editing.PublicationGate(
             lambda: not manager.coordinator.is_cancelled(token) and manager.coordinator.is_current(token)
         )
-
-        def guard():
-            if publication_gate.state != "pending" or manager.coordinator.is_cancelled(token) or not manager.coordinator.is_current(token):
-                raise RuntimeError("GGUF bake ownership was cancelled or superseded before publication")
+        payload = {
+            "bundle": bundle,
+            "meta": meta,
+            "rules": rules,
+            "source_dir": source_dir,
+            "scale": scale,
+            "kwargs": kwargs,
+            "export_fn": export_fn,
+            "name": "/".join((*name_parts, "hf")),
+            "publication_gate": publication_gate,
+        }
+        dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+        snap = bundle = meta = intervention_snapshot = rules = source_dir = kwargs = export_fn = payload = None
 
         def bake_worker():
             if not dispatch.claim():
                 return
+            payload = dispatch.take_payload()
             try:
-                call_kwargs = dict(kwargs)
-                if export_fn is editing.export_rebase:
-                    call_kwargs["publication_guard"] = publication_gate
-                return export_fn(
-                    rules, bundle.jl, meta, fmt="full", name="/".join((*name_parts, "hf")),
-                    source_dir=source_dir, scale=scale, **call_kwargs,
+                call_kwargs = dict(payload["kwargs"])
+                if payload["export_fn"] is editing.export_rebase:
+                    call_kwargs["publication_guard"] = payload["publication_gate"]
+                return payload["export_fn"](
+                    payload["rules"], payload["bundle"].jl, payload["meta"],
+                    fmt="full", name=payload["name"],
+                    source_dir=payload["source_dir"], scale=payload["scale"], **call_kwargs,
                 )
             finally:
+                payload = None
                 dispatch.release_from_worker()
         try:
             task = asyncio.create_task(asyncio.to_thread(bake_worker))
@@ -1106,7 +1191,7 @@ def _captured_generation_context(token, snap, stop_event):
         meta=bundle.meta,
         capability_profile=bundle.capability_profile,
         lens=lens_manager.snapshot_for_generation(),
-        intervention_snapshot=interventions.snapshot(),
+        intervention_snapshot=snap.interventions or interventions.snapshot(),
         stop_event=stop_event,
     )
 
@@ -1123,7 +1208,13 @@ async def api_generate_sync(req: GenerateSyncRequest):
         raise _conflict(exc)
     except ModelStateError as exc:
         raise HTTPException(422, str(exc))
-    dispatch = WorkerDispatch(manager.coordinator, token, stop_event)
+    except Exception:
+        if token is not None:
+            manager.coordinator.release(token)
+        raise
+    payload = {"context": context, "messages": req.messages, "sampling": req.sampling}
+    dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+    snap = context = payload = None
     done = {}
 
     def emit(frame):
@@ -1136,9 +1227,11 @@ async def api_generate_sync(req: GenerateSyncRequest):
         global _generation_counter
         if not dispatch.claim():
             return
+        payload = dispatch.take_payload()
         try:
+            context = payload["context"]
             manager.generate(
-                req.messages, req.sampling, stop_event, emit,
+                payload["messages"], payload["sampling"], stop_event, emit,
                 lens=context, ablator=interventions if context.intervention_snapshot.get("rules") else None,
             )
             if done.get("error"):
@@ -1146,13 +1239,14 @@ async def api_generate_sync(req: GenerateSyncRequest):
             _generation_counter += 1
             last = {
                 "n": _generation_counter,
-                "prompt": next((m.get("content", "") for m in reversed(req.messages) if m.get("role") == "user"), ""),
+                "prompt": next((m.get("content", "") for m in reversed(payload["messages"]) if m.get("role") == "user"), ""),
                 "text": done.get("text", ""),
                 "stats": done.get("stats"),
             }
             manager.coordinator.publish_last_generation(token, context.model_session_id, last)
             done["last_generation"] = last
         finally:
+            payload = context = None
             dispatch.release_from_worker()
 
     try:
@@ -1196,14 +1290,21 @@ async def api_token_neighbors(req: NeighborsRequest):
         raise _conflict(exc)
     except ModelStateError as exc:
         raise HTTPException(422, str(exc))
-    dispatch = WorkerDispatch(manager.coordinator, token, stop_event)
+    payload = {"bundle": bundle, "key": key, "token_ids": req.token_ids[:64], "k": req.k}
+    dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+    snap = bundle = payload = None
 
     def worker():
         if not dispatch.claim():
             return None
+        payload = dispatch.take_payload()
         try:
-            return neighbors.lookup(bundle.jl, bundle.tokenizer, key, req.token_ids[:64], req.k)
+            return neighbors.lookup(
+                payload["bundle"].jl, payload["bundle"].tokenizer,
+                payload["key"], payload["token_ids"], payload["k"],
+            )
         finally:
+            payload = None
             dispatch.release_from_worker()
 
     try:
@@ -1324,14 +1425,18 @@ async def api_lens_pin(req: PinRequest):
         raise _conflict(exc)
     except ModelStateError as exc:
         raise HTTPException(422, str(exc))
-    dispatch = WorkerDispatch(manager.coordinator, token, stop_event)
+    payload = {"jl": jl, "gen_id": req.gen_id, "token_ids": req.token_ids}
+    dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+    snap = jl = payload = None
 
     def worker():
         if not dispatch.claim():
             return None
+        payload = dispatch.take_payload()
         try:
-            return lens_manager.pin_ranks(req.gen_id, req.token_ids, jl)
+            return lens_manager.pin_ranks(payload["gen_id"], payload["token_ids"], payload["jl"])
         finally:
+            payload = None
             dispatch.release_from_worker()
 
     try:
@@ -1842,17 +1947,23 @@ async def _run_chat(ws, req):
         await _ws_send(ws, json.dumps({"type": "error", "message": str(exc)}))
         return
 
-    dispatch = WorkerDispatch(manager.coordinator, token, stop_event)
+    payload = {"context": context, "request": dict(req)}
+    dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+    snap = context = payload = None
 
     def worker_body():
         if not dispatch.claim():
             return
+        payload = dispatch.take_payload()
         try:
-            if "messages" in req:
-                _generate_safely(req["messages"], req.get("sampling", {}), stop_event, emit, context)
+            request = payload["request"]
+            context = payload["context"]
+            if "messages" in request:
+                _generate_safely(request["messages"], request.get("sampling", {}), stop_event, emit, context)
             else:
-                _persisted_generate(req, stop_event, emit, context)
+                _persisted_generate(request, stop_event, emit, context)
         finally:
+            payload = context = request = None
             dispatch.release_from_worker()
 
     try:

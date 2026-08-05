@@ -185,6 +185,22 @@ class Interventions:
         with self._lock:
             return self._scale, self._mode
 
+    def state_record(self):
+        with self._lock:
+            return {
+                "rules": [self._clone_rule_locked(r) for r in self._rules],
+                "scale": self._scale,
+                "mode": self._mode,
+                "revision": self._revision,
+            }
+
+    def restore_state_record(self, record):
+        with self._lock:
+            self._rules = [self._clone_rule_locked(r) for r in record["rules"]]
+            self._scale = record["scale"]
+            self._mode = record["mode"]
+            self._revision = record["revision"]
+
     def rules_full(self):
         with self._lock:
             return [self._clone_rule_locked(r) for r in self._rules]
@@ -273,51 +289,56 @@ class Interventions:
         if needs_dirs:
             from core.capabilities import ensure_unquantized
             ensure_unquantized(jl)
+            if lens_manager is None or jl is None:
+                raise ValueError("model and lens required to edit the rule")
+            lens = lens_manager.lens
+            if lens is None:
+                raise ValueError("no lens loaded")
+            tokenizer = jl.tokenizer
         with self._lock:
-            for rule in self._rules:
+            for index, rule in enumerate(self._rules):
                 if rule["id"] != rule_id:
                     continue
+                candidate = self._clone_rule_locked(rule)
                 if factor is not None:
-                    rule["factor"] = float(factor)
+                    candidate["factor"] = float(factor)
                 if enabled is not None:
-                    rule["enabled"] = bool(enabled)
+                    candidate["enabled"] = bool(enabled)
                 # token / replacement / mode / layers change the directions →
                 # the lens and model are required to re-resolve them
                 if not needs_dirs:
+                    self._rules[index] = candidate
                     self._revision += 1
                     return self._summary_locked()
-                if lens_manager is None or jl is None:
-                    raise ValueError("model and lens required to edit the rule")
-                lens = lens_manager.lens
-                if lens is None:
-                    raise ValueError("no lens loaded")
-                tokenizer = jl.tokenizer
                 if mode is not None:
                     if mode not in ("scale", "replace"):
                         raise ValueError(f"invalid mode: {mode}")
-                    rule["mode"] = mode
+                    candidate["mode"] = mode
                 if token_id is not None:
-                    rule["token_id"] = int(token_id)
-                    rule["token"] = tokenizer.decode([int(token_id)])
+                    candidate["token_id"] = int(token_id)
+                    candidate["token"] = tokenizer.decode([int(token_id)])
                 if replacement_id is not None:
-                    rule["replacement_id"] = int(replacement_id)
-                    rule["replacement"] = tokenizer.decode([int(replacement_id)])
-                if rule["mode"] == "scale":
-                    rule["replacement_id"] = None
-                    rule["replacement"] = None
-                elif rule["replacement_id"] is None:
+                    candidate["replacement_id"] = int(replacement_id)
+                    candidate["replacement"] = tokenizer.decode([int(replacement_id)])
+                if candidate["mode"] == "scale":
+                    candidate["replacement_id"] = None
+                    candidate["replacement"] = None
+                elif candidate["replacement_id"] is None:
                     raise ValueError("replacement_id required in replace mode")
                 if layers is not None:
                     n_layers = len(jl.layers)
                     # new_layers=[] is valid: rule kept but inactive
-                    rule["layers"] = sorted({int(l) for l in layers if 0 <= int(l) < n_layers})
+                    candidate["layers"] = sorted({int(l) for l in layers if 0 <= int(l) < n_layers})
                 weight = jl._lm_head.weight
-                rule["dirs_a"] = self._direction(lens, weight, rule["token_id"], rule["layers"])
-                rule["dirs_b"] = (
-                    self._direction(lens, weight, rule["replacement_id"], rule["layers"])
-                    if rule["replacement_id"] is not None
+                dirs_a = self._direction(lens, weight, candidate["token_id"], candidate["layers"])
+                dirs_b = (
+                    self._direction(lens, weight, candidate["replacement_id"], candidate["layers"])
+                    if candidate["replacement_id"] is not None
                     else None
                 )
+                candidate["dirs_a"] = dirs_a
+                candidate["dirs_b"] = dirs_b
+                self._rules[index] = candidate
                 self._revision += 1
                 return self._summary_locked()
             raise ValueError(f"unknown rule {rule_id}")

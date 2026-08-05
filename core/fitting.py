@@ -289,8 +289,15 @@ class FitManager:
                 self.state["state"] = "stopping"
         with run.process_lock:
             for proc in run.processes:
-                if proc.poll() is None:
-                    proc.terminate()
+                try:
+                    running = proc.poll() is None
+                except Exception:
+                    running = True
+                if running:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
         self._emit()
         return dict(self.state)
 
@@ -357,7 +364,10 @@ class FitManager:
                 pass
         for thread in run.helper_threads:
             if thread is not threading.current_thread():
-                thread.join()
+                try:
+                    thread.join()
+                except Exception:
+                    pass
 
     def _helper_exception(self, run):
         with run.helper_error_lock:
@@ -524,9 +534,9 @@ class FitManager:
                     args=(run, proc, worker_state, started),
                     daemon=True,
                 )
+                reader.start()
                 run.helper_threads.append(reader)
                 run.reader_threads.append(reader)
-                reader.start()
             self._check_cancelled(run)
 
             self._check_cancelled(run)
@@ -535,8 +545,8 @@ class FitManager:
                 args=(run, started),
                 daemon=True,
             )
-            run.heartbeat_thread = heartbeat
             heartbeat.start()
+            run.heartbeat_thread = heartbeat
             self._check_cancelled(run)
 
             stderr_tails = [""] * len(run.processes)
@@ -554,9 +564,9 @@ class FitManager:
                 threading.Thread(target=drain_err, args=(i, p), daemon=True)
                 for i, p in enumerate(run.processes)
             ]
-            run.helper_threads.extend(drainers)
             for t in drainers:
                 t.start()
+                run.helper_threads.append(t)
             for proc in run.processes:
                 proc.wait()
             # Popen.wait() does not guarantee that Python reader threads have
@@ -678,7 +688,17 @@ class FitManager:
                         pass
             with self._lock:
                 if self._active_run is run:
+                    if self.state.get("state") in ("running", "loading", "stopping"):
+                        self.state.update(
+                            state="error",
+                            error=self.state.get("error") or "fit terminated during cleanup",
+                            eta_seconds=None,
+                        )
                     self._active_run = None
+            try:
+                self._emit()
+            except Exception:
+                pass
             release = run.reservation_release
             if release is not None:
                 try:

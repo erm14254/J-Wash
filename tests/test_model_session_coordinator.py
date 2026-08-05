@@ -125,3 +125,73 @@ def test_metadata_snapshots_do_not_retain_model_bundle():
     import gc
     gc.collect()
     assert model_ref() is None
+
+
+def test_acquire_rolls_back_when_snapshot_copy_fails():
+    c = ModelSessionCoordinator()
+    token, snap = c.acquire(OperationType.LOAD)
+    c.publish_loaded(token, bundle("copy-fail"), expected_unloaded_session=snap.model_session_id)
+    c.release(token)
+
+    def fail_copy(_value):
+        raise RuntimeError("copy failed")
+
+    c._copy_hook = fail_copy
+    with pytest.raises(RuntimeError, match="copy failed"):
+        c.acquire(OperationType.GENERATE, requires_loaded=True)
+    c._copy_hook = None
+    assert c.status_snapshot().operation is None
+    successor, _ = c.acquire(OperationType.UNLOAD, include_bundle=False)
+    assert c.release(successor)
+
+
+class NoDeepcopyTensor:
+    def __deepcopy__(self, memo):
+        raise AssertionError("direction tensor was deep-copied")
+
+
+def test_intervention_publication_does_not_deepcopy_direction_tensors():
+    c = ModelSessionCoordinator()
+    token, snap = c.acquire(OperationType.LOAD)
+    c.publish_loaded(token, bundle("directions"), expected_unloaded_session=snap.model_session_id)
+    c.release(token)
+    token, _ = c.acquire(OperationType.INTERVENTION_UPDATE, requires_loaded=True)
+    record = {
+        "revision": 1,
+        "model_session_id": 1,
+        "lens_binding_id": 7,
+        "scale": 1.0,
+        "mode": "standard",
+        "rules": [{"id": 1, "layers": [0], "enabled": True, "dirs_a": {0: NoDeepcopyTensor()}}],
+        "active_rules": [{"id": 1, "layers": [0], "enabled": True, "dirs_a": {0: NoDeepcopyTensor()}}],
+        "summary": [{"id": 1, "layers": [0], "enabled": True}],
+        "active_summary": [{"id": 1, "layers": [0], "enabled": True}],
+    }
+    c.update_interventions(token, record)
+    snap = c.snapshot()
+    assert snap.interventions["rules"][0]["dirs_a"][0].__class__ is NoDeepcopyTensor
+    assert c.release(token)
+
+
+def test_intervention_publication_failure_preserves_previous_revision():
+    c = ModelSessionCoordinator()
+    token, snap = c.acquire(OperationType.LOAD)
+    c.publish_loaded(token, bundle("revision"), expected_unloaded_session=snap.model_session_id)
+    c.release(token)
+    first = {
+        "revision": 1, "scale": 1.0, "mode": "standard",
+        "rules": [], "active_rules": [], "summary": [], "active_summary": [],
+    }
+    token, _ = c.acquire(OperationType.INTERVENTION_UPDATE, requires_loaded=True)
+    c.update_interventions(token, first)
+    c.release(token)
+
+    class BadSummary:
+        def __deepcopy__(self, memo):
+            raise RuntimeError("summary copy failed")
+
+    token, _ = c.acquire(OperationType.INTERVENTION_UPDATE, requires_loaded=True)
+    with pytest.raises(RuntimeError, match="summary copy failed"):
+        c.update_interventions(token, dict(first, revision=2, summary=[BadSummary()]))
+    c.release(token)
+    assert c.status_snapshot().interventions["revision"] == 1

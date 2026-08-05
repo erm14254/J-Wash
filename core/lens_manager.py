@@ -282,17 +282,63 @@ class LensManager:
             return dict(self.meta)
 
     def unload(self):
+        old = self.withdraw()
+        cleanup_error = self.cleanup_withdrawn(old)
+        if cleanup_error is not None:
+            raise cleanup_error
+        return {"unloaded": True}
+
+    def withdraw(self):
         with self._lock:
+            old = {
+                "lens": self.lens,
+                "meta": self.meta,
+                "layers": self.layers,
+                "k": self.k,
+                "mask": self.mask,
+                "_J": self._J,
+                "_tok_strs": self._tok_strs,
+                "_pref_key": self._pref_key,
+                "binding_id": self.binding_id,
+                "model_session_id": self.model_session_id,
+                "gen_store": self.gen_store,
+            }
             self.lens = None
             self.meta = None
             self.layers = []
             self.mask = None
             self._J = None
             self._tok_strs = {}
-            self.gen_store.clear()
+            self.gen_store = OrderedDict()
             self.model_session_id = None
+            return old
+
+    def restore_withdrawn(self, old):
+        if not old:
+            return
+        with self._lock:
+            self.lens = old["lens"]
+            self.meta = old["meta"]
+            self.layers = old["layers"]
+            self.k = old["k"]
+            self.mask = old["mask"]
+            self._J = old["_J"]
+            self._tok_strs = old["_tok_strs"]
+            self._pref_key = old["_pref_key"]
+            self.binding_id = old["binding_id"]
+            self.model_session_id = old["model_session_id"]
+            self.gen_store = old["gen_store"]
+
+    @staticmethod
+    def cleanup_withdrawn(_old):
+        import gc
+        _old = None
+        gc.collect()
+        try:
             torch.cuda.empty_cache()
-            return {"unloaded": True}
+        except Exception as exc:
+            return exc
+        return None
 
     def start_gen(self):
         gen_id = next(self._gen_counter)
