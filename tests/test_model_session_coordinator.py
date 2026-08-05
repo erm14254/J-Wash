@@ -192,6 +192,7 @@ def test_status_snapshot_does_not_retain_bundle_during_outward_construction():
     c.release(token)
     entered = threading.Event()
     unblock = threading.Event()
+    first_call = threading.Event()
 
     def blocking_hook(_value):
         if first_call.is_set():
@@ -223,6 +224,8 @@ def test_status_snapshot_does_not_retain_bundle_during_outward_construction():
     assert model_ref() is None
     unblock.set()
     thread.join(2)
+    assert not thread.is_alive(), "status worker did not finish after unblock"
+    assert errors == []
     assert not thread.is_alive(), "status outward construction did not finish"
     assert errors == []
 
