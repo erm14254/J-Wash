@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 import json
 import logging
 import mimetypes
@@ -34,7 +35,7 @@ from core.model_manager import (
     resolve_local_dir,
     resolve_source,
 )
-from core.store import Store
+from core.store import Store, FrameStorageError, StaleMessageUpdate
 
 manager = ModelManager()
 lens_manager = LensManager()
@@ -104,6 +105,28 @@ _loop_holder = {}
 _deferred_worker_tasks = set()
 
 
+
+
+@dataclass(frozen=True)
+class RouteOutcome:
+    value: object | None = None
+    status: int | None = None
+    message: str | None = None
+
+
+def _route_value(value=None):
+    return RouteOutcome(value=value)
+
+
+def _route_http(status, message):
+    return RouteOutcome(status=status, message=str(message))
+
+
+def _raise_route_outcome(outcome: RouteOutcome):
+    if outcome.status is not None:
+        raise HTTPException(outcome.status, outcome.message or "request failed") from None
+    return outcome.value
+
 def _worker_success(value=None):
     return WorkerOutcome(value=value)
 
@@ -137,6 +160,16 @@ def _coordinated_interventions(snap):
     if snap.interventions is None:
         raise HTTPException(500, "coordinated intervention state unavailable")
     return snap.interventions
+
+
+async def _retain_worker_task_or_cancel(task, dispatch):
+    try:
+        _retain_worker_task(task)
+    except Exception:
+        dispatch.cancel_from_awaiter()
+        await asyncio.gather(asyncio.shield(task), return_exceptions=True)
+        raise
+    return task
 
 
 def _retain_worker_task(task):
@@ -459,7 +492,7 @@ async def api_delete_model(req: DeleteModelRequest):
     except Exception:
         dispatch.cancel_from_awaiter()
         raise
-    _retain_worker_task(task)
+    await _retain_worker_task_or_cancel(task, dispatch)
     try:
         return _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -613,7 +646,7 @@ async def api_lens_load(req: LensLoadRequest):
     except Exception:
         dispatch.cancel_from_awaiter()
         raise
-    _retain_worker_task(task)
+    await _retain_worker_task_or_cancel(task, dispatch)
     try:
         return _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -654,7 +687,22 @@ def api_lens_unload():
 def api_lens_layers(req: LensLayersRequest):
     token = None
     try:
-        token, _ = manager.coordinator.acquire(OperationType.LENS_UPDATE, requires_loaded=True)
+        token, snap = manager.coordinator.acquire(OperationType.LENS_UPDATE, requires_loaded=True, include_bundle=False)
+        outcome = _lens_layers_resource(token, req)
+    except OperationConflict as exc:
+        raise _conflict(exc)
+    except ModelStateError as exc:
+        raise HTTPException(422, str(exc))
+    finally:
+        snap = None
+        if token is not None:
+            manager.coordinator.release(token)
+    return _raise_route_outcome(outcome)
+
+
+def _lens_layers_resource(token, req):
+    old_state = result = None
+    try:
         old_state = lens_manager.state_record()
         result = lens_manager.set_layers(manager, req.layers, k=req.k)
         try:
@@ -662,16 +710,15 @@ def api_lens_layers(req: LensLayersRequest):
         except Exception:
             lens_manager.restore_state_record(old_state)
             raise
-        return result
-    except OperationConflict as exc:
-        raise _conflict(exc)
-    except ModelStateError as exc:
-        raise HTTPException(422, str(exc))
+        return _route_value(dict(result))
     except ValueError as exc:
-        raise HTTPException(422, str(exc))
+        return _route_http(422, str(exc))
+    except Exception as exc:
+        if isinstance(exc, HTTPException):
+            return _route_http(exc.status_code, exc.detail)
+        raise
     finally:
-        if token is not None:
-            manager.coordinator.release(token)
+        old_state = result = None
 
 
 @app.get("/api/interventions")
@@ -686,9 +733,24 @@ def api_interventions_add(req: InterventionRequest):
     token = snap = None
     try:
         token, snap = manager.coordinator.acquire(OperationType.INTERVENTION_UPDATE, requires_loaded=True)
+        outcome = _interventions_add_resource(token, snap, req)
+    except OperationConflict as exc:
+        raise _conflict(exc)
+    except ModelStateError as exc:
+        raise HTTPException(422, str(exc))
+    finally:
+        snap = None
+        if token is not None:
+            manager.coordinator.release(token)
+    return _raise_route_outcome(outcome)
+
+
+def _interventions_add_resource(token, snap, req):
+    bundle = rules = None
+    try:
         bundle = _bundle_from_snapshot_or_legacy(snap)
         if lens_manager.lens is None:
-            raise HTTPException(422, "model and lens required")
+            return _route_http(422, "model and lens required")
         capabilities.require(bundle.capability_profile, "modes", "standard", loaded=True)
         def mutate():
             return interventions.add(
@@ -701,16 +763,13 @@ def api_interventions_add(req: InterventionRequest):
                 layers=req.layers,
             )
         rules, _ = _run_intervention_transaction(token, snap, mutate)
-        return {"rules": rules}
-    except OperationConflict as exc:
-        raise _conflict(exc)
-    except ModelStateError as exc:
-        raise HTTPException(422, str(exc))
+        return _route_value({"rules": list(rules or [])})
     except ValueError as exc:
-        raise HTTPException(422, str(exc))
+        return _route_http(422, str(exc))
+    except HTTPException as exc:
+        return _route_http(exc.status_code, exc.detail)
     finally:
-        if token is not None:
-            manager.coordinator.release(token)
+        bundle = rules = mutate = None
 
 
 @app.patch("/api/interventions/{rule_id}")
@@ -723,6 +782,21 @@ def api_interventions_patch(rule_id: int, req: InterventionPatch):
         token, snap = manager.coordinator.acquire(
             OperationType.INTERVENTION_UPDATE, requires_loaded=True if needs_dirs else None
         )
+        outcome = _interventions_patch_resource(token, snap, rule_id, req, needs_dirs)
+    except OperationConflict as exc:
+        raise _conflict(exc)
+    except ModelStateError as exc:
+        raise HTTPException(422, str(exc))
+    finally:
+        snap = None
+        if token is not None:
+            manager.coordinator.release(token)
+    return _raise_route_outcome(outcome)
+
+
+def _interventions_patch_resource(token, snap, rule_id, req, needs_dirs):
+    bundle = rules = None
+    try:
         bundle = _bundle_from_snapshot_or_legacy(snap) if needs_dirs else None
         def mutate():
             return interventions.update(
@@ -737,16 +811,13 @@ def api_interventions_patch(rule_id: int, req: InterventionPatch):
                 jl=bundle.jl if needs_dirs else None,
             )
         rules, _ = _run_intervention_transaction(token, snap, mutate)
-        return {"rules": rules}
-    except OperationConflict as exc:
-        raise _conflict(exc)
-    except ModelStateError as exc:
-        raise HTTPException(422, str(exc))
+        return _route_value({"rules": list(rules or [])})
     except ValueError as exc:
-        raise HTTPException(404, str(exc))
+        return _route_http(404, str(exc))
+    except HTTPException as exc:
+        return _route_http(exc.status_code, exc.detail)
     finally:
-        if token is not None:
-            manager.coordinator.release(token)
+        bundle = rules = mutate = None
 
 
 @app.patch("/api/interventions")
@@ -754,6 +825,18 @@ def api_interventions_scale(req: InterventionsScale):
     token = snap = None
     try:
         token, snap = manager.coordinator.acquire(OperationType.INTERVENTION_UPDATE)
+        outcome = _interventions_scale_resource(token, snap, req)
+    except OperationConflict as exc:
+        raise _conflict(exc)
+    finally:
+        snap = None
+        if token is not None:
+            manager.coordinator.release(token)
+    return _raise_route_outcome(outcome)
+
+
+def _interventions_scale_resource(token, snap, req):
+    try:
         if req.mode is not None:
             status = manager.coordinator.status_snapshot()
             capabilities.require(status.capability_profile, "modes", req.mode,
@@ -761,17 +844,11 @@ def api_interventions_scale(req: InterventionsScale):
         def mutate():
             return interventions.set_scale_and_mode(scale=req.scale, mode=req.mode)
         (scale, mode), _ = _run_intervention_transaction(token, snap, mutate)
+        return _route_value({"scale": scale, "mode": mode})
     except ValueError as exc:
-        raise HTTPException(422, str(exc))
-    except OperationConflict as exc:
-        raise _conflict(exc)
+        return _route_http(422, str(exc))
     finally:
-        if token is not None:
-            manager.coordinator.release(token)
-    return {
-        "scale": scale,
-        "mode": mode,
-    }
+        mutate = None
 
 
 @app.delete("/api/interventions/{rule_id}")
@@ -779,15 +856,25 @@ def api_interventions_remove(rule_id: int):
     token = snap = None
     try:
         token, snap = manager.coordinator.acquire(OperationType.INTERVENTION_UPDATE)
-        def mutate():
-            return interventions.remove(rule_id)
-        rules, _ = _run_intervention_transaction(token, snap, mutate)
-        return {"rules": rules}
+        outcome = _interventions_remove_resource(token, snap, rule_id)
     except OperationConflict as exc:
         raise _conflict(exc)
     finally:
+        snap = None
         if token is not None:
             manager.coordinator.release(token)
+    return _raise_route_outcome(outcome)
+
+
+def _interventions_remove_resource(token, snap, rule_id):
+    rules = None
+    try:
+        def mutate():
+            return interventions.remove(rule_id)
+        rules, _ = _run_intervention_transaction(token, snap, mutate)
+        return _route_value({"rules": list(rules or [])})
+    finally:
+        rules = mutate = None
 
 
 @app.delete("/api/interventions")
@@ -795,42 +882,96 @@ def api_interventions_clear():
     token = snap = None
     try:
         token, snap = manager.coordinator.acquire(OperationType.INTERVENTION_UPDATE)
-        def mutate():
-            return interventions.remove()
-        rules, _ = _run_intervention_transaction(token, snap, mutate)
-        return {"rules": rules}
+        outcome = _interventions_clear_resource(token, snap)
     except OperationConflict as exc:
         raise _conflict(exc)
     finally:
+        snap = None
         if token is not None:
             manager.coordinator.release(token)
+    return _raise_route_outcome(outcome)
+
+
+def _interventions_clear_resource(token, snap):
+    rules = None
+    try:
+        def mutate():
+            return interventions.remove()
+        rules, _ = _run_intervention_transaction(token, snap, mutate)
+        return _route_value({"rules": list(rules or [])})
+    finally:
+        rules = mutate = None
 
 
 def _stable_lens_descriptor(lens_binding):
     if lens_binding is None:
-        return None
+        return {
+            "schema_version": 1,
+            "source_kind": "none",
+            "repo_id": None,
+            "path": None,
+            "filename": None,
+            "revision": None,
+            "model_id": None,
+            "model_revision": None,
+            "fitted_layers": [],
+            "tapped_layers": [],
+            "k": None,
+            "runtime_lens_binding_id": None,
+            "runtime_model_session_id": None,
+        }
     lens = dict(lens_binding)
-    keys = (
-        "repo_id", "path", "filename", "revision",
-        "model_id", "model_revision", "model_session_id",
-        "fitted_layers", "fitted_layers_all", "tapped_layers", "k",
-    )
-    descriptor = {key: lens.get(key) for key in keys if lens.get(key) is not None}
-    if lens.get("lens_binding_id") is not None:
-        descriptor["runtime_lens_binding_id"] = lens.get("lens_binding_id")
-    return descriptor or None
+    path = lens.get("path")
+    repo_id = lens.get("repo_id")
+    source_kind = "local" if path else ("hub" if repo_id else "none")
+
+    def int_list(value):
+        if value is None:
+            return []
+        if isinstance(value, (str, bytes)):
+            return []
+        try:
+            return [int(v) for v in value]
+        except TypeError:
+            return []
+
+    fitted = int_list(lens.get("fitted_layers_all"))
+    if not fitted:
+        fitted = int_list(lens.get("fitted_layers"))
+    return {
+        "schema_version": 1,
+        "source_kind": source_kind,
+        "repo_id": repo_id,
+        "path": os.path.normpath(str(path)) if path else None,
+        "filename": lens.get("filename") or ("lens.pt" if repo_id else None),
+        "revision": lens.get("revision"),
+        "model_id": lens.get("model_id"),
+        "model_revision": lens.get("model_revision"),
+        "fitted_layers": fitted,
+        "tapped_layers": int_list(lens.get("tapped_layers")),
+        "k": int(lens["k"]) if lens.get("k") is not None else None,
+        "runtime_lens_binding_id": lens.get("lens_binding_id"),
+        "runtime_model_session_id": lens.get("model_session_id"),
+    }
 
 
 def _lens_descriptor_mismatch(saved, current):
     if saved is None:
         return False
-    current = current or {}
-    for key, value in saved.items():
-        if key == "runtime_lens_binding_id":
-            continue
-        if current.get(key) != value:
-            return True
-    return False
+    current = current or _stable_lens_descriptor(None)
+    if not isinstance(saved, dict) or saved.get("schema_version") != 1:
+        return True
+    if not isinstance(current, dict) or current.get("schema_version") != 1:
+        return True
+    stable_keys = (
+        "source_kind", "repo_id", "path", "filename", "revision",
+        "model_id", "model_revision", "fitted_layers", "tapped_layers", "k",
+    )
+    return any(saved.get(key) != current.get(key) for key in stable_keys)
+
+
+def _lens_descriptor_is_legacy(value):
+    return value is not None and (not isinstance(value, dict) or value.get("schema_version") != 1)
 
 
 @app.get("/api/presets")
@@ -883,9 +1024,24 @@ def api_presets_apply(name: str):
     token = snap = None
     try:
         token, snap = manager.coordinator.acquire(OperationType.INTERVENTION_UPDATE, requires_loaded=True)
+        outcome = _presets_apply_resource(token, snap, preset)
+    except OperationConflict as exc:
+        raise _conflict(exc)
+    except ModelStateError as exc:
+        raise HTTPException(422, str(exc))
+    finally:
+        snap = None
+        if token is not None:
+            manager.coordinator.release(token)
+    return _raise_route_outcome(outcome)
+
+
+def _presets_apply_resource(token, snap, preset):
+    bundle = current_iv = rules = None
+    try:
         bundle = _bundle_from_snapshot_or_legacy(snap)
         if lens_manager.lens is None:
-            raise HTTPException(422, "model and lens required")
+            return _route_http(422, "model and lens required")
         capabilities.ensure_unquantized(bundle.jl, dict(bundle.meta))
         warnings = []
         if preset.get("model_id") and preset["model_id"] != bundle.meta["model_id"]:
@@ -903,7 +1059,9 @@ def api_presets_apply(name: str):
             )
         current_lens_descriptor = _stable_lens_descriptor(snap.lens_binding)
         if preset.get("lens_descriptor") is not None:
-            if _lens_descriptor_mismatch(preset.get("lens_descriptor"), current_lens_descriptor):
+            if _lens_descriptor_is_legacy(preset.get("lens_descriptor")):
+                warnings.append("preset has sparse lens provenance; stable lens compatibility cannot be verified")
+            elif _lens_descriptor_mismatch(preset.get("lens_descriptor"), current_lens_descriptor):
                 warnings.append("preset lens descriptor differs from the current coordinated lens")
         elif preset.get("lens_binding_id") is not None:
             warnings.append("preset has only process-local lens provenance; current stable lens identity is unknown")
@@ -929,20 +1087,17 @@ def api_presets_apply(name: str):
                 interventions.set_scale(preset.get("intervention_scale", preset.get("scale")))
             return rules
         rules, _ = _run_intervention_transaction(token, snap, mutate)
-        return {
+        return _route_value({
             "rules": rules or interventions.summary(),
             "scale": interventions.global_scale,
             "warnings": warnings,
-        }
-    except OperationConflict as exc:
-        raise _conflict(exc)
-    except ModelStateError as exc:
-        raise HTTPException(422, str(exc))
+        })
     except ValueError as exc:
-        raise HTTPException(422, str(exc))
+        return _route_http(422, str(exc))
+    except HTTPException as exc:
+        return _route_http(exc.status_code, exc.detail)
     finally:
-        if token is not None:
-            manager.coordinator.release(token)
+        bundle = current_iv = rules = mutate = warnings = None
 
 
 @app.delete("/api/presets/{name}")
@@ -956,72 +1111,41 @@ async def api_edit_export(req: ExportRequest):
     req.name = _safe_name(req.name)
     if req.format not in ("layers", "lora", "full"):
         raise HTTPException(422, f"unknown format: {req.format}")
-    token = None
+    token = snap = None
     stop_event = ThreadingEvent()
     try:
         token, snap = manager.coordinator.acquire(OperationType.EXPORT, requires_loaded=True)
-        bundle = snap.bundle
-        meta = dict(bundle.meta)
-        intervention_snapshot = _coordinated_interventions(snap)
-        rules = intervention_snapshot["active_rules"]
-        if not rules:
-            raise HTTPException(422, "no active intervention to export (rules disabled or without layers?)")
-        source_dir = resolve_local_dir(meta["model_id"])
-        scale, mode = intervention_snapshot["scale"], intervention_snapshot["mode"]
-        capabilities.ensure_unquantized(bundle.jl, meta)
-        capabilities.require(bundle.capability_profile, "exports", req.format, mode, loaded=True)
-        kwargs = {}
-        if mode in ("readthrough", "exact"):
-            export_fn = editing.export_rebase
-            kwargs["exact"] = mode == "exact"
-        elif mode == "abliteration":
-            export_fn = editing.export_abliteration
-        else:
-            raise HTTPException(
-                422,
-                "export requires a pure-weights mode: switch to \"read projection\" "
-                "(or \"global projection\" on write-norm architectures) — per-layer "
-                "steering does not bake faithfully",
-            )
+        outcome = _export_preflight_resource(snap, req)
     except OperationConflict as exc:
         raise _conflict(exc)
     except ModelStateError as exc:
         raise HTTPException(422, str(exc))
-    except ValueError as exc:
-        if token is not None:
-            manager.coordinator.release(token)
-        raise HTTPException(422, str(exc))
-    except HTTPException:
-        if token is not None:
-            manager.coordinator.release(token)
-        raise
     except Exception:
         if token is not None:
             manager.coordinator.release(token)
         raise
+    finally:
+        snap = None
+
+    if outcome.status is not None:
+        if token is not None:
+            manager.coordinator.release(token)
+            token = None
+        return _raise_route_outcome(outcome)
+    payload_seed = outcome.value
 
     try:
         publication_gate = editing.PublicationGate(
             lambda: not manager.coordinator.is_cancelled(token) and manager.coordinator.is_current(token)
         )
-        payload = {
-            "bundle": bundle,
-            "meta": meta,
-            "rules": rules,
-            "source_dir": source_dir,
-            "scale": scale,
-            "kwargs": kwargs,
-            "export_fn": export_fn,
-            "format": req.format,
-            "name": req.name,
-            "publication_gate": publication_gate,
-        }
+        payload = dict(payload_seed)
+        payload.update(publication_gate=publication_gate, format=req.format, name=req.name)
         dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
     except Exception:
         if token is not None:
             manager.coordinator.release(token)
         raise
-    snap = bundle = meta = intervention_snapshot = rules = source_dir = kwargs = export_fn = payload = None
+    payload_seed = payload = None
 
     def worker():
         if not dispatch.claim():
@@ -1041,17 +1165,19 @@ async def api_edit_export(req: ExportRequest):
             except Exception as exc:
                 return _worker_failure(exc)
         finally:
-            import gc
-            payload = call_kwargs = result = None
-            gc.collect()
-            dispatch.release_from_worker()
+            try:
+                import gc
+                payload = call_kwargs = result = None
+                gc.collect()
+            finally:
+                dispatch.release_from_worker()
 
     try:
         task = asyncio.create_task(asyncio.to_thread(worker))
     except Exception:
         dispatch.cancel_from_awaiter()
         raise
-    _retain_worker_task(task)
+    await _retain_worker_task_or_cancel(task, dispatch)
     try:
         return _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -1060,6 +1186,77 @@ async def api_edit_export(req: ExportRequest):
         raise
     except HTTPException:
         raise
+
+
+def _export_preflight_resource(snap, req):
+    bundle = meta = intervention_snapshot = rules = source_dir = kwargs = export_fn = None
+    try:
+        bundle = snap.bundle
+        meta = dict(bundle.meta)
+        intervention_snapshot = _coordinated_interventions(snap)
+        rules = intervention_snapshot["active_rules"]
+        if not rules:
+            return _route_http(422, "no active intervention to export (rules disabled or without layers?)")
+        source_dir = resolve_local_dir(meta["model_id"])
+        scale, mode = intervention_snapshot["scale"], intervention_snapshot["mode"]
+        capabilities.ensure_unquantized(bundle.jl, meta)
+        capabilities.require(bundle.capability_profile, "exports", req.format, mode, loaded=True)
+        kwargs = {}
+        if mode in ("readthrough", "exact"):
+            export_fn = editing.export_rebase
+            kwargs["exact"] = mode == "exact"
+        elif mode == "abliteration":
+            export_fn = editing.export_abliteration
+        else:
+            return _route_http(
+                422,
+                "export requires a pure-weights mode: switch to \"read projection\" "
+                "(or \"global projection\" on write-norm architectures) — per-layer "
+                "steering does not bake faithfully",
+            )
+        return _route_value({
+            "bundle": bundle, "meta": meta, "rules": rules, "source_dir": source_dir,
+            "scale": scale, "kwargs": kwargs, "export_fn": export_fn,
+        })
+    except ValueError as exc:
+        return _route_http(422, str(exc))
+    except HTTPException as exc:
+        return _route_http(exc.status_code, exc.detail)
+    finally:
+        bundle = meta = intervention_snapshot = rules = source_dir = kwargs = export_fn = None
+
+
+
+
+def _gguf_preflight_resource(snap):
+    bundle = meta = intervention_snapshot = rules = source_dir = kwargs = export_fn = None
+    try:
+        bundle = _bundle_from_snapshot_or_legacy(snap)
+        meta = dict(bundle.meta)
+        intervention_snapshot = _coordinated_interventions(snap)
+        rules = intervention_snapshot["active_rules"]
+        if not rules:
+            return _route_http(422, "no active intervention to export")
+        scale, mode = intervention_snapshot["scale"], intervention_snapshot["mode"]
+        capabilities.ensure_unquantized(bundle.jl, meta)
+        capabilities.require(bundle.capability_profile, "exports", "gguf", mode, loaded=True)
+        if mode in ("readthrough", "exact"):
+            export_fn, kwargs = editing.export_rebase, {"exact": mode == "exact"}
+        elif mode == "abliteration":
+            export_fn, kwargs = editing.export_abliteration, {}
+        else:
+            return _route_http(422, "export requires a pure-weights mode")
+        source_dir = resolve_local_dir(meta["model_id"])
+        return _route_value({
+            "bundle": bundle, "meta": meta, "rules": rules, "source_dir": source_dir,
+            "scale": scale, "kwargs": kwargs, "export_fn": export_fn,
+        })
+    except ValueError as exc:
+        return _route_http(422, str(exc))
+    except HTTPException as exc:
+        return _route_http(exc.status_code, exc.detail)
+    finally:
+        bundle = meta = intervention_snapshot = rules = source_dir = kwargs = export_fn = None
 
 
 # --- direct GGUF export (via a user-provided llama.cpp folder) ---------------
@@ -1205,63 +1402,39 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
     hf_dir = job_dir / "hf"
     baked = "reused"
     if not (hf_dir / "config.json").exists():
-        token = None
+        token = snap = None
         stop_event = ThreadingEvent()
         try:
             token, snap = manager.coordinator.acquire(OperationType.GGUF_BAKE, requires_loaded=True)
-            bundle = _bundle_from_snapshot_or_legacy(snap)
-            meta = dict(bundle.meta)
-            intervention_snapshot = _coordinated_interventions(snap)
-            rules = intervention_snapshot["active_rules"]
-            if not rules:
-                raise HTTPException(422, "no active intervention to export")
-            scale, mode = intervention_snapshot["scale"], intervention_snapshot["mode"]
-            capabilities.ensure_unquantized(bundle.jl, meta)
-            capabilities.require(bundle.capability_profile, "exports", "gguf", mode, loaded=True)
-            if mode in ("readthrough", "exact"):
-                export_fn, kwargs = editing.export_rebase, {"exact": mode == "exact"}
-            elif mode == "abliteration":
-                export_fn, kwargs = editing.export_abliteration, {}
-            else:
-                raise HTTPException(422, "export requires a pure-weights mode")
-            source_dir = resolve_local_dir(meta["model_id"])
+            outcome = _gguf_preflight_resource(snap)
         except OperationConflict as exc:
             raise _conflict(exc)
         except ModelStateError as exc:
             raise HTTPException(422, "no model loaded (and no cached checkpoint for this name)") from exc
-        except ValueError as exc:
-            if token is not None:
-                manager.coordinator.release(token)
-            raise HTTPException(422, str(exc))
-        except HTTPException:
-            if token is not None:
-                manager.coordinator.release(token)
-            raise
         except Exception:
             if token is not None:
                 manager.coordinator.release(token)
             raise
+        finally:
+            snap = None
+        if outcome.status is not None:
+            if token is not None:
+                manager.coordinator.release(token)
+                token = None
+            return _raise_route_outcome(outcome)
+        payload_seed = outcome.value
         try:
             publication_gate = editing.PublicationGate(
                 lambda: not manager.coordinator.is_cancelled(token) and manager.coordinator.is_current(token)
             )
-            payload = {
-                "bundle": bundle,
-                "meta": meta,
-                "rules": rules,
-                "source_dir": source_dir,
-                "scale": scale,
-                "kwargs": kwargs,
-                "export_fn": export_fn,
-                "name": "/".join((*name_parts, "hf")),
-                "publication_gate": publication_gate,
-            }
+            payload = dict(payload_seed)
+            payload.update(name="/".join((*name_parts, "hf")), publication_gate=publication_gate)
             dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
         except Exception:
             if token is not None:
                 manager.coordinator.release(token)
             raise
-        snap = bundle = meta = intervention_snapshot = rules = source_dir = kwargs = export_fn = payload = None
+        payload_seed = payload = None
 
         def bake_worker():
             if not dispatch.claim():
@@ -1288,7 +1461,7 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
         except Exception:
             dispatch.cancel_from_awaiter()
             raise
-        _retain_worker_task(task)
+        await _retain_worker_task_or_cancel(task, dispatch)
         try:
             _raise_worker_outcome(await asyncio.shield(task))
         except asyncio.CancelledError:
@@ -1376,8 +1549,13 @@ async def api_generate_sync(req: GenerateSyncRequest):
         if token is not None:
             manager.coordinator.release(token)
         raise
-    payload = {"context": context, "messages": req.messages, "sampling": req.sampling}
-    dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+    try:
+        payload = {"context": context, "messages": req.messages, "sampling": req.sampling}
+        dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+    except Exception:
+        if token is not None:
+            manager.coordinator.release(token)
+        raise
     snap = context = payload = None
     done = {}
 
@@ -1423,7 +1601,7 @@ async def api_generate_sync(req: GenerateSyncRequest):
     except Exception:
         dispatch.cancel_from_awaiter()
         raise
-    _retain_worker_task(task)
+    await _retain_worker_task_or_cancel(task, dispatch)
     try:
         outcome_value = _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -1461,8 +1639,13 @@ async def api_token_neighbors(req: NeighborsRequest):
         raise _conflict(exc)
     except ModelStateError as exc:
         raise HTTPException(422, str(exc))
-    payload = {"bundle": bundle, "key": key, "token_ids": req.token_ids[:64], "k": req.k}
-    dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+    try:
+        payload = {"bundle": bundle, "key": key, "token_ids": req.token_ids[:64], "k": req.k}
+        dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+    except Exception:
+        if token is not None:
+            manager.coordinator.release(token)
+        raise
     snap = bundle = payload = None
 
     def worker():
@@ -1487,7 +1670,7 @@ async def api_token_neighbors(req: NeighborsRequest):
     except Exception:
         dispatch.cancel_from_awaiter()
         raise
-    _retain_worker_task(task)
+    await _retain_worker_task_or_cancel(task, dispatch)
     try:
         result = _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -1500,9 +1683,24 @@ async def api_token_neighbors(req: NeighborsRequest):
 
 @app.get("/api/token-lookup")
 def api_token_lookup(q: str):
-    token = None
+    token = snap = None
     try:
         token, snap = manager.coordinator.acquire(OperationType.MODEL_READ, requires_loaded=True)
+        outcome = _token_lookup_resource(snap, q)
+    except OperationConflict as exc:
+        raise _conflict(exc)
+    except ModelStateError as exc:
+        raise HTTPException(422, str(exc))
+    finally:
+        snap = None
+        if token is not None:
+            manager.coordinator.release(token)
+    return _raise_route_outcome(outcome)
+
+
+def _token_lookup_resource(snap, q: str):
+    tokenizer = candidates = None
+    try:
         tokenizer = snap.bundle.tokenizer
         candidates = {}
         for variant in (q, " " + q, q.lower(), " " + q.lower(),
@@ -1510,14 +1708,13 @@ def api_token_lookup(q: str):
             ids = tokenizer.encode(variant, add_special_tokens=False)
             if len(ids) == 1 and ids[0] not in candidates:
                 candidates[ids[0]] = tokenizer.decode([ids[0]])
-        return {"candidates": [{"id": tid, "str": s} for tid, s in candidates.items()]}
-    except OperationConflict as exc:
-        raise _conflict(exc)
-    except ModelStateError as exc:
-        raise HTTPException(422, str(exc))
+        return _route_value({"candidates": [{"id": tid, "str": s} for tid, s in candidates.items()]})
+    except Exception as exc:
+        if isinstance(exc, HTTPException):
+            return _route_http(exc.status_code, exc.detail)
+        raise
     finally:
-        if token is not None:
-            manager.coordinator.release(token)
+        tokenizer = candidates = None
 
 
 @app.get("/api/registry/local")
@@ -1605,8 +1802,13 @@ async def api_lens_pin(req: PinRequest):
         raise _conflict(exc)
     except ModelStateError as exc:
         raise HTTPException(422, str(exc))
-    payload = {"jl": jl, "gen_id": req.gen_id, "token_ids": req.token_ids}
-    dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+    try:
+        payload = {"jl": jl, "gen_id": req.gen_id, "token_ids": req.token_ids}
+        dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+    except Exception:
+        if token is not None:
+            manager.coordinator.release(token)
+        raise
     snap = jl = payload = None
 
     def worker():
@@ -1628,7 +1830,7 @@ async def api_lens_pin(req: PinRequest):
     except Exception:
         dispatch.cancel_from_awaiter()
         raise
-    _retain_worker_task(task)
+    await _retain_worker_task_or_cancel(task, dispatch)
     try:
         return _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -1940,6 +2142,8 @@ def api_message_frames(mid: int):
         return store.load_frames(mid)
     except ValueError as exc:
         raise HTTPException(404, str(exc))
+    except FrameStorageError as exc:
+        raise HTTPException(422, str(exc)) from None
 
 
 class MessagePatch(BaseModel):
@@ -2046,7 +2250,11 @@ def _persisted_generate(req, stop_event, emit, gen_context):
             conversation_id, parent_id, "assistant", done_holder.get("text", ""), meta=meta
         )
         if frames_acc:
-            store.save_frames(message_id, frames_acc, layers_used, k_used)
+            try:
+                store.save_frames(message_id, frames_acc, layers_used, k_used)
+            except StaleMessageUpdate:
+                emit({"type": "error", "message": "message changed before frames were attached; retry"})
+                return
         emit(dict(done_holder, conversation_id=conversation_id, message_id=message_id))
     except Exception as exc:
         emit({"type": "error", "message": str(exc)})
@@ -2134,7 +2342,8 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
             try:
                 merged = store.load_frames(message_id)["frames"] + frames_acc
             except Exception:
-                pass
+                emit({"type": "error", "message": "could not load existing frames; continuation not persisted"})
+                return
     if not store.update_message_and_frames_if_unchanged(
         message_id, expected_version, new_content, meta,
         frames=merged, layers=layers_used, k=k_used,
@@ -2184,9 +2393,20 @@ async def _run_chat(ws, req):
     except ModelStateError as exc:
         await _ws_send(ws, json.dumps({"type": "error", "message": str(exc)}))
         return
+    except Exception as exc:
+        if token is not None:
+            manager.coordinator.release(token)
+        await _ws_send(ws, json.dumps({"type": "error", "message": str(exc)}))
+        return
 
-    payload = {"context": context, "request": dict(req)}
-    dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+    try:
+        payload = {"context": context, "request": dict(req)}
+        dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+    except Exception as exc:
+        if token is not None:
+            manager.coordinator.release(token)
+        await _ws_send(ws, json.dumps({"type": "error", "message": str(exc)}))
+        return
     snap = context = payload = None
 
     def worker_body():
@@ -2213,8 +2433,15 @@ async def _run_chat(ws, req):
     except Exception:
         dispatch.cancel_from_awaiter()
         raise
-    _retain_worker_task(worker)
-    receiver = asyncio.create_task(_watch_stop(ws, stop_event))
+    await _retain_worker_task_or_cancel(worker, dispatch)
+    try:
+        receiver = asyncio.create_task(_watch_stop(ws, stop_event))
+    except Exception as exc:
+        stop_event.set()
+        dispatch.cancel_from_awaiter()
+        await asyncio.gather(asyncio.shield(worker), return_exceptions=True)
+        await _ws_send(ws, json.dumps({"type": "error", "message": str(exc)}))
+        return
     try:
         while True:
             get_task = asyncio.create_task(queue.get())

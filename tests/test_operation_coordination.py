@@ -1,5 +1,7 @@
 import threading
 
+import pytest
+
 from core.ablation import HookAttachment
 from core.editing import PublicationCancelled, PublicationGate
 from core.model_session import ModelSessionCoordinator, OperationConflict, OperationType
@@ -388,6 +390,7 @@ def test_http_generation_metadata_preserves_captured_intervention_provenance(mon
 def test_persisted_continue_records_segment_provenance(monkeypatch):
     import json
     import threading
+
     from types import SimpleNamespace
     from api import app
 
@@ -466,6 +469,7 @@ def test_persisted_continue_records_segment_provenance(monkeypatch):
 def test_zero_length_continuation_does_not_reattribute_existing_text(monkeypatch):
     import json
     import threading
+
     from types import SimpleNamespace
     from api import app
 
@@ -642,21 +646,129 @@ def test_legacy_continued_message_gets_unknown_base_provenance():
 def test_preset_lens_descriptor_detects_reused_runtime_binding_id():
     from api import app
 
-    saved = {
-        "runtime_lens_binding_id": 7,
+    saved = app._stable_lens_descriptor({
+        "lens_binding_id": 7,
         "repo_id": "lens-a",
         "filename": "lens.pt",
         "revision": "ra",
         "tapped_layers": [0, 1],
         "k": 8,
-    }
-    current = {
-        "runtime_lens_binding_id": 7,
+    })
+    current = app._stable_lens_descriptor({
+        "lens_binding_id": 7,
         "repo_id": "lens-b",
         "filename": "lens.pt",
         "revision": "rb",
         "tapped_layers": [0, 1],
         "k": 8,
-    }
+    })
+    same_stable_new_runtime = dict(saved, runtime_lens_binding_id=99, runtime_model_session_id=123)
     assert app._lens_descriptor_mismatch(saved, current)
-    assert not app._lens_descriptor_mismatch(saved, dict(saved, runtime_lens_binding_id=99))
+    assert not app._lens_descriptor_mismatch(saved, same_stable_new_runtime)
+
+
+def test_preset_lens_descriptor_compares_missing_revision_symmetrically():
+    from api import app
+
+    saved = app._stable_lens_descriptor({
+        "repo_id": "lens-a",
+        "filename": "lens.pt",
+        "revision": None,
+        "tapped_layers": [0],
+        "k": 4,
+    })
+    current = app._stable_lens_descriptor({
+        "repo_id": "lens-a",
+        "filename": "lens.pt",
+        "revision": "rb",
+        "tapped_layers": [0],
+        "k": 4,
+    })
+    assert saved["revision"] is None
+    assert app._lens_descriptor_mismatch(saved, current)
+
+
+def test_store_load_frames_retries_when_old_pointer_is_retired(tmp_path, monkeypatch):
+    from pathlib import Path
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c")
+    mid = s.add_message(cid, None, "assistant", "old", meta={"m": 1})
+    old_frame = s.save_frames(mid, [_frame(0)], [0], 1)
+    captured = s.get_message(mid)
+    original_read_bytes = Path.read_bytes
+    retired = {"done": False}
+
+    def racing_read_bytes(path):
+        if path.name == old_frame and not retired["done"]:
+            retired["done"] = True
+            assert s.update_message_and_frames_if_unchanged(
+                mid, captured["version"], "old new", {"m": 2},
+                frames=[_frame(0), _frame(1)], layers=[0], k=1,
+            )
+            raise FileNotFoundError(path)
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", racing_read_bytes)
+    loaded = s.load_frames(mid)
+    assert retired["done"]
+    assert len(loaded["frames"]) == 2
+
+
+def test_store_save_frames_detects_stale_initial_attachment(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c")
+    mid = s.add_message(cid, None, "assistant", "old", meta={"m": 1})
+    original = s._write_unique_frame_candidate
+
+    def racing_candidate(message_id, expected_version, blob):
+        s.update_message(mid, "edited", meta={"edited": True}, clear_frames=True)
+        return original(message_id, expected_version, blob)
+
+    monkeypatch.setattr(s, "_write_unique_frame_candidate", racing_candidate)
+    with pytest.raises(store_mod.StaleMessageUpdate):
+        s.save_frames(mid, [_frame(0)], [0], 1)
+    current = s.get_message(mid)
+    assert current["content"] == "edited"
+    assert current["frames_file"] is None
+    assert not list(store_mod.FRAMES_DIR.glob("*.msgpack"))
+
+
+def test_persisted_continue_fails_closed_when_base_frames_cannot_load(monkeypatch):
+    from api import app
+
+    unchanged = {"content": "old", "version": 3, "updated": False}
+    emitted = []
+
+    class FakeStore:
+        def get_message(self, message_id):
+            return {
+                "id": message_id, "conversation_id": 1, "parent_id": None,
+                "role": "assistant", "content": unchanged["content"],
+                "meta": "{}", "frames_file": "base.msgpack", "version": unchanged["version"],
+            }
+        def path_to_root(self, message_id):
+            return [{"role": "assistant", "content": unchanged["content"]}]
+        def load_frames(self, message_id):
+            raise app.FrameStorageError("base corrupt")
+        def update_message_and_frames_if_unchanged(self, *args, **kwargs):
+            unchanged["updated"] = True
+            return True
+
+    def generate(**kwargs):
+        kwargs["emit"]({"type": "frame", **_frame(1)})
+        kwargs["emit"]({"type": "done", "text": " new", "meta": {"m": 2}, "stats": {}, "stopped": False})
+
+    monkeypatch.setattr(app, "store", FakeStore())
+    monkeypatch.setattr(app.manager, "generate", generate)
+    context = type("Ctx", (), {"lens": None, "intervention_snapshot": {"rules": []}})()
+    app._persisted_continue({}, 1, threading.Event(), emitted.append, context)
+    assert not unchanged["updated"]
+    assert emitted[-1]["type"] == "error"

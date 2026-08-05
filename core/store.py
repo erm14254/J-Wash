@@ -1,8 +1,11 @@
 import json
+import logging
+import os
 import sqlite3
 import threading
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 import msgpack
 import numpy as np
@@ -11,6 +14,15 @@ import config
 
 DB_PATH = config.DATA_DIR / "jlens.db"
 FRAMES_DIR = config.DATA_DIR / "frames"
+log = logging.getLogger(__name__)
+
+
+class StaleMessageUpdate(RuntimeError):
+    """A versioned message update lost its durable CAS race."""
+
+
+class FrameStorageError(RuntimeError):
+    """Frame archive publication or loading failed coherently."""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
@@ -69,6 +81,31 @@ class Store:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
         if "version" not in cols:
             conn.execute("ALTER TABLE messages ADD COLUMN version INTEGER NOT NULL DEFAULT 0")
+
+    @staticmethod
+    def _unlink_best_effort(path):
+        if not path:
+            return
+        try:
+            Path(path).unlink(missing_ok=True)
+        except Exception:
+            log.warning("failed to retire unreferenced frame file %s", path, exc_info=True)
+
+    @staticmethod
+    def _fsync_dir_best_effort(path):
+        try:
+            fd = os.open(str(path), os.O_RDONLY)
+        except (OSError, AttributeError):
+            return
+        try:
+            os.fsync(fd)
+        except OSError:
+            pass
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     def _conn(self):
         conn = getattr(self._local, "conn", None)
@@ -257,7 +294,7 @@ class Store:
         )
         conn.commit()
         if clear_frames and row["frames_file"]:
-            (FRAMES_DIR / row["frames_file"]).unlink(missing_ok=True)
+            self._unlink_best_effort(FRAMES_DIR / row["frames_file"])
 
     def update_message_if_unchanged(self, message_id, expected_version, content, meta=None):
         return self.update_message_and_frames_if_unchanged(
@@ -268,16 +305,27 @@ class Store:
         frame_file = f"{message_id}-v{int(expected_version) + 1}-{uuid.uuid4().hex}.msgpack"
         tmp = FRAMES_DIR / f".{frame_file}.tmp-{uuid.uuid4().hex}"
         final = FRAMES_DIR / frame_file
-        with tmp.open("wb") as fh:
-            fh.write(frame_blob)
-            fh.flush()
+        try:
+            with tmp.open("wb") as fh:
+                fh.write(frame_blob)
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+            tmp.replace(final)
+            self._fsync_dir_best_effort(FRAMES_DIR)
+            return frame_file, final
+        except Exception as exc:
             try:
-                import os
-                os.fsync(fh.fileno())
-            except OSError:
-                pass
-        tmp.replace(final)
-        return frame_file, final
+                tmp.unlink(missing_ok=True)
+            except Exception:
+                log.warning("failed to clean temporary frame candidate %s", tmp, exc_info=True)
+            try:
+                final.unlink(missing_ok=True)
+            except Exception:
+                log.warning("failed to clean frame candidate %s", final, exc_info=True)
+            raise FrameStorageError(str(exc)) from exc
 
     def update_message_and_frames_if_unchanged(self, message_id, expected_version, content, meta=None, *, frames=None, layers=None, k=0):
         frame_file = None
@@ -323,7 +371,7 @@ class Store:
                 final_path.unlink(missing_ok=True)
             raise
         if frame_file and old_file and old_file != frame_file:
-            (FRAMES_DIR / old_file).unlink(missing_ok=True)
+            self._unlink_best_effort(FRAMES_DIR / old_file)
         return True
 
     def path_to_root(self, message_id):
@@ -387,26 +435,52 @@ class Store:
             message_id, row["version"], self._pack_frames_blob(frames, layers, k)
         )
         try:
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE messages SET frames_file = ?, version = version + 1 WHERE id = ? AND version = ?",
                 (filename, message_id, row["version"]),
             )
+            if cur.rowcount != 1:
+                conn.rollback()
+                final_path.unlink(missing_ok=True)
+                raise StaleMessageUpdate(f"message {message_id} changed before frames attached")
             conn.commit()
         except Exception:
-            final_path.unlink(missing_ok=True)
+            try:
+                final_path.unlink(missing_ok=True)
+            except Exception:
+                log.warning("failed to clean stale frame candidate %s", final_path, exc_info=True)
             raise
         if row["frames_file"] and row["frames_file"] != filename:
-            (FRAMES_DIR / row["frames_file"]).unlink(missing_ok=True)
+            self._unlink_best_effort(FRAMES_DIR / row["frames_file"])
         return filename
 
     def load_frames(self, message_id):
         conn = self._conn()
-        row = conn.execute(
-            "SELECT frames_file FROM messages WHERE id = ?", (message_id,)
-        ).fetchone()
-        if row is None or row["frames_file"] is None:
-            raise ValueError(f"no frames for message {message_id}")
-        data = msgpack.unpackb((FRAMES_DIR / row["frames_file"]).read_bytes(), strict_map_key=False)
+        last_missing = None
+        for _attempt in range(2):
+            row = conn.execute(
+                "SELECT frames_file, version FROM messages WHERE id = ?", (message_id,)
+            ).fetchone()
+            if row is None or row["frames_file"] is None:
+                raise ValueError(f"no frames for message {message_id}")
+            frame_file, version = row["frames_file"], row["version"]
+            try:
+                data = msgpack.unpackb((FRAMES_DIR / frame_file).read_bytes(), strict_map_key=False)
+                break
+            except FileNotFoundError as exc:
+                fresh = conn.execute(
+                    "SELECT frames_file, version FROM messages WHERE id = ?", (message_id,)
+                ).fetchone()
+                if fresh is not None and (
+                    fresh["frames_file"] != frame_file or fresh["version"] != version
+                ):
+                    last_missing = exc
+                    continue
+                raise ValueError(f"frame archive missing for message {message_id}") from exc
+            except Exception as exc:
+                raise FrameStorageError(f"could not read frame archive for message {message_id}: {exc}") from exc
+        else:
+            raise ValueError(f"frame archive changed while reading message {message_id}") from last_missing
         vocab = data["vocab"]
         frames = []
         for entry in data["frames"]:
