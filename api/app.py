@@ -198,6 +198,64 @@ async def _retain_worker_task_or_cancel(task, dispatch):
     return task
 
 
+class OperationHandoff:
+    """Owns an acquired operation until a retained worker can take over."""
+
+    def __init__(self, coordinator, token, stop_event=None):
+        self.coordinator = coordinator
+        self.token = token
+        self.stop_event = stop_event
+        self.dispatch = None
+        self.wrapper = None
+        self.task = None
+        self.heavy = {}
+        self.transferred = False
+        self.closed = False
+
+    def set_heavy(self, **refs):
+        self.heavy.update(refs)
+
+    def clear_heavy(self):
+        self.heavy.clear()
+
+    def set_dispatch(self, dispatch):
+        self.dispatch = dispatch
+
+    def set_wrapper(self, wrapper):
+        self.wrapper = wrapper
+
+    def set_task(self, task):
+        self.task = task
+
+    async def create_thread_task(self, worker_factory):
+        try:
+            worker = worker_factory()
+            self.set_heavy(worker=worker)
+            wrapper = asyncio.to_thread(worker)
+            self.set_wrapper(wrapper)
+            task = asyncio.create_task(wrapper)
+            self.wrapper = None
+            self.set_task(task)
+            await _retain_worker_task_or_cancel(task, self.dispatch)
+            self.transferred = True
+            self.clear_heavy()
+            return task
+        except Exception:
+            wrapper = self.wrapper
+            self.wrapper = None
+            if wrapper is not None and hasattr(wrapper, "close"):
+                wrapper.close()
+            self.clear_heavy()
+            if self.dispatch is not None:
+                self.dispatch.cancel_from_awaiter()
+                if self.task is not None:
+                    await _drain_worker_uninterruptibly(self.task)
+            elif self.token is not None and not self.closed:
+                self.coordinator.release(self.token)
+                self.closed = True
+            raise
+
+
 def _retain_worker_task(task):
     _deferred_worker_tasks.add(task)
 
@@ -222,17 +280,35 @@ def _retain_worker_task(task):
 async def _drain_worker_uninterruptibly(task):
     async def _drain():
         return await asyncio.gather(asyncio.shield(task), return_exceptions=True)
-    drain = asyncio.create_task(_drain())
+    drain = None
     cancelled = False
     try:
+        try:
+            drain = asyncio.create_task(_drain())
+        except Exception:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    cancelled = True
+                    current = asyncio.current_task()
+                    if current is not None and hasattr(current, "uncancel"):
+                        current.uncancel()
+            result = await asyncio.gather(task, return_exceptions=True)
+            if cancelled:
+                raise asyncio.CancelledError()
+            return result
         while not drain.done():
             try:
                 await asyncio.shield(drain)
             except asyncio.CancelledError:
                 cancelled = True
+                current = asyncio.current_task()
+                if current is not None and hasattr(current, "uncancel"):
+                    current.uncancel()
         result = drain.result()
     finally:
-        if not drain.done():
+        if drain is not None and not drain.done():
             drain.cancel()
             await asyncio.gather(drain, return_exceptions=True)
     if cancelled:
@@ -1707,46 +1783,63 @@ class NeighborsRequest(BaseModel):
 async def api_token_neighbors(req: NeighborsRequest):
     token = None
     stop_event = ThreadingEvent()
+    handoff = None
     try:
         token, snap = manager.coordinator.acquire(OperationType.MODEL_READ, requires_loaded=True)
+        handoff = OperationHandoff(manager.coordinator, token, stop_event)
+        handoff.set_heavy(snap=snap)
         bundle = snap.bundle
-        key = (snap.model_session_id, dict(bundle.meta).get("model_id"), dict(bundle.meta).get("revision"))
+        meta_copy = dict(bundle.meta)
+        key = (snap.model_session_id, meta_copy.get("model_id"), meta_copy.get("revision"))
+        handoff.set_heavy(bundle=bundle, meta_copy=meta_copy, key=key)
     except OperationConflict as exc:
         raise _conflict(exc)
     except ModelStateError as exc:
         raise HTTPException(422, str(exc))
+    except Exception as exc:
+        detail = str(exc)
+        if handoff is not None:
+            handoff.clear_heavy()
+            manager.coordinator.release(token)
+        elif token is not None:
+            manager.coordinator.release(token)
+        raise HTTPException(500, detail) from None
     try:
         payload = {"bundle": bundle, "key": key, "token_ids": req.token_ids[:64], "k": req.k}
         dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
-    except Exception:
+        handoff.set_dispatch(dispatch)
+    except Exception as exc:
+        detail = str(exc)
+        if handoff is not None:
+            handoff.clear_heavy()
         if token is not None:
             manager.coordinator.release(token)
-        raise
+        raise HTTPException(500, detail) from None
     snap = bundle = payload = None
 
-    def worker():
-        if not dispatch.claim():
-            return _worker_success()
-        payload = dispatch.take_payload()
-        try:
+    def make_worker():
+        def worker():
+            if not dispatch.claim():
+                return _worker_success()
+            payload = dispatch.take_payload()
             try:
-                result = neighbors.lookup(
-                    payload["bundle"].jl, payload["bundle"].tokenizer,
-                    payload["key"], payload["token_ids"], payload["k"],
-                )
-                return _worker_success(result)
-            except Exception as exc:
-                return _worker_failure(exc)
-        finally:
-            payload = result = None
-            dispatch.release_from_worker()
+                try:
+                    result = neighbors.lookup(
+                        payload["bundle"].jl, payload["bundle"].tokenizer,
+                        payload["key"], payload["token_ids"], payload["k"],
+                    )
+                    return _worker_success(result)
+                except Exception as exc:
+                    return _worker_failure(exc)
+            finally:
+                payload = result = None
+                dispatch.release_from_worker()
+        return worker
 
     try:
-        task = asyncio.create_task(asyncio.to_thread(worker))
-    except Exception:
-        dispatch.cancel_from_awaiter()
-        raise
-    await _retain_worker_task_or_cancel(task, dispatch)
+        task = await handoff.create_thread_task(make_worker)
+    except Exception as exc:
+        raise HTTPException(500, str(exc)) from None
     try:
         result = _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -2350,7 +2443,7 @@ def _persisted_generate(req, stop_event, emit, gen_context):
             except Exception as exc:
                 failure_meta = dict(
                     meta, publication_state="frames_publication_failed", frames_expected=True,
-                    frames_error_kind=exc.__class__.__name__, frames_error=str(exc),
+                    frames_error_kind=exc.__class__.__name__, frames_error=str(exc)[:512],
                 )
                 try:
                     marked = store.mark_frame_publication_failed(

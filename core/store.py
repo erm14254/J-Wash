@@ -5,6 +5,8 @@ import os
 import sqlite3
 import threading
 import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -36,6 +38,32 @@ class FramePointerTurnover(RuntimeError):
 
 class FrameFileMissing(FrameStorageError):
     """The committed frame archive is missing from disk."""
+
+
+class StorageMutationError(RuntimeError):
+    """A durable store mutation could not be classified as successful."""
+
+
+class StorageCommitAmbiguous(StorageMutationError):
+    """A commit result could not be reconciled through an independent read."""
+
+
+class StorageMutationSuperseded(StorageMutationError):
+    """A versioned mutation was superseded by a newer durable row."""
+
+
+MAX_FRAME_ERROR_CHARS = 512
+
+
+@dataclass(frozen=True)
+class StorageMutationOutcome:
+    status: str
+    message_id: int | None = None
+    expected_version: int | None = None
+    observed_version: int | None = None
+    mutation: str = ""
+    message: str = ""
+
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
@@ -137,24 +165,60 @@ class Store:
                 conn.close()
             except Exception:
                 pass
-        if hasattr(self._local, "conn"):
-            del self._local.conn
+        if getattr(self._local, "conn", None) is conn or conn is None:
+            if hasattr(self._local, "conn"):
+                del self._local.conn
 
-    def _rollback_or_discard(self, conn):
+    def _abort_transaction_or_discard(self, conn):
         try:
             if conn.in_transaction:
                 conn.rollback()
+            if conn.in_transaction:
+                raise sqlite3.OperationalError("rollback left transaction open")
+            conn.execute("SELECT 1").fetchone()
             return True
         except Exception:
-            log.warning("discarding poisoned sqlite connection after rollback failure", exc_info=True)
+            log.warning("discarding poisoned sqlite connection after transaction abort failure", exc_info=True)
             self._discard_conn(conn)
             return False
+
+    def _rollback_or_discard(self, conn):
+        return self._abort_transaction_or_discard(conn)
+
+    @contextmanager
+    def _independent_read_connection(self):
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        try:
+            yield conn
+        finally:
+            conn.close()
 
     def _fresh_conn(self):
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         return conn
+
+    def _candidate_referenced(self, filename):
+        if not filename:
+            return False
+        try:
+            with self._independent_read_connection() as read:
+                row = read.execute("SELECT 1 FROM messages WHERE frames_file = ? LIMIT 1", (filename,)).fetchone()
+                return row is not None
+        except Exception:
+            log.warning("could not prove candidate %s is unreferenced; preserving it", filename, exc_info=True)
+            return True
+
+    def _unlink_candidate_if_unreferenced(self, filename, path):
+        if path is not None and not self._candidate_referenced(filename):
+            self._unlink_best_effort(path)
+
+    @staticmethod
+    def _bounded_error(exc):
+        return str(exc)[:MAX_FRAME_ERROR_CHARS]
 
     def create_conversation(self, title, tags=None):
         conn = self._conn()
@@ -280,6 +344,7 @@ class Store:
         conn = self._conn()
         message_id = None
         now = _now()
+        meta_sql = json.dumps(meta, ensure_ascii=False) if meta else None
         try:
             conn.execute("BEGIN IMMEDIATE")
             cur = conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM messages")
@@ -293,7 +358,7 @@ class Store:
                     parent_id,
                     role,
                     content,
-                    json.dumps(meta, ensure_ascii=False) if meta else None,
+                    meta_sql,
                     now,
                 ),
             )
@@ -302,20 +367,33 @@ class Store:
                 (now, conversation_id),
             )
             conn.commit()
-        except Exception:
-            clean = self._rollback_or_discard(conn)
-            read = self._fresh_conn() if not clean else conn
+        except Exception as exc:
+            self._abort_transaction_or_discard(conn)
             try:
-                if message_id is not None:
+                with self._independent_read_connection() as read:
+                    if message_id is None:
+                        raise
                     row = read.execute(
-                        "SELECT id, version FROM messages WHERE id = ? AND conversation_id = ?",
-                        (message_id, conversation_id),
+                        "SELECT id, conversation_id, parent_id, role, content, meta, frames_file, version "
+                        "FROM messages WHERE id = ?",
+                        (message_id,),
                     ).fetchone()
-                    if row is not None:
+                    if row is not None and (
+                        row["conversation_id"] == conversation_id
+                        and row["parent_id"] == parent_id
+                        and row["role"] == role
+                        and row["content"] == content
+                        and row["meta"] == meta_sql
+                        and row["frames_file"] is None
+                        and row["version"] == 0
+                    ):
                         return (row["id"], row["version"]) if return_version else row["id"]
-            finally:
-                if read is not conn:
-                    read.close()
+                    if row is not None:
+                        raise StorageCommitAmbiguous(f"message insert {message_id} committed with mismatched state")
+            except StorageCommitAmbiguous:
+                raise
+            except Exception:
+                raise
             raise
         return (message_id, 0) if return_version else message_id
 
@@ -330,7 +408,7 @@ class Store:
             raise ValueError(f"unknown message {message_id}")
         return dict(row)
 
-    def update_message(self, message_id, content, meta=None, *, clear_frames=False):
+    def update_message(self, message_id, content, meta=None, *, clear_frames=False, expected_version=None):
         """Rewrite a message and increment its durable row version.
 
         Assistant edits may clear derived frame/provenance artifacts atomically;
@@ -339,21 +417,47 @@ class Store:
         """
         conn = self._conn()
         row = conn.execute(
-            "SELECT conversation_id, frames_file FROM messages WHERE id = ?", (message_id,)
+            "SELECT conversation_id, frames_file, version FROM messages WHERE id = ?", (message_id,)
         ).fetchone()
         if row is None:
             raise ValueError(f"unknown message {message_id}")
         meta_json = json.dumps(meta, ensure_ascii=False) if meta is not None else None
         frames_file = None if clear_frames else row["frames_file"]
-        conn.execute(
-            "UPDATE messages SET content = ?, meta = ?, frames_file = ?, version = version + 1 WHERE id = ?",
-            (content, meta_json, frames_file, message_id),
-        )
-        conn.execute(
-            "UPDATE conversations SET updated_at = ? WHERE id = ?",
-            (_now(), row["conversation_id"]),
-        )
-        conn.commit()
+        baseline = row["version"] if expected_version is None else expected_version
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "UPDATE messages SET content = ?, meta = ?, frames_file = ?, version = version + 1 "
+                "WHERE id = ? AND version = ?",
+                (content, meta_json, frames_file, message_id, baseline),
+            )
+            if cur.rowcount != 1:
+                self._abort_transaction_or_discard(conn)
+                raise StaleMessageUpdate(f"message {message_id} changed before edit")
+            conn.execute(
+                "UPDATE conversations SET updated_at = ? WHERE id = ?",
+                (_now(), row["conversation_id"]),
+            )
+            conn.commit()
+        except Exception as exc:
+            self._abort_transaction_or_discard(conn)
+            try:
+                with self._independent_read_connection() as read:
+                    current = read.execute(
+                        "SELECT content, meta, frames_file, version FROM messages WHERE id = ?",
+                        (message_id,),
+                    ).fetchone()
+                    if current is not None and (
+                        current["content"] == content
+                        and current["meta"] == meta_json
+                        and current["frames_file"] == frames_file
+                        and current["version"] == baseline + 1
+                    ):
+                        pass
+                    else:
+                        raise
+            except Exception:
+                raise
         if clear_frames and row["frames_file"]:
             self._unlink_best_effort(FRAMES_DIR / row["frames_file"])
 
@@ -424,15 +528,36 @@ class Store:
                 (_now(), row["conversation_id"]),
             )
             conn.commit()
-        except Exception:
-            self._rollback_or_discard(conn)
+        except Exception as exc:
+            self._abort_transaction_or_discard(conn)
+            intended_meta = json.dumps(meta, ensure_ascii=False) if meta is not None else None
+            try:
+                with self._independent_read_connection() as read:
+                    current = read.execute(
+                        "SELECT content, meta, frames_file, version FROM messages WHERE id = ?",
+                        (message_id,),
+                    ).fetchone()
+                    if current is not None and (
+                        current["content"] == content
+                        and current["meta"] == intended_meta
+                        and current["frames_file"] == (frame_file if frame_file is not None else old_file)
+                        and current["version"] == expected_version + 1
+                    ):
+                        if frame_file and old_file and old_file != frame_file:
+                            self._unlink_best_effort(FRAMES_DIR / old_file)
+                        return True
+                    if current is not None and current["version"] != expected_version:
+                        if final_path is not None:
+                            self._unlink_candidate_if_unreferenced(frame_file, final_path)
+                        return False
+            except Exception as reconcile_exc:
+                if final_path is not None and not self._candidate_referenced(frame_file):
+                    log.warning("frame mutation reconciliation failed; preserving candidate if referenced", exc_info=True)
+                raise StorageCommitAmbiguous(
+                    f"could not reconcile message {message_id} mutation: {self._bounded_error(reconcile_exc)}"
+                ) from reconcile_exc
             if final_path is not None:
-                current = conn.execute("SELECT frames_file FROM messages WHERE id = ?", (message_id,)).fetchone()
-                if current is not None and current["frames_file"] == frame_file:
-                    if old_file and old_file != frame_file:
-                        self._unlink_best_effort(FRAMES_DIR / old_file)
-                    return True
-                self._unlink_best_effort(final_path)
+                self._unlink_candidate_if_unreferenced(frame_file, final_path)
             raise
         if frame_file and old_file and old_file != frame_file:
             self._unlink_best_effort(FRAMES_DIR / old_file)
@@ -491,6 +616,7 @@ class Store:
     def mark_frame_publication_failed(self, message_id, *, expected_version, failure_meta):
         conn = self._conn()
         meta_sql = json.dumps(failure_meta, ensure_ascii=False)
+        intended_version = expected_version + 1
         try:
             conn.execute("BEGIN IMMEDIATE")
             cur = conn.execute(
@@ -504,8 +630,44 @@ class Store:
             conn.commit()
             return True
         except Exception:
-            self._rollback_or_discard(conn)
-            raise
+            self._abort_transaction_or_discard(conn)
+            try:
+                with self._independent_read_connection() as read:
+                    row = read.execute(
+                        "SELECT meta, frames_file, version FROM messages WHERE id = ?",
+                        (message_id,),
+                    ).fetchone()
+                    if row is not None and (
+                        row["meta"] == meta_sql
+                        and row["frames_file"] is None
+                        and row["version"] == intended_version
+                    ):
+                        return True
+                    if row is not None and row["version"] != expected_version:
+                        return False
+                    if row is not None and row["version"] == expected_version:
+                        retry_conn = self._conn()
+                        try:
+                            retry_conn.execute("BEGIN IMMEDIATE")
+                            cur = retry_conn.execute(
+                                "UPDATE messages SET meta = ?, frames_file = NULL, version = version + 1 "
+                                "WHERE id = ? AND version = ?",
+                                (meta_sql, message_id, expected_version),
+                            )
+                            if cur.rowcount == 1:
+                                retry_conn.commit()
+                                return True
+                            self._abort_transaction_or_discard(retry_conn)
+                            return False
+                        except Exception:
+                            self._abort_transaction_or_discard(retry_conn)
+                            raise
+            except Exception as reconcile_exc:
+                raise StorageCommitAmbiguous(
+                    f"could not reconcile frame-failure terminalization for message {message_id}: "
+                    f"{self._bounded_error(reconcile_exc)}"
+                ) from reconcile_exc
+            raise StorageCommitAmbiguous(f"message {message_id} frame-failure terminalization is ambiguous")
 
     def save_frames(self, message_id, frames, layers, k, *, expected_version=None, complete_meta=None):
         conn = self._conn()
@@ -539,20 +701,35 @@ class Store:
                 raise StaleMessageUpdate(f"message {message_id} changed before frames attached")
             conn.commit()
             committed = True
-        except Exception:
-            clean = self._rollback_or_discard(conn)
-            read_conn = self._fresh_conn() if not clean else conn
-            current = read_conn.execute("SELECT frames_file FROM messages WHERE id = ?", (message_id,)).fetchone()
+        except Exception as exc:
+            if isinstance(exc, StaleMessageUpdate):
+                self._abort_transaction_or_discard(conn)
+                self._unlink_candidate_if_unreferenced(filename, final_path)
+                raise
             try:
-                if current is not None and current["frames_file"] == filename:
+                self._abort_transaction_or_discard(conn)
+                with self._independent_read_connection() as read_conn:
+                    current = read_conn.execute(
+                        "SELECT frames_file, meta, version FROM messages WHERE id = ?",
+                        (message_id,),
+                    ).fetchone()
+                meta_matches = complete_meta is None or (
+                    current is not None and current["meta"] == json.dumps(complete_meta, ensure_ascii=False)
+                )
+                if current is not None and current["frames_file"] == filename and current["version"] == baseline + 1 and meta_matches:
                     if old_file and old_file != filename:
                         self._unlink_best_effort(FRAMES_DIR / old_file)
                     return filename
-                self._unlink_best_effort(final_path)
-                raise
-            finally:
-                if read_conn is not conn:
-                    read_conn.close()
+                self._unlink_candidate_if_unreferenced(filename, final_path)
+            except Exception as reconcile_exc:
+                if isinstance(reconcile_exc, StorageMutationError):
+                    raise
+                if not self._candidate_referenced(filename):
+                    self._unlink_best_effort(final_path)
+                raise StorageCommitAmbiguous(
+                    f"could not reconcile frame save for message {message_id}: {self._bounded_error(reconcile_exc)}"
+                ) from reconcile_exc
+            raise
         if old_file and old_file != filename:
             self._unlink_best_effort(FRAMES_DIR / old_file)
         return filename
@@ -587,13 +764,29 @@ class Store:
         try:
             if not isinstance(data, dict) or data.get("version") != 1:
                 raise ValueError("unsupported frame archive version")
+            if not isinstance(data.get("k"), int) or data["k"] < 0:
+                raise ValueError("invalid frame archive k")
+            if not isinstance(data.get("layers"), list) or any(not isinstance(l, int) or l < 0 for l in data["layers"]):
+                raise ValueError("invalid frame archive layers")
+            if len(set(data["layers"])) != len(data["layers"]):
+                raise ValueError("duplicate frame archive layers")
             vocab = data["vocab"]
             if not isinstance(vocab, dict) or not isinstance(data.get("frames"), list):
                 raise ValueError("invalid frame archive structure")
             frames = []
+            last_pos = -1
             for entry in data["frames"]:
                 if not isinstance(entry, dict) or not isinstance(entry.get("layers"), dict):
                     raise ValueError("invalid frame entry")
+                if entry.get("phase") not in ("prompt", "gen"):
+                    raise ValueError("invalid frame phase")
+                if not isinstance(entry.get("pos"), int) or entry["pos"] < 0 or entry["pos"] < last_pos:
+                    raise ValueError("invalid frame position")
+                last_pos = entry["pos"]
+                if not isinstance(entry.get("token_id"), int):
+                    raise ValueError("invalid frame token id")
+                if set(int(l) for l in entry["layers"].keys()) != set(data["layers"]):
+                    raise ValueError("frame layers do not match archive layers")
                 frame = {
                     "type": "frame",
                     "phase": entry["phase"],
@@ -613,6 +806,10 @@ class Store:
                     m_rank_arr = np.frombuffer(d["m_rank"], np.int32)
                     if len(ids_arr) != len(p_arr) or len(m_ids_arr) != len(m_p_arr) or len(m_ids_arr) != len(m_rank_arr):
                         raise ValueError("frame vector length mismatch")
+                    if len(ids_arr) != data["k"] or len(m_ids_arr) != data["k"]:
+                        raise ValueError("frame vector length does not match k")
+                    if not np.all(np.isfinite(p_arr.astype(np.float32))) or not np.all(np.isfinite(m_p_arr.astype(np.float32))):
+                        raise ValueError("frame probabilities must be finite")
                     ids = ids_arr.tolist()
                     m_ids = m_ids_arr.tolist()
                     frame["layers"][layer] = {
