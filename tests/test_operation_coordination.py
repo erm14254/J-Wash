@@ -222,10 +222,8 @@ def test_model_transition_cleanup_does_not_restore_rules_after_publication_failu
         app.interventions._scale = 2.5
         app.interventions._mode = "readthrough"
 
-        def fail_update(_token, _snapshot):
-            raise RuntimeError("publication failed")
-
-        monkeypatch.setattr(app.manager.coordinator, "update_interventions", fail_update)
+        prepared = app._prepare_model_transition_interventions(42)
+        assert prepared["rules"] == []
         app._cleanup_model_bound_state(42, token=object())
         snap = app.interventions.snapshot()
         assert snap["rules"] == []

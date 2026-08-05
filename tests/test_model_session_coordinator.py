@@ -154,6 +154,7 @@ def test_snapshot_copy_hook_runs_after_lock_release_and_does_not_block_release()
     active, _ = c.acquire(OperationType.GENERATE, requires_loaded=True)
     entered = threading.Event()
     unblock = threading.Event()
+    first_call = threading.Event()
     hook_assertions = []
 
     def blocking_hook(_value):
@@ -193,6 +194,9 @@ def test_status_snapshot_does_not_retain_bundle_during_outward_construction():
     unblock = threading.Event()
 
     def blocking_hook(_value):
+        if first_call.is_set():
+            return
+        first_call.set()
         entered.set()
         assert unblock.wait(2), "status outward construction was not unblocked"
 
@@ -208,6 +212,7 @@ def test_status_snapshot_does_not_retain_bundle_during_outward_construction():
     thread = threading.Thread(target=status_worker)
     thread.start()
     assert entered.wait(2), "status outward construction did not reach hook"
+    c._copy_hook = None
     unload, _ = c.acquire(OperationType.UNLOAD, include_bundle=False)
     old, _, changed = c.withdraw_loaded(unload)
     assert changed
@@ -218,7 +223,6 @@ def test_status_snapshot_does_not_retain_bundle_during_outward_construction():
     assert model_ref() is None
     unblock.set()
     thread.join(2)
-    c._copy_hook = None
     assert not thread.is_alive(), "status outward construction did not finish"
     assert errors == []
 
