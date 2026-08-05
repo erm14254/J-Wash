@@ -413,8 +413,14 @@ def test_persisted_continue_records_segment_provenance(monkeypatch):
         def path_to_root(self, message_id):
             return [{"role": "user", "content": "u"}, {"role": "assistant", "content": "old"}]
 
-        def update_message(self, message_id, content, meta=None):
+        def update_message_and_frames_if_unchanged(
+            self, message_id, expected_content, expected_meta, content, meta=None, **kwargs
+        ):
+            assert expected_content == "old"
+            assert expected_meta == json.dumps(self.meta)
+            assert kwargs.get("frames") is None
             self.updated = (message_id, content, meta)
+            return True
 
         def save_frames(self, *args, **kwargs):
             raise AssertionError("no lens frames expected")
