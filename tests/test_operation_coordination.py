@@ -1120,6 +1120,7 @@ def test_load_frames_rejects_semantic_archive_corruption(tmp_path, monkeypatch):
         ("duplicate-layers", {"layers": [0, 0]}),
         ("invalid-phase", {"frames": [{"phase": "bad"}]}),
         ("invalid-layer-key", {"frames": [{"layers": {"01": {}}}]}),
+        ("mixed-script-layer-key", {"frames": [{"layers": {"١": {}}}]}),
         ("bytes-layer-key", {"frames": [{"layers": {b"0": {}}}]}),
         ("float-layer-key", {"frames": [{"layers": {0.0: {}}}]}),
         ("bool-layer-key", {"frames": [{"layers": {True: {}}}]}),
@@ -1145,3 +1146,160 @@ def test_load_frames_rejects_semantic_archive_corruption(tmp_path, monkeypatch):
         conn.commit()
         with pytest.raises(store_mod.FrameStorageError):
             s.load_frames(mid)
+
+
+def test_persisted_continue_drops_overlapping_reread_frames_and_reloads(tmp_path, monkeypatch):
+    from api import app
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    monkeypatch.setattr(app, "store", s)
+    cid = s.create_conversation("c")
+    mid = s.add_message(
+        cid,
+        None,
+        "assistant",
+        "old",
+        meta={"publication_state": "complete", "frames_lens_binding_id": 7, "frames_layers": [0], "frames_k": 1},
+    )
+    s.save_frames(mid, [_frame(0, "reading", "0"), _frame(1, "thinking", "0")], [0], 1)
+    emitted = []
+
+    def generate_first(**kwargs):
+        kwargs["emit"]({"type": "frame", **_frame(1, "reading", "0")})
+        kwargs["emit"]({"type": "frame", **_frame(2, "thinking", "0")})
+        kwargs["emit"]({"type": "done", "text": " plus", "meta": {"model_id": "m"}, "stats": {}, "stopped": False})
+
+    monkeypatch.setattr(app.manager, "generate", generate_first)
+    context = type("Ctx", (), {"lens": type("Lens", (), {"layers": [0], "k": 1, "binding_id": 7})(), "intervention_snapshot": {"rules": []}})()
+    app._persisted_continue({}, mid, threading.Event(), emitted.append, context)
+    loaded = s.load_frames(mid)
+    assert [frame["pos"] for frame in loaded["frames"]] == [0, 1, 2]
+    assert [frame["phase"] for frame in loaded["frames"]] == ["reading", "thinking", "thinking"]
+
+    def generate_second(**kwargs):
+        kwargs["emit"]({"type": "frame", **_frame(2, "reading", "0")})
+        kwargs["emit"]({"type": "frame", **_frame(3, "thinking", "0")})
+        kwargs["emit"]({"type": "done", "text": " again", "meta": {"model_id": "m"}, "stats": {}, "stopped": False})
+
+    monkeypatch.setattr(app.manager, "generate", generate_second)
+    app._persisted_continue({}, mid, threading.Event(), emitted.append, context)
+    loaded = s.load_frames(mid)
+    assert [frame["pos"] for frame in loaded["frames"]] == [0, 1, 2, 3]
+    body, _ = s.export(cid, fmt="md", include_frames=True)
+    assert "4 lens frames" in body
+
+
+def test_persisted_continue_rejects_incompatible_frame_configuration(tmp_path, monkeypatch):
+    from api import app
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    monkeypatch.setattr(app, "store", s)
+    cid = s.create_conversation("c")
+    mid = s.add_message(cid, None, "assistant", "old", meta={"frames_lens_binding_id": 7})
+    s.save_frames(mid, [_frame(0, "thinking", "0")], [0], 1)
+    before = s.get_message(mid)
+
+    def generate(**kwargs):
+        kwargs["emit"]({"type": "frame", **_frame(1, "thinking", "0")})
+        kwargs["emit"]({"type": "done", "text": " plus", "meta": {}, "stats": {}, "stopped": False})
+
+    monkeypatch.setattr(app.manager, "generate", generate)
+    emitted = []
+    changed_layers = type("Ctx", (), {"lens": type("Lens", (), {"layers": [1], "k": 1, "binding_id": 7})(), "intervention_snapshot": {"rules": []}})()
+    app._persisted_continue({}, mid, threading.Event(), emitted.append, changed_layers)
+    after = s.get_message(mid)
+    assert after["content"] == before["content"]
+    assert after["version"] == before["version"]
+    assert emitted[-1]["type"] == "error"
+
+
+def test_lens_disabled_continuation_invalidates_existing_frames(tmp_path, monkeypatch):
+    from api import app
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    monkeypatch.setattr(app, "store", s)
+    cid = s.create_conversation("c")
+    mid = s.add_message(cid, None, "assistant", "old", meta={"publication_state": "complete"})
+    old_file = s.save_frames(mid, [_frame(0, "thinking", "0")], [0], 1)
+
+    def generate(**kwargs):
+        kwargs["emit"]({"type": "done", "text": " plus", "meta": {}, "stats": {}, "stopped": False})
+
+    monkeypatch.setattr(app.manager, "generate", generate)
+    context = type("Ctx", (), {"lens": None, "intervention_snapshot": {"rules": []}})()
+    emitted = []
+    app._persisted_continue({}, mid, threading.Event(), emitted.append, context)
+    current = s.get_message(mid)
+    assert current["content"] == "old plus"
+    assert current["frames_file"] is None
+    meta = current["meta"] if isinstance(current["meta"], dict) else json.loads(current["meta"])
+    assert meta["frames_invalidated"] is True
+    assert not (store_mod.FRAMES_DIR / old_file).exists()
+
+
+def test_lens_disabled_continuation_fails_closed_on_missing_frames(tmp_path, monkeypatch):
+    from api import app
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    monkeypatch.setattr(app, "store", s)
+    cid = s.create_conversation("c")
+    mid = s.add_message(cid, None, "assistant", "old")
+    conn = s._conn()
+    conn.execute("UPDATE messages SET frames_file = ?, version = version + 1 WHERE id = ?", ("missing.msgpack", mid))
+    conn.commit()
+    before = s.get_message(mid)
+
+    def generate(**kwargs):
+        kwargs["emit"]({"type": "done", "text": " plus", "meta": {}, "stats": {}, "stopped": False})
+
+    monkeypatch.setattr(app.manager, "generate", generate)
+    context = type("Ctx", (), {"lens": None, "intervention_snapshot": {"rules": []}})()
+    emitted = []
+    app._persisted_continue({}, mid, threading.Event(), emitted.append, context)
+    after = s.get_message(mid)
+    assert after["content"] == before["content"]
+    assert after["version"] == before["version"]
+    assert emitted[-1]["type"] == "error"
+
+
+def test_frame_candidate_validation_failure_leaves_old_row_unchanged(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c")
+    mid, version = s.add_message(cid, None, "assistant", "old", return_version=True)
+    old = s.get_message(mid)
+    monkeypatch.setattr(s, "_validate_frame_candidate", lambda *args, **kwargs: (_ for _ in ()).throw(store_mod.FrameStorageError("bad candidate")))
+    with pytest.raises(store_mod.FrameStorageError):
+        s.update_message_and_frames_if_unchanged(mid, version, "new", {}, frames=[_frame(1)], layers=[0], k=1)
+    assert s.get_message(mid)["content"] == old["content"]
+    assert s.get_message(mid)["version"] == old["version"]
+    assert not list(store_mod.FRAMES_DIR.glob("*.msgpack"))
+
+
+def test_operation_handoff_can_own_acquisition_before_setup():
+    from api import app
+
+    c = ModelSessionCoordinator()
+    handoff = app.OperationHandoff(c, threading.Event())
+    assert handoff.state is app.HandoffState.NEW
+    token, snap = handoff.acquire(OperationType.GENERATE)
+    assert token is handoff.token
+    assert handoff.state is app.HandoffState.PREPARING
+    assert handoff.heavy["snap"] is snap
+    handoff.clear_heavy()
+    c.release(token)

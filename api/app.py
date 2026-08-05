@@ -200,6 +200,7 @@ async def _retain_worker_task_or_cancel(task, dispatch):
 
 
 class HandoffState(Enum):
+    NEW = "NEW"
     ACQUIRED = "ACQUIRED"
     PREPARING = "PREPARING"
     DISPATCH_READY = "DISPATCH_READY"
@@ -213,7 +214,9 @@ class HandoffState(Enum):
 class OperationHandoff:
     """Owns an acquired operation until a retained worker can take over."""
 
-    def __init__(self, coordinator, token, stop_event=None):
+    def __init__(self, coordinator, token=None, stop_event=None):
+        if stop_event is None and hasattr(token, "set") and hasattr(token, "is_set"):
+            stop_event, token = token, None
         self.coordinator = coordinator
         self.token = token
         self.stop_event = stop_event
@@ -223,10 +226,11 @@ class OperationHandoff:
         self.heavy = {}
         self.transferred = False
         self.closed = False
-        self.state = HandoffState.ACQUIRED
+        self.state = HandoffState.ACQUIRED if token is not None else HandoffState.NEW
 
     def _set_state(self, state):
         allowed = {
+            HandoffState.NEW: {HandoffState.ACQUIRED, HandoffState.CLOSED},
             HandoffState.ACQUIRED: {HandoffState.PREPARING, HandoffState.DISPATCH_READY, HandoffState.CLOSED},
             HandoffState.PREPARING: {HandoffState.PREPARING, HandoffState.DISPATCH_READY, HandoffState.CLOSED},
             HandoffState.DISPATCH_READY: {HandoffState.WRAPPER_READY, HandoffState.CLOSED},
@@ -240,8 +244,17 @@ class OperationHandoff:
             raise RuntimeError(f"invalid operation handoff transition {self.state.value}->{state.value}")
         self.state = state
 
+    def acquire(self, operation_type, **kwargs):
+        if self.closed or self.state is not HandoffState.NEW:
+            raise RuntimeError("operation handoff acquire is not available")
+        token, snap = self.coordinator.acquire(operation_type, **kwargs)
+        self._set_state(HandoffState.ACQUIRED)
+        self.token = token
+        self.set_heavy(snap=snap)
+        return token, snap
+
     def set_heavy(self, **refs):
-        if self.closed:
+        if self.closed or self.transferred:
             raise RuntimeError("handoff is closed")
         if self.state in (HandoffState.ACQUIRED, HandoffState.PREPARING):
             self._set_state(HandoffState.PREPARING)
@@ -255,18 +268,18 @@ class OperationHandoff:
             raise RuntimeError("handoff is closed")
         if self.dispatch is not None:
             raise RuntimeError("operation handoff dispatch already set")
-        self.dispatch = dispatch
         self._set_state(HandoffState.DISPATCH_READY)
+        self.dispatch = dispatch
 
     def set_wrapper(self, wrapper):
-        self.wrapper = wrapper
         self._set_state(HandoffState.WRAPPER_READY)
+        self.wrapper = wrapper
 
     def set_task(self, task):
         if self.dispatch is None:
             raise RuntimeError("operation handoff task requires dispatch")
-        self.task = task
         self._set_state(HandoffState.TASK_CREATED)
+        self.task = task
 
     async def create_thread_task(self, worker_factory):
         primary_error = None
@@ -2332,7 +2345,16 @@ def api_conversation(cid: int):
 
 @app.patch("/api/conversations/{cid}")
 def api_conversation_patch(cid: int, req: ConversationPatch):
-    store.update_conversation(cid, title=req.title, tags=req.tags)
+    try:
+        outcome = store.update_conversation(cid, title=req.title, tags=req.tags)
+    except StorageCommitAmbiguous as exc:
+        raise HTTPException(500, str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from None
+    if getattr(outcome, "state", "committed") == "superseded":
+        raise HTTPException(409, "conversation changed before update completed")
+    if getattr(outcome, "state", "committed") != "committed":
+        raise HTTPException(500, "conversation update did not commit")
     return {"ok": True}
 
 
@@ -2480,7 +2502,12 @@ def _persisted_generate(req, stop_event, emit, gen_context):
             return_version=True,
         )
         if frames_acc:
-            complete_meta = dict(meta, publication_state="complete", frames_expected=True)
+            complete_meta = dict(
+                meta,
+                publication_state="complete",
+                frames_expected=True,
+                **_frames_lens_signature(lens, layers_used, k_used),
+            )
             try:
                 store.save_frames(
                     message_id, frames_acc, layers_used, k_used,
@@ -2547,6 +2574,33 @@ def _continuation_metadata(previous_meta, start_offset, end_offset, done_meta, s
     return merged
 
 
+def _frames_lens_signature(lens, layers, k):
+    if lens is None:
+        return {"frames_lens_binding_id": None, "frames_layers": [], "frames_k": 0}
+    return {
+        "frames_lens_binding_id": getattr(lens, "binding_id", None),
+        "frames_layers": [int(l) for l in layers],
+        "frames_k": int(k),
+    }
+
+
+def _merge_continuation_frames(existing_archive, new_frames, layers, k, previous_meta, lens):
+    if existing_archive["layers"] != [int(l) for l in layers] or existing_archive["k"] != int(k):
+        raise ValueError("continuation lens frame configuration changed")
+    previous_binding = (previous_meta or {}).get("frames_lens_binding_id")
+    current_binding = getattr(lens, "binding_id", None)
+    if previous_binding is not None and current_binding is not None and previous_binding != current_binding:
+        raise ValueError("continuation lens binding changed")
+    old_frames = list(existing_archive["frames"] or [])
+    old_positions = {frame.get("pos") for frame in old_frames}
+    max_old_pos = max(old_positions) if old_positions else -1
+    append = [frame for frame in new_frames if frame.get("pos") not in old_positions and frame.get("pos", -1) > max_old_pos]
+    merged = old_frames + append
+    if any(merged[i].get("pos") > merged[i + 1].get("pos") for i in range(len(merged) - 1)):
+        raise ValueError("continuation frames are not ordered after merge")
+    return merged
+
+
 def _persisted_continue(req, message_id, stop_event, emit, gen_context):
     """Extend an existing assistant reply: generate with the turn left open,
     append the text to the message, and merge the new lens frames into its
@@ -2587,17 +2641,32 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
         done_holder.get("meta"), done_holder.get("stats"), done_holder.get("stopped"),
     )
     merged = None
+    clear_frames = False
     if frames_acc:
+        meta.update(_frames_lens_signature(lens, layers_used, k_used))
         merged = frames_acc
         if msg.get("frames_file"):
             try:
-                merged = store.load_frames(message_id)["frames"] + frames_acc
-            except Exception:
-                emit({"type": "error", "message": "could not load existing frames; continuation not persisted"})
+                existing_archive = store.load_frames(message_id)
+                merged = _merge_continuation_frames(existing_archive, frames_acc, layers_used, k_used, previous_meta, lens)
+            except Exception as exc:
+                emit({"type": "error", "message": f"could not merge existing frames; continuation not persisted: {exc}"})
                 return
+    elif msg.get("frames_file") and lens is None:
+        try:
+            store.load_frames(message_id)
+        except Exception as exc:
+            emit({"type": "error", "message": f"could not load existing frames; continuation not persisted: {exc}"})
+            return
+        clear_frames = True
+        meta.update(
+            frames_expected=False,
+            frames_invalidated=True,
+            frames_invalidation_reason="lens_disabled_continuation",
+        )
     if not store.update_message_and_frames_if_unchanged(
         message_id, expected_version, new_content, meta,
-        frames=merged, layers=layers_used, k=k_used,
+        frames=merged, layers=layers_used, k=k_used, clear_frames=clear_frames,
     ):
         emit({"type": "error", "message": "message changed during continuation; retry"})
         return

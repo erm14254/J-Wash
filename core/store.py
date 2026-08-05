@@ -96,7 +96,7 @@ def _normalize_frame_layer_key(key):
     if isinstance(key, str):
         if key == "0":
             return 0
-        if key and key[0] in "123456789" and key.isdecimal():
+        if key and key.isascii() and key[0] in "123456789" and key.isdecimal():
             return int(key)
         raise ValueError("invalid frame layer key")
     raise ValueError("invalid frame layer key")
@@ -313,16 +313,19 @@ class Store:
 
     def update_conversation(self, conversation_id, title=None, tags=None):
         conn = self._conn()
-        current = conn.execute(
-            "SELECT title, tags FROM conversations WHERE id = ?", (conversation_id,)
-        ).fetchone()
-        if current is None:
-            raise ValueError(f"unknown conversation {conversation_id}")
-        new_title = current["title"] if title is None else title
-        new_tags = current["tags"] if tags is None else json.dumps(tags)
+        new_title = None
+        new_tags = None
         now = _now()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            current = conn.execute(
+                "SELECT title, tags FROM conversations WHERE id = ?", (conversation_id,)
+            ).fetchone()
+            if current is None:
+                self._abort_transaction_or_discard(conn)
+                raise ValueError(f"unknown conversation {conversation_id}")
+            new_title = current["title"] if title is None else title
+            new_tags = current["tags"] if tags is None else json.dumps(tags)
             cur = conn.execute(
                 "UPDATE conversations SET title = ?, tags = ?, updated_at = ? WHERE id = ?",
                 (new_title, new_tags, now, conversation_id),
@@ -625,12 +628,17 @@ class Store:
                 log.warning("failed to clean frame candidate %s", final, exc_info=True)
             raise FrameStorageError(str(exc)) from exc
 
-    def update_message_and_frames_if_unchanged(self, message_id, expected_version, content, meta=None, *, frames=None, layers=None, k=0):
+    def update_message_and_frames_if_unchanged(self, message_id, expected_version, content, meta=None, *, frames=None, layers=None, k=0, clear_frames=False):
         frame_file = None
         final_path = None
         if frames:
             frame_blob = self._pack_frames_blob(frames, layers or [], k)
             frame_file, final_path = self._write_unique_frame_candidate(message_id, expected_version, frame_blob)
+            try:
+                self._validate_frame_candidate(final_path, message_id)
+            except Exception:
+                self._unlink_best_effort(final_path)
+                raise
         conn = self._conn()
         old_file = None
         try:
@@ -643,7 +651,7 @@ class Store:
                 self._rollback_or_discard(conn)
                 raise ValueError(f"unknown message {message_id}")
             old_file = row["frames_file"]
-            target_frame = frame_file if frame_file is not None else old_file
+            target_frame = None if clear_frames else (frame_file if frame_file is not None else old_file)
             meta_json = json.dumps(meta, ensure_ascii=False) if meta is not None else None
             cur = conn.execute(
                 "UPDATE messages SET content = ?, meta = ?, frames_file = ?, version = version + 1 "
@@ -672,7 +680,7 @@ class Store:
                     if current is not None and (
                         current["content"] == content
                         and current["meta"] == intended_meta
-                        and current["frames_file"] == (frame_file if frame_file is not None else old_file)
+                        and current["frames_file"] == target_frame
                         and current["version"] == expected_version + 1
                     ):
                         if frame_file and old_file and old_file != frame_file:
@@ -691,7 +699,7 @@ class Store:
             if final_path is not None:
                 self._unlink_candidate_if_unreferenced(frame_file, final_path)
             raise
-        if frame_file and old_file and old_file != frame_file:
+        if (frame_file or clear_frames) and old_file and old_file != frame_file:
             self._unlink_best_effort(FRAMES_DIR / old_file)
         return True
 
@@ -812,6 +820,11 @@ class Store:
         filename, final_path = self._write_unique_frame_candidate(
             message_id, baseline, self._pack_frames_blob(frames, layers, k)
         )
+        try:
+            self._validate_frame_candidate(final_path, message_id)
+        except Exception:
+            self._unlink_best_effort(final_path)
+            raise
         old_file = row["frames_file"]
         committed = False
         try:
@@ -866,45 +879,33 @@ class Store:
             self._unlink_best_effort(FRAMES_DIR / old_file)
         return filename
 
-    def load_frames(self, message_id):
-        conn = self._conn()
-        last_missing = None
-        for _attempt in range(2):
-            row = conn.execute(
-                "SELECT frames_file, version FROM messages WHERE id = ?", (message_id,)
-            ).fetchone()
-            if row is None or row["frames_file"] is None:
-                raise FramesNotAttached(f"no frames for message {message_id}")
-            frame_file, version = row["frames_file"], row["version"]
-            try:
-                data = msgpack.unpackb((FRAMES_DIR / frame_file).read_bytes(), strict_map_key=False)
-                break
-            except FileNotFoundError as exc:
-                fresh = conn.execute(
-                    "SELECT frames_file, version FROM messages WHERE id = ?", (message_id,)
-                ).fetchone()
-                if fresh is not None and (
-                    fresh["frames_file"] != frame_file or fresh["version"] != version
-                ):
-                    last_missing = exc
-                    continue
-                raise FrameFileMissing(f"frame archive missing for message {message_id}") from exc
-            except Exception as exc:
-                raise FrameStorageError(f"could not read frame archive for message {message_id}: {exc}") from exc
-        else:
-            raise FramePointerTurnover(f"frame archive changed while reading message {message_id}") from last_missing
+    def _validate_frame_candidate(self, final_path, message_id):
+        try:
+            data = msgpack.unpackb(final_path.read_bytes(), strict_map_key=False)
+            self._decode_frames_data(data, message_id)
+        except FrameStorageError:
+            raise
+        except Exception as exc:
+            raise FrameStorageError(f"candidate frame archive for message {message_id} is invalid: {exc}") from exc
+
+    def _decode_frames_data(self, data, message_id):
         try:
             if not isinstance(data, dict) or data.get("version") != 1:
                 raise ValueError("unsupported frame archive version")
-            if not isinstance(data.get("k"), int) or data["k"] < 0:
+            if isinstance(data.get("k"), bool) or not isinstance(data.get("k"), int) or data["k"] < 0:
                 raise ValueError("invalid frame archive k")
-            if not isinstance(data.get("layers"), list) or any(not isinstance(l, int) or l < 0 for l in data["layers"]):
+            if (
+                not isinstance(data.get("layers"), list)
+                or any(isinstance(l, bool) or not isinstance(l, int) or l < 0 for l in data["layers"])
+            ):
                 raise ValueError("invalid frame archive layers")
             if len(set(data["layers"])) != len(data["layers"]):
                 raise ValueError("duplicate frame archive layers")
             vocab = data["vocab"]
             if not isinstance(vocab, dict) or not isinstance(data.get("frames"), list):
                 raise ValueError("invalid frame archive structure")
+            if any(not isinstance(key, str) or not isinstance(value, str) for key, value in vocab.items()):
+                raise ValueError("invalid frame archive vocabulary")
             frames = []
             last_pos = -1
             for entry in data["frames"]:
@@ -912,10 +913,15 @@ class Store:
                     raise ValueError("invalid frame entry")
                 if entry.get("phase") not in SUPPORTED_FRAME_PHASES:
                     raise ValueError("invalid frame phase")
-                if not isinstance(entry.get("pos"), int) or entry["pos"] < 0 or entry["pos"] < last_pos:
+                if (
+                    isinstance(entry.get("pos"), bool)
+                    or not isinstance(entry.get("pos"), int)
+                    or entry["pos"] < 0
+                    or entry["pos"] < last_pos
+                ):
                     raise ValueError("invalid frame position")
                 last_pos = entry["pos"]
-                if not isinstance(entry.get("token_id"), int):
+                if isinstance(entry.get("token_id"), bool) or not isinstance(entry.get("token_id"), int) or entry["token_id"] < 0:
                     raise ValueError("invalid frame token id")
                 normalized_layers = {}
                 for raw_layer, layer_data in entry["layers"].items():
@@ -925,7 +931,9 @@ class Store:
                     normalized_layers[layer_id] = layer_data
                 if set(normalized_layers) != set(data["layers"]):
                     raise ValueError("frame layers do not match archive layers")
-                if data.get("gen") is not None and (not isinstance(data.get("gen"), int) or data.get("gen") < 0):
+                if data.get("gen") is not None and (
+                    isinstance(data.get("gen"), bool) or not isinstance(data.get("gen"), int) or data.get("gen") < 0
+                ):
                     raise ValueError("invalid frame generation index")
                 frame = {
                     "type": "frame",
@@ -965,6 +973,36 @@ class Store:
             return {"k": data["k"], "layers": [int(l) for l in data["layers"]], "frames": frames}
         except Exception as exc:
             raise FrameStorageError(f"corrupt frame archive for message {message_id}: {exc}") from exc
+
+
+    def load_frames(self, message_id):
+        conn = self._conn()
+        last_missing = None
+        for _attempt in range(2):
+            row = conn.execute(
+                "SELECT frames_file, version FROM messages WHERE id = ?", (message_id,)
+            ).fetchone()
+            if row is None or row["frames_file"] is None:
+                raise FramesNotAttached(f"no frames for message {message_id}")
+            frame_file, version = row["frames_file"], row["version"]
+            try:
+                data = msgpack.unpackb((FRAMES_DIR / frame_file).read_bytes(), strict_map_key=False)
+                break
+            except FileNotFoundError as exc:
+                fresh = conn.execute(
+                    "SELECT frames_file, version FROM messages WHERE id = ?", (message_id,)
+                ).fetchone()
+                if fresh is not None and (
+                    fresh["frames_file"] != frame_file or fresh["version"] != version
+                ):
+                    last_missing = exc
+                    continue
+                raise FrameFileMissing(f"frame archive missing for message {message_id}") from exc
+            except Exception as exc:
+                raise FrameStorageError(f"could not read frame archive for message {message_id}: {exc}") from exc
+        else:
+            raise FramePointerTurnover(f"frame archive changed while reading message {message_id}") from last_missing
+        return self._decode_frames_data(data, message_id)
 
     def export(self, conversation_id, fmt="json", include_frames=False):
         conv = self.get_conversation(conversation_id)
