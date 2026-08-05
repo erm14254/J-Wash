@@ -57,12 +57,27 @@ MAX_FRAME_ERROR_CHARS = 512
 
 @dataclass(frozen=True)
 class StorageMutationOutcome:
-    status: str
+    state: str
+    mutation: str
     message_id: int | None = None
     expected_version: int | None = None
     observed_version: int | None = None
-    mutation: str = ""
-    message: str = ""
+    error_kind: str | None = None
+    error_message: str | None = None
+
+    @property
+    def committed(self):
+        return self.state == "committed"
+
+    @property
+    def status(self):
+        return self.state
+
+    def __bool__(self):
+        return self.committed
+
+
+SUPPORTED_FRAME_PHASES = frozenset({"reading", "thinking", "prompt", "gen"})
 
 
 SCHEMA = """
@@ -175,7 +190,7 @@ class Store:
                 conn.rollback()
             if conn.in_transaction:
                 raise sqlite3.OperationalError("rollback left transaction open")
-            conn.execute("SELECT 1").fetchone()
+            conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='messages'").fetchone()
             return True
         except Exception:
             log.warning("discarding poisoned sqlite connection after transaction abort failure", exc_info=True)
@@ -187,13 +202,15 @@ class Store:
 
     @contextmanager
     def _independent_read_connection(self):
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
+        conn = None
         try:
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys=ON")
             yield conn
         finally:
-            conn.close()
+            if conn is not None:
+                conn.close()
 
     def _fresh_conn(self):
         conn = sqlite3.connect(DB_PATH)
@@ -220,29 +237,96 @@ class Store:
     def _bounded_error(exc):
         return str(exc)[:MAX_FRAME_ERROR_CHARS]
 
+    def _mutation_outcome(self, state, mutation, *, message_id=None, expected_version=None,
+                          observed_version=None, exc=None, message=None):
+        return StorageMutationOutcome(
+            state=state,
+            mutation=mutation,
+            message_id=message_id,
+            expected_version=expected_version,
+            observed_version=observed_version,
+            error_kind=exc.__class__.__name__ if exc is not None else None,
+            error_message=self._bounded_error(exc) if exc is not None else (
+                str(message)[:MAX_FRAME_ERROR_CHARS] if message is not None else None
+            ),
+        )
+
     def create_conversation(self, title, tags=None):
         conn = self._conn()
         now = _now()
-        cur = conn.execute(
-            "INSERT INTO conversations (title, tags, created_at, updated_at) VALUES (?, ?, ?, ?)",
-            (title, json.dumps(tags or []), now, now),
-        )
-        conn.commit()
-        return cur.lastrowid
+        tags_sql = json.dumps(tags or [])
+        conversation_id = None
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM conversations")
+            conversation_id = int(cur.fetchone()[0])
+            conn.execute(
+                "INSERT INTO conversations (id, title, tags, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (conversation_id, title, tags_sql, now, now),
+            )
+            conn.commit()
+            return conversation_id
+        except Exception as exc:
+            self._abort_transaction_or_discard(conn)
+            try:
+                with self._independent_read_connection() as read:
+                    row = read.execute(
+                        "SELECT id, title, tags, created_at, updated_at FROM conversations WHERE id = ?",
+                        (conversation_id,),
+                    ).fetchone() if conversation_id is not None else None
+                if row is not None and (
+                    row["title"] == title
+                    and row["tags"] == tags_sql
+                    and row["created_at"] == now
+                    and row["updated_at"] == now
+                ):
+                    return conversation_id
+            except Exception as reconcile_exc:
+                raise StorageCommitAmbiguous(
+                    f"could not reconcile conversation create: {self._bounded_error(reconcile_exc)}"
+                ) from None
+            raise StorageCommitAmbiguous(
+                f"conversation create did not commit: {self._bounded_error(exc)}"
+            ) from None
 
     def update_conversation(self, conversation_id, title=None, tags=None):
         conn = self._conn()
-        if title is not None:
-            conn.execute(
-                "UPDATE conversations SET title = ?, updated_at = ? WHERE id = ?",
-                (title, _now(), conversation_id),
+        current = conn.execute(
+            "SELECT title, tags FROM conversations WHERE id = ?", (conversation_id,)
+        ).fetchone()
+        if current is None:
+            raise ValueError(f"unknown conversation {conversation_id}")
+        new_title = current["title"] if title is None else title
+        new_tags = current["tags"] if tags is None else json.dumps(tags)
+        now = _now()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "UPDATE conversations SET title = ?, tags = ?, updated_at = ? WHERE id = ?",
+                (new_title, new_tags, now, conversation_id),
             )
-        if tags is not None:
-            conn.execute(
-                "UPDATE conversations SET tags = ?, updated_at = ? WHERE id = ?",
-                (json.dumps(tags), _now(), conversation_id),
-            )
-        conn.commit()
+            if cur.rowcount != 1:
+                self._abort_transaction_or_discard(conn)
+                raise ValueError(f"unknown conversation {conversation_id}")
+            conn.commit()
+            return self._mutation_outcome("committed", "update_conversation", message_id=conversation_id)
+        except Exception as exc:
+            self._abort_transaction_or_discard(conn)
+            try:
+                with self._independent_read_connection() as read:
+                    row = read.execute(
+                        "SELECT title, tags, updated_at FROM conversations WHERE id = ?",
+                        (conversation_id,),
+                    ).fetchone()
+                if row is not None and row["title"] == new_title and row["tags"] == new_tags and row["updated_at"] == now:
+                    return self._mutation_outcome("committed", "update_conversation", message_id=conversation_id)
+                if row is None:
+                    return self._mutation_outcome("superseded", "update_conversation", message_id=conversation_id, exc=exc)
+            except Exception as reconcile_exc:
+                raise StorageCommitAmbiguous(
+                    f"could not reconcile conversation update {conversation_id}: {self._bounded_error(reconcile_exc)}"
+                ) from None
+            raise
 
     def delete_conversation(self, conversation_id):
         conn = self._conn()
@@ -250,10 +334,31 @@ class Store:
             "SELECT frames_file FROM messages WHERE conversation_id = ? AND frames_file IS NOT NULL",
             (conversation_id,),
         ).fetchall()
-        conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
-        conn.commit()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+            conn.commit()
+        except Exception as exc:
+            self._abort_transaction_or_discard(conn)
+            try:
+                with self._independent_read_connection() as read:
+                    row = read.execute(
+                        "SELECT 1 FROM conversations WHERE id = ?", (conversation_id,)
+                    ).fetchone()
+                if row is None:
+                    for frame_row in rows:
+                        self._unlink_best_effort(FRAMES_DIR / frame_row["frames_file"])
+                    return self._mutation_outcome("committed", "delete_conversation", message_id=conversation_id)
+            except Exception as reconcile_exc:
+                raise StorageCommitAmbiguous(
+                    f"could not reconcile conversation delete {conversation_id}: {self._bounded_error(reconcile_exc)}"
+                ) from None
+            raise StorageCommitAmbiguous(
+                f"conversation delete {conversation_id} outcome ambiguous: {self._bounded_error(exc)}"
+            ) from None
         for row in rows:
             self._unlink_best_effort(FRAMES_DIR / row["frames_file"])
+        return self._mutation_outcome("committed", "delete_conversation", message_id=conversation_id)
 
     def list_conversations(self, query=None, limit=200):
         conn = self._conn()
@@ -778,15 +883,19 @@ class Store:
             for entry in data["frames"]:
                 if not isinstance(entry, dict) or not isinstance(entry.get("layers"), dict):
                     raise ValueError("invalid frame entry")
-                if entry.get("phase") not in ("prompt", "gen"):
+                if entry.get("phase") not in SUPPORTED_FRAME_PHASES:
                     raise ValueError("invalid frame phase")
                 if not isinstance(entry.get("pos"), int) or entry["pos"] < 0 or entry["pos"] < last_pos:
                     raise ValueError("invalid frame position")
                 last_pos = entry["pos"]
                 if not isinstance(entry.get("token_id"), int):
                     raise ValueError("invalid frame token id")
-                if set(int(l) for l in entry["layers"].keys()) != set(data["layers"]):
+                if any(not isinstance(l, int) for l in entry["layers"].keys()):
+                    raise ValueError("invalid frame layer key")
+                if set(entry["layers"].keys()) != set(data["layers"]):
                     raise ValueError("frame layers do not match archive layers")
+                if data.get("gen") is not None and (not isinstance(data.get("gen"), int) or data.get("gen") < 0):
+                    raise ValueError("invalid frame generation index")
                 frame = {
                     "type": "frame",
                     "phase": entry["phase"],

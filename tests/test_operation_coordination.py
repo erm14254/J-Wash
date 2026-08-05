@@ -1,4 +1,5 @@
 import json
+import asyncio
 import threading
 
 import pytest
@@ -120,6 +121,56 @@ def test_dispatch_cancellation_after_claim_leaves_release_to_worker():
     assert c.snapshot().operation.id == token.id
     assert c.snapshot().operation.cancellation_requested is True
     assert dispatch.release_from_worker() is True
+
+
+def test_operation_handoff_factory_failure_releases_unclaimed_dispatch():
+    from api import app
+    from core.model_session import WorkerDispatch
+
+    async def scenario():
+        c = ModelSessionCoordinator()
+        token, _ = c.acquire(OperationType.GENERATE)
+        stop_event = threading.Event()
+        dispatch = WorkerDispatch(c, token, stop_event)
+        handoff = app.OperationHandoff(c, token, stop_event)
+        handoff.set_dispatch(dispatch)
+        with pytest.raises(RuntimeError):
+            await handoff.create_thread_task(lambda: (_ for _ in ()).throw(RuntimeError("factory")))
+        assert c.snapshot().operation is None
+        successor, _ = c.acquire(OperationType.UNLOAD)
+        assert c.release(successor)
+
+    asyncio.run(scenario())
+
+
+def test_operation_handoff_closes_unsubmitted_to_thread_wrapper(monkeypatch):
+    from api import app
+    from core.model_session import WorkerDispatch
+
+    async def scenario():
+        c = ModelSessionCoordinator()
+        token, _ = c.acquire(OperationType.GENERATE)
+        stop_event = threading.Event()
+        dispatch = WorkerDispatch(c, token, stop_event)
+        handoff = app.OperationHandoff(c, token, stop_event)
+        handoff.set_dispatch(dispatch)
+        wrapper_closed = {"value": False}
+
+        class Wrapper:
+            def close(self):
+                wrapper_closed["value"] = True
+
+        monkeypatch.setattr(app.asyncio, "to_thread", lambda worker: Wrapper())
+        def fail_create_task(_wrapper):
+            raise RuntimeError("task creation failed")
+        monkeypatch.setattr(app.asyncio, "create_task", fail_create_task)
+
+        with pytest.raises(RuntimeError):
+            await handoff.create_thread_task(lambda: (lambda: None))
+        assert wrapper_closed["value"]
+        assert c.snapshot().operation is None
+
+    asyncio.run(scenario())
 
 
 def test_publication_gate_cancellation_wins_before_rename():
@@ -544,10 +595,10 @@ def test_preset_save_persists_coordinated_provenance(monkeypatch):
     assert captured["rules"][0]["id"] == 1
 
 
-def _frame(pos=0):
+def _frame(pos=0, phase="gen"):
     return {
         "type": "frame",
-        "phase": "gen",
+        "phase": phase,
         "pos": pos,
         "token_id": 1,
         "tok": "a",
@@ -558,6 +609,63 @@ def _frame(pos=0):
             }
         },
     }
+
+
+def test_store_round_trips_production_frame_phases(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c")
+    mid = s.add_message(cid, None, "assistant", "T", meta={"publication_state": "complete"})
+    s.save_frames(mid, [_frame(0, "reading"), _frame(1, "thinking")], [0], 1)
+    loaded = s.load_frames(mid)
+    assert [frame["phase"] for frame in loaded["frames"]] == ["reading", "thinking"]
+    body, _ = s.export(cid, include_frames=True)
+    assert "2 lens frames" in body
+    s._discard_conn()
+    reopened = store_mod.Store()
+    loaded = reopened.load_frames(mid)
+    assert [frame["phase"] for frame in loaded["frames"]] == ["reading", "thinking"]
+
+
+def test_store_accepts_legacy_frame_phases(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c")
+    mid = s.add_message(cid, None, "assistant", "T")
+    s.save_frames(mid, [_frame(0, "prompt"), _frame(1, "gen")], [0], 1)
+    loaded = s.load_frames(mid)
+    assert [frame["phase"] for frame in loaded["frames"]] == ["prompt", "gen"]
+
+
+def test_persisted_continue_merges_existing_production_phase_archive(tmp_path, monkeypatch):
+    from api import app
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    monkeypatch.setattr(app, "store", s)
+    cid = s.create_conversation("c")
+    mid = s.add_message(cid, None, "assistant", "T", meta={"publication_state": "complete"})
+    s.save_frames(mid, [_frame(0, "reading"), _frame(1, "thinking")], [0], 1)
+    emitted = []
+
+    def generate(**kwargs):
+        kwargs["emit"]({"type": "frame", **_frame(2, "thinking")})
+        kwargs["emit"]({"type": "done", "text": " plus", "meta": {"model_id": "m"}, "stats": {}, "stopped": False})
+
+    monkeypatch.setattr(app.manager, "generate", generate)
+    context = type("Ctx", (), {"lens": type("Lens", (), {"layers": [0], "k": 1})(), "intervention_snapshot": {"rules": []}})()
+    app._persisted_continue({}, mid, threading.Event(), emitted.append, context)
+    loaded = s.load_frames(mid)
+    assert [frame["phase"] for frame in loaded["frames"]] == ["reading", "thinking", "thinking"]
+    assert emitted[-1]["type"] == "done"
 
 
 def test_store_versioned_cas_rejects_stale_continuation_after_patch(tmp_path, monkeypatch):
@@ -967,3 +1075,39 @@ def test_load_frames_state_taxonomy(tmp_path, monkeypatch):
     conn.commit()
     with pytest.raises(store_mod.FrameFileMissing):
         s.load_frames(mid)
+
+
+def test_load_frames_rejects_semantic_archive_corruption(tmp_path, monkeypatch):
+    import msgpack
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c")
+
+    cases = [
+        ("invalid-k", {"k": -1}),
+        ("duplicate-layers", {"layers": [0, 0]}),
+        ("invalid-phase", {"frames": [{"phase": "bad"}]}),
+        ("invalid-layer-key", {"frames": [{"layers": {"0": {}}}]}),
+    ]
+    for name, patch in cases:
+        mid = s.add_message(cid, None, "assistant", name)
+        blob = msgpack.unpackb(
+            store_mod.Store._pack_frames_blob([_frame(0, "reading")], [0], 1),
+            strict_map_key=False,
+        )
+        for key, value in patch.items():
+            if key == "frames":
+                blob["frames"][0].update(value[0])
+            else:
+                blob[key] = value
+        frame_file = f"{name}.msgpack"
+        store_mod.FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+        (store_mod.FRAMES_DIR / frame_file).write_bytes(msgpack.packb(blob, use_bin_type=True))
+        conn = s._conn()
+        conn.execute("UPDATE messages SET frames_file = ?, version = version + 1 WHERE id = ?", (frame_file, mid))
+        conn.commit()
+        with pytest.raises(store_mod.FrameStorageError):
+            s.load_frames(mid)

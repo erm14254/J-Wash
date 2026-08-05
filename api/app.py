@@ -1,6 +1,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from enum import Enum
 import json
 import logging
 import mimetypes
@@ -35,7 +36,7 @@ from core.model_manager import (
     resolve_local_dir,
     resolve_source,
 )
-from core.store import Store, FrameStorageError, StaleMessageUpdate, FramesNotAttached, FramePointerTurnover, FrameFileMissing
+from core.store import Store, FrameStorageError, StaleMessageUpdate, FramesNotAttached, FramePointerTurnover, FrameFileMissing, StorageCommitAmbiguous
 
 manager = ModelManager()
 lens_manager = LensManager()
@@ -198,6 +199,17 @@ async def _retain_worker_task_or_cancel(task, dispatch):
     return task
 
 
+class HandoffState(Enum):
+    ACQUIRED = "ACQUIRED"
+    PREPARING = "PREPARING"
+    DISPATCH_READY = "DISPATCH_READY"
+    WRAPPER_READY = "WRAPPER_READY"
+    TASK_CREATED = "TASK_CREATED"
+    TASK_RETAINED = "TASK_RETAINED"
+    TRANSFERRED = "TRANSFERRED"
+    CLOSED = "CLOSED"
+
+
 class OperationHandoff:
     """Owns an acquired operation until a retained worker can take over."""
 
@@ -211,23 +223,36 @@ class OperationHandoff:
         self.heavy = {}
         self.transferred = False
         self.closed = False
+        self.state = HandoffState.ACQUIRED
+
+    def _set_state(self, state):
+        self.state = state
 
     def set_heavy(self, **refs):
+        if self.closed:
+            raise RuntimeError("handoff is closed")
+        self._set_state(HandoffState.PREPARING)
         self.heavy.update(refs)
 
     def clear_heavy(self):
         self.heavy.clear()
 
     def set_dispatch(self, dispatch):
+        if self.closed:
+            raise RuntimeError("handoff is closed")
         self.dispatch = dispatch
+        self._set_state(HandoffState.DISPATCH_READY)
 
     def set_wrapper(self, wrapper):
         self.wrapper = wrapper
+        self._set_state(HandoffState.WRAPPER_READY)
 
     def set_task(self, task):
         self.task = task
+        self._set_state(HandoffState.TASK_CREATED)
 
     async def create_thread_task(self, worker_factory):
+        primary_error = None
         try:
             worker = worker_factory()
             self.set_heavy(worker=worker)
@@ -237,23 +262,44 @@ class OperationHandoff:
             self.wrapper = None
             self.set_task(task)
             await _retain_worker_task_or_cancel(task, self.dispatch)
+            self._set_state(HandoffState.TASK_RETAINED)
             self.transferred = True
+            self._set_state(HandoffState.TRANSFERRED)
             self.clear_heavy()
             return task
-        except Exception:
+        except BaseException as exc:
+            primary_error = exc
             wrapper = self.wrapper
             self.wrapper = None
             if wrapper is not None and hasattr(wrapper, "close"):
-                wrapper.close()
+                try:
+                    wrapper.close()
+                except Exception:
+                    logging.getLogger(__name__).exception("failed to close unsubmitted worker wrapper")
             self.clear_heavy()
             if self.dispatch is not None:
                 self.dispatch.cancel_from_awaiter()
                 if self.task is not None:
-                    await _drain_worker_uninterruptibly(self.task)
+                    try:
+                        await _drain_worker_uninterruptibly(self.task)
+                    except asyncio.CancelledError:
+                        if isinstance(primary_error, asyncio.CancelledError):
+                            raise
+                    except Exception:
+                        logging.getLogger(__name__).exception("worker drain failed during operation handoff cleanup")
             elif self.token is not None and not self.closed:
                 self.coordinator.release(self.token)
                 self.closed = True
+                self._set_state(HandoffState.CLOSED)
             raise
+
+
+async def _handoff_thread_worker(coordinator, token, stop_event, dispatch, worker_factory, **heavy):
+    handoff = OperationHandoff(coordinator, token, stop_event)
+    if heavy:
+        handoff.set_heavy(**heavy)
+    handoff.set_dispatch(dispatch)
+    return await handoff.create_thread_task(worker_factory)
 
 
 def _retain_worker_task(task):
@@ -615,12 +661,7 @@ async def api_delete_model(req: DeleteModelRequest):
         finally:
             dispatch.release_from_worker()
 
-    try:
-        task = asyncio.create_task(asyncio.to_thread(worker))
-    except Exception:
-        dispatch.cancel_from_awaiter()
-        raise
-    await _retain_worker_task_or_cancel(task, dispatch)
+    task = await _handoff_thread_worker(manager.coordinator, token, stop_event, dispatch, lambda: worker)
     try:
         return _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -769,12 +810,7 @@ async def api_lens_load(req: LensLoadRequest):
             payload = old_state = result = None
             dispatch.release_from_worker()
 
-    try:
-        task = asyncio.create_task(asyncio.to_thread(worker))
-    except Exception:
-        dispatch.cancel_from_awaiter()
-        raise
-    await _retain_worker_task_or_cancel(task, dispatch)
+    task = await _handoff_thread_worker(manager.coordinator, token, stop_event, dispatch, lambda: worker)
     try:
         return _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -1316,12 +1352,7 @@ async def api_edit_export(req: ExportRequest):
             finally:
                 dispatch.release_from_worker()
 
-    try:
-        task = asyncio.create_task(asyncio.to_thread(worker))
-    except Exception:
-        dispatch.cancel_from_awaiter()
-        raise
-    await _retain_worker_task_or_cancel(task, dispatch)
+    task = await _handoff_thread_worker(manager.coordinator, token, stop_event, dispatch, lambda: worker)
     try:
         return _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -1608,12 +1639,7 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
             finally:
                 payload = call_kwargs = result = None
                 dispatch.release_from_worker()
-        try:
-            task = asyncio.create_task(asyncio.to_thread(bake_worker))
-        except Exception:
-            dispatch.cancel_from_awaiter()
-            raise
-        await _retain_worker_task_or_cancel(task, dispatch)
+        task = await _handoff_thread_worker(manager.coordinator, token, stop_event, dispatch, lambda: bake_worker)
         try:
             _raise_worker_outcome(await asyncio.shield(task))
         except asyncio.CancelledError:
@@ -1748,12 +1774,7 @@ async def api_generate_sync(req: GenerateSyncRequest):
             payload = context = None
             dispatch.release_from_worker()
 
-    try:
-        task = asyncio.create_task(asyncio.to_thread(worker))
-    except Exception:
-        dispatch.cancel_from_awaiter()
-        raise
-    await _retain_worker_task_or_cancel(task, dispatch)
+    task = await _handoff_thread_worker(manager.coordinator, token, stop_event, dispatch, lambda: worker)
     try:
         outcome_value = _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -1777,6 +1798,26 @@ async def api_generate_sync(req: GenerateSyncRequest):
 class NeighborsRequest(BaseModel):
     token_ids: list[int]
     k: int = 3
+
+
+def _make_token_neighbors_worker(dispatch):
+    def worker():
+        if not dispatch.claim():
+            return _worker_success()
+        payload = dispatch.take_payload()
+        try:
+            try:
+                result = neighbors.lookup(
+                    payload["bundle"].jl, payload["bundle"].tokenizer,
+                    payload["key"], payload["token_ids"], payload["k"],
+                )
+                return _worker_success(result)
+            except Exception as exc:
+                return _worker_failure(exc)
+        finally:
+            payload = result = None
+            dispatch.release_from_worker()
+    return worker
 
 
 @app.post("/api/token-neighbors")
@@ -1817,27 +1858,8 @@ async def api_token_neighbors(req: NeighborsRequest):
         raise HTTPException(500, detail) from None
     snap = bundle = payload = None
 
-    def make_worker():
-        def worker():
-            if not dispatch.claim():
-                return _worker_success()
-            payload = dispatch.take_payload()
-            try:
-                try:
-                    result = neighbors.lookup(
-                        payload["bundle"].jl, payload["bundle"].tokenizer,
-                        payload["key"], payload["token_ids"], payload["k"],
-                    )
-                    return _worker_success(result)
-                except Exception as exc:
-                    return _worker_failure(exc)
-            finally:
-                payload = result = None
-                dispatch.release_from_worker()
-        return worker
-
     try:
-        task = await handoff.create_thread_task(make_worker)
+        task = await handoff.create_thread_task(lambda: _make_token_neighbors_worker(dispatch))
     except Exception as exc:
         raise HTTPException(500, str(exc)) from None
     try:
@@ -1994,12 +2016,7 @@ async def api_lens_pin(req: PinRequest):
             payload = result = None
             dispatch.release_from_worker()
 
-    try:
-        task = asyncio.create_task(asyncio.to_thread(worker))
-    except Exception:
-        dispatch.cancel_from_awaiter()
-        raise
-    await _retain_worker_task_or_cancel(task, dispatch)
+    task = await _handoff_thread_worker(manager.coordinator, token, stop_event, dispatch, lambda: worker)
     try:
         return _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -2330,6 +2347,7 @@ def api_message_patch(mid: int, req: MessagePatch):
     """Edit a message's content (e.g. rewrite an assistant reply). Later turns
     are generated from the stored path, so the edit takes effect immediately."""
     try:
+        current = store.get_message(mid)
         store.update_message(
             mid,
             req.content,
@@ -2340,7 +2358,12 @@ def api_message_patch(mid: int, req: MessagePatch):
                 "continuations": [],
             },
             clear_frames=True,
+            expected_version=current.get("version", 0),
         )
+    except StaleMessageUpdate as exc:
+        raise HTTPException(409, str(exc)) from None
+    except StorageCommitAmbiguous as exc:
+        raise HTTPException(500, str(exc)) from None
     except ValueError as exc:
         raise HTTPException(404, str(exc))
     return {"ok": True, "id": mid}
@@ -2630,12 +2653,7 @@ async def _run_chat(ws, req):
             payload = context = request = None
             dispatch.release_from_worker()
 
-    try:
-        worker = asyncio.create_task(asyncio.to_thread(worker_body))
-    except Exception:
-        dispatch.cancel_from_awaiter()
-        raise
-    await _retain_worker_task_or_cancel(worker, dispatch)
+    worker = await _handoff_thread_worker(manager.coordinator, token, stop_event, dispatch, lambda: worker_body)
     try:
         receiver = asyncio.create_task(_watch_stop(ws, stop_event))
     except Exception as exc:
