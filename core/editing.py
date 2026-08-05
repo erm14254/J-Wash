@@ -1067,7 +1067,7 @@ def save_preset(name, rules, model_id, scale=1.0, **provenance):
     }
     for key in (
         "model_revision", "intervention_mode", "intervention_revision",
-        "model_session_id", "lens_binding_id",
+        "model_session_id", "lens_binding_id", "lens_descriptor",
     ):
         if key in provenance:
             payload[key] = provenance[key]

@@ -806,6 +806,33 @@ def api_interventions_clear():
             manager.coordinator.release(token)
 
 
+def _stable_lens_descriptor(lens_binding):
+    if lens_binding is None:
+        return None
+    lens = dict(lens_binding)
+    keys = (
+        "repo_id", "path", "filename", "revision",
+        "model_id", "model_revision", "model_session_id",
+        "fitted_layers", "fitted_layers_all", "tapped_layers", "k",
+    )
+    descriptor = {key: lens.get(key) for key in keys if lens.get(key) is not None}
+    if lens.get("lens_binding_id") is not None:
+        descriptor["runtime_lens_binding_id"] = lens.get("lens_binding_id")
+    return descriptor or None
+
+
+def _lens_descriptor_mismatch(saved, current):
+    if saved is None:
+        return False
+    current = current or {}
+    for key, value in saved.items():
+        if key == "runtime_lens_binding_id":
+            continue
+        if current.get(key) != value:
+            return True
+    return False
+
+
 @app.get("/api/presets")
 def api_presets():
     return {"presets": editing.list_presets()}
@@ -824,6 +851,7 @@ def api_presets_save(name: str):
             raise HTTPException(422, "no active intervention to save")
         model_id = bundle.meta.get("model_id") if bundle is not None else None
         scale = iv.get("scale")
+        lens_descriptor = _stable_lens_descriptor(snap.lens_binding)
         result = editing.save_preset(
             name, rules, model_id, scale=scale,
             model_revision=bundle.meta.get("revision") if bundle is not None else None,
@@ -832,6 +860,7 @@ def api_presets_save(name: str):
             intervention_revision=iv.get("revision"),
             model_session_id=iv.get("model_session_id"),
             lens_binding_id=iv.get("lens_binding_id"),
+            lens_descriptor=lens_descriptor,
         )
         return result
     except OperationConflict as exc:
@@ -872,8 +901,12 @@ def api_presets_apply(name: str):
             warnings.append(
                 f"preset saved under intervention mode {preset['intervention_mode']}; current mode: {current_iv.get('mode')}"
             )
-        if preset.get("lens_binding_id") is not None and preset.get("lens_binding_id") != current_iv.get("lens_binding_id"):
-            warnings.append("preset lens binding differs from the current lens binding")
+        current_lens_descriptor = _stable_lens_descriptor(snap.lens_binding)
+        if preset.get("lens_descriptor") is not None:
+            if _lens_descriptor_mismatch(preset.get("lens_descriptor"), current_lens_descriptor):
+                warnings.append("preset lens descriptor differs from the current coordinated lens")
+        elif preset.get("lens_binding_id") is not None:
+            warnings.append("preset has only process-local lens provenance; current stable lens identity is unknown")
         if preset.get("schema_version") is None:
             warnings.append("legacy preset: provenance is unknown")
         def mutate():
@@ -1918,7 +1951,17 @@ def api_message_patch(mid: int, req: MessagePatch):
     """Edit a message's content (e.g. rewrite an assistant reply). Later turns
     are generated from the stored path, so the edit takes effect immediately."""
     try:
-        store.update_message(mid, req.content, meta={"provenance_invalidated": True, "edited": True})
+        store.update_message(
+            mid,
+            req.content,
+            meta={
+                "provenance_invalidated": True,
+                "edited": True,
+                "provenance": "user_edited_unknown",
+                "continuations": [],
+            },
+            clear_frames=True,
+        )
     except ValueError as exc:
         raise HTTPException(404, str(exc))
     return {"ok": True, "id": mid}
@@ -2018,7 +2061,15 @@ def _continuation_metadata(previous_meta, start_offset, end_offset, done_meta, s
         base_meta = dict(previous_meta)
         base_meta.pop("continuations", None)
         base_meta.pop("continuation_attempts", None)
-        continuations.append({"start_offset": 0, "end_offset": start_offset, "meta": base_meta})
+        if previous_meta.get("continued"):
+            continuations.append({
+                "start_offset": 0,
+                "end_offset": start_offset,
+                "provenance": "legacy_mixed_unknown",
+                "meta": None,
+            })
+        else:
+            continuations.append({"start_offset": 0, "end_offset": start_offset, "meta": base_meta})
     merged = dict(previous_meta)
     if end_offset > start_offset:
         continuations.append({
@@ -2044,6 +2095,7 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
     msg = store.get_message(message_id)
     expected_content = msg["content"]
     expected_meta = msg.get("meta")
+    expected_version = msg.get("version", 0)
     if msg["role"] != "assistant":
         emit({"type": "error", "message": "only an assistant reply can be continued"})
         return
@@ -2084,7 +2136,7 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
             except Exception:
                 pass
     if not store.update_message_and_frames_if_unchanged(
-        message_id, expected_content, expected_meta, new_content, meta,
+        message_id, expected_version, new_content, meta,
         frames=merged, layers=layers_used, k=k_used,
     ):
         emit({"type": "error", "message": "message changed during continuation; retry"})

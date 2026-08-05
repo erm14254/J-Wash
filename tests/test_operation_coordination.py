@@ -414,10 +414,9 @@ def test_persisted_continue_records_segment_provenance(monkeypatch):
             return [{"role": "user", "content": "u"}, {"role": "assistant", "content": "old"}]
 
         def update_message_and_frames_if_unchanged(
-            self, message_id, expected_content, expected_meta, content, meta=None, **kwargs
+            self, message_id, expected_version, content, meta=None, **kwargs
         ):
-            assert expected_content == "old"
-            assert expected_meta == json.dumps(self.meta)
+            assert expected_version == 0
             assert kwargs.get("frames") is None
             self.updated = (message_id, content, meta)
             return True
@@ -475,10 +474,11 @@ def test_zero_length_continuation_does_not_reattribute_existing_text(monkeypatch
             self.meta = {"intervention_provenance": {"revision": 1}}
             self.updated = None
         def get_message(self, message_id):
-            return {"id": message_id, "conversation_id": 1, "parent_id": None, "role": "assistant", "content": "old", "meta": json.dumps(self.meta), "frames_file": None}
+            return {"id": message_id, "conversation_id": 1, "parent_id": None, "role": "assistant", "content": "old", "meta": json.dumps(self.meta), "frames_file": None, "version": 0}
         def path_to_root(self, message_id):
             return [{"role": "assistant", "content": "old"}]
-        def update_message_and_frames_if_unchanged(self, message_id, expected_content, expected_meta, content, meta=None, **kwargs):
+        def update_message_and_frames_if_unchanged(self, message_id, expected_version, content, meta=None, **kwargs):
+            assert expected_version == 0
             self.updated = (content, meta)
             return True
 
@@ -537,3 +537,126 @@ def test_preset_save_persists_coordinated_provenance(monkeypatch):
     assert captured["model_session_id"] == session_id
     assert captured["lens_binding_id"] == 44
     assert captured["rules"][0]["id"] == 1
+
+
+def _frame(pos=0):
+    return {
+        "type": "frame",
+        "phase": "gen",
+        "pos": pos,
+        "token_id": 1,
+        "tok": "a",
+        "layers": {
+            0: {
+                "ids": [1], "strs": ["a"], "p": [1.0],
+                "m_ids": [2], "m_strs": ["b"], "m_p": [0.5], "m_rank": [1],
+            }
+        },
+    }
+
+
+def test_store_versioned_cas_rejects_stale_continuation_after_patch(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c")
+    mid = s.add_message(cid, None, "assistant", "old", meta={"intervention_provenance": {"revision": 1}})
+    old_frame = s.save_frames(mid, [_frame(0)], [0], 1)
+    captured = s.get_message(mid)
+    assert captured["version"] == 1
+    assert (store_mod.FRAMES_DIR / old_frame).exists()
+
+    s.update_message(mid, "edited", meta={"edited": True}, clear_frames=True)
+    assert not (store_mod.FRAMES_DIR / old_frame).exists()
+
+    ok = s.update_message_and_frames_if_unchanged(
+        mid,
+        captured["version"],
+        "old suffix",
+        {"intervention_provenance": {"revision": 2}},
+        frames=[_frame(1)],
+        layers=[0],
+        k=1,
+    )
+    assert ok is False
+    current = s.get_message(mid)
+    assert current["content"] == "edited"
+    assert current["frames_file"] is None
+    assert not list(store_mod.FRAMES_DIR.glob("*.tmp-*"))
+    assert not list(store_mod.FRAMES_DIR.glob("*.msgpack"))
+
+
+def test_store_versioned_frames_commit_uses_unique_file_and_cleans_old_after_commit(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c")
+    mid = s.add_message(cid, None, "assistant", "old", meta={"m": 1})
+    old_frame = s.save_frames(mid, [_frame(0)], [0], 1)
+    captured = s.get_message(mid)
+    assert old_frame.startswith(f"{mid}-v1-")
+
+    ok = s.update_message_and_frames_if_unchanged(
+        mid,
+        captured["version"],
+        "old new",
+        {"m": 2},
+        frames=[_frame(0), _frame(1)],
+        layers=[0],
+        k=1,
+    )
+    assert ok is True
+    updated = s.get_message(mid)
+    assert updated["version"] == captured["version"] + 1
+    assert updated["frames_file"] != old_frame
+    assert updated["frames_file"].startswith(f"{mid}-v{updated['version']}-")
+    assert not (store_mod.FRAMES_DIR / old_frame).exists()
+    assert (store_mod.FRAMES_DIR / updated["frames_file"]).exists()
+    assert len(s.load_frames(mid)["frames"]) == 2
+
+
+def test_legacy_continued_message_gets_unknown_base_provenance():
+    from api import app
+
+    meta = app._continuation_metadata(
+        {"continued": True, "intervention_provenance": {"revision": 9}},
+        12,
+        15,
+        {"intervention_provenance": {"revision": 10}},
+        {"tokens": 1},
+        False,
+    )
+    assert meta["continuations"][0] == {
+        "start_offset": 0,
+        "end_offset": 12,
+        "provenance": "legacy_mixed_unknown",
+        "meta": None,
+    }
+    assert meta["continuations"][1]["meta"]["intervention_provenance"]["revision"] == 10
+
+
+def test_preset_lens_descriptor_detects_reused_runtime_binding_id():
+    from api import app
+
+    saved = {
+        "runtime_lens_binding_id": 7,
+        "repo_id": "lens-a",
+        "filename": "lens.pt",
+        "revision": "ra",
+        "tapped_layers": [0, 1],
+        "k": 8,
+    }
+    current = {
+        "runtime_lens_binding_id": 7,
+        "repo_id": "lens-b",
+        "filename": "lens.pt",
+        "revision": "rb",
+        "tapped_layers": [0, 1],
+        "k": 8,
+    }
+    assert app._lens_descriptor_mismatch(saved, current)
+    assert not app._lens_descriptor_mismatch(saved, dict(saved, runtime_lens_binding_id=99))

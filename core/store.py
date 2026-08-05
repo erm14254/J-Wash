@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import threading
+import uuid
 from datetime import datetime, timezone
 
 import msgpack
@@ -27,7 +28,8 @@ CREATE TABLE IF NOT EXISTS messages (
     content TEXT NOT NULL,
     meta TEXT,
     frames_file TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id);
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
@@ -59,7 +61,14 @@ class Store:
         self._local = threading.local()
         conn = self._conn()
         conn.executescript(SCHEMA)
+        self._ensure_message_version(conn)
         conn.commit()
+
+    @staticmethod
+    def _ensure_message_version(conn):
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
+        if "version" not in cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN version INTEGER NOT NULL DEFAULT 0")
 
     def _conn(self):
         conn = getattr(self._local, "conn", None)
@@ -215,7 +224,7 @@ class Store:
     def get_message(self, message_id):
         conn = self._conn()
         row = conn.execute(
-            "SELECT id, conversation_id, parent_id, role, content, meta, frames_file "
+            "SELECT id, conversation_id, parent_id, role, content, meta, frames_file, version "
             "FROM messages WHERE id = ?",
             (message_id,),
         ).fetchone()
@@ -223,83 +232,96 @@ class Store:
             raise ValueError(f"unknown message {message_id}")
         return dict(row)
 
-    def update_message(self, message_id, content, meta=None):
-        """Rewrite a message's content (assistant edit, or a continuation
-        appending to it). The FTS index follows via the update trigger."""
+    def update_message(self, message_id, content, meta=None, *, clear_frames=False):
+        """Rewrite a message and increment its durable row version.
+
+        Assistant edits may clear derived frame/provenance artifacts atomically;
+        stale continuations then fail their versioned CAS instead of overwriting
+        an acknowledged edit.
+        """
         conn = self._conn()
         row = conn.execute(
-            "SELECT conversation_id FROM messages WHERE id = ?", (message_id,)
+            "SELECT conversation_id, frames_file FROM messages WHERE id = ?", (message_id,)
         ).fetchone()
         if row is None:
             raise ValueError(f"unknown message {message_id}")
-        if meta is not None:
-            conn.execute(
-                "UPDATE messages SET content = ?, meta = ? WHERE id = ?",
-                (content, json.dumps(meta, ensure_ascii=False), message_id),
-            )
-        else:
-            conn.execute(
-                "UPDATE messages SET content = ? WHERE id = ?", (content, message_id)
-            )
-        conn.execute(
-            "UPDATE conversations SET updated_at = ? WHERE id = ?",
-            (_now(), row["conversation_id"]),
-        )
-        conn.commit()
-
-
-    def update_message_if_unchanged(self, message_id, expected_content, expected_meta, content, meta=None):
-        conn = self._conn()
-        row = conn.execute(
-            "SELECT conversation_id, content, meta FROM messages WHERE id = ?",
-            (message_id,),
-        ).fetchone()
-        if row is None:
-            raise ValueError(f"unknown message {message_id}")
-        if row["content"] != expected_content or row["meta"] != expected_meta:
-            return False
         meta_json = json.dumps(meta, ensure_ascii=False) if meta is not None else None
+        frames_file = None if clear_frames else row["frames_file"]
         conn.execute(
-            "UPDATE messages SET content = ?, meta = ? WHERE id = ?",
-            (content, meta_json, message_id),
+            "UPDATE messages SET content = ?, meta = ?, frames_file = ?, version = version + 1 WHERE id = ?",
+            (content, meta_json, frames_file, message_id),
         )
         conn.execute(
             "UPDATE conversations SET updated_at = ? WHERE id = ?",
             (_now(), row["conversation_id"]),
         )
         conn.commit()
-        return True
+        if clear_frames and row["frames_file"]:
+            (FRAMES_DIR / row["frames_file"]).unlink(missing_ok=True)
 
-    def update_message_and_frames_if_unchanged(self, message_id, expected_content, expected_meta, content, meta=None, *, frames=None, layers=None, k=0):
-        frame_blob = None
+    def update_message_if_unchanged(self, message_id, expected_version, content, meta=None):
+        return self.update_message_and_frames_if_unchanged(
+            message_id, expected_version, content, meta, frames=None
+        )
+
+    def _write_unique_frame_candidate(self, message_id, expected_version, frame_blob):
+        frame_file = f"{message_id}-v{int(expected_version) + 1}-{uuid.uuid4().hex}.msgpack"
+        tmp = FRAMES_DIR / f".{frame_file}.tmp-{uuid.uuid4().hex}"
+        final = FRAMES_DIR / frame_file
+        with tmp.open("wb") as fh:
+            fh.write(frame_blob)
+            fh.flush()
+            try:
+                import os
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        tmp.replace(final)
+        return frame_file, final
+
+    def update_message_and_frames_if_unchanged(self, message_id, expected_version, content, meta=None, *, frames=None, layers=None, k=0):
         frame_file = None
+        final_path = None
         if frames:
             frame_blob = self._pack_frames_blob(frames, layers or [], k)
-            frame_file = f"{message_id}.msgpack"
+            frame_file, final_path = self._write_unique_frame_candidate(message_id, expected_version, frame_blob)
         conn = self._conn()
-        row = conn.execute(
-            "SELECT conversation_id, content, meta, frames_file FROM messages WHERE id = ?",
-            (message_id,),
-        ).fetchone()
-        if row is None:
-            raise ValueError(f"unknown message {message_id}")
-        if row["content"] != expected_content or row["meta"] != expected_meta:
-            return False
-        old_file = row["frames_file"]
-        if frame_blob is not None:
-            tmp = FRAMES_DIR / f".{frame_file}.tmp"
-            tmp.write_bytes(frame_blob)
-            tmp.replace(FRAMES_DIR / frame_file)
-        meta_json = json.dumps(meta, ensure_ascii=False) if meta is not None else None
-        conn.execute(
-            "UPDATE messages SET content = ?, meta = ?, frames_file = COALESCE(?, frames_file) WHERE id = ?",
-            (content, meta_json, frame_file, message_id),
-        )
-        conn.execute(
-            "UPDATE conversations SET updated_at = ? WHERE id = ?",
-            (_now(), row["conversation_id"]),
-        )
-        conn.commit()
+        old_file = None
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT conversation_id, frames_file FROM messages WHERE id = ?",
+                (message_id,),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                raise ValueError(f"unknown message {message_id}")
+            old_file = row["frames_file"]
+            target_frame = frame_file if frame_file is not None else old_file
+            meta_json = json.dumps(meta, ensure_ascii=False) if meta is not None else None
+            cur = conn.execute(
+                "UPDATE messages SET content = ?, meta = ?, frames_file = ?, version = version + 1 "
+                "WHERE id = ? AND version = ?",
+                (content, meta_json, target_frame, message_id, expected_version),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                if final_path is not None:
+                    final_path.unlink(missing_ok=True)
+                return False
+            conn.execute(
+                "UPDATE conversations SET updated_at = ? WHERE id = ?",
+                (_now(), row["conversation_id"]),
+            )
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            if final_path is not None:
+                final_path.unlink(missing_ok=True)
+            raise
         if frame_file and old_file and old_file != frame_file:
             (FRAMES_DIR / old_file).unlink(missing_ok=True)
         return True
@@ -355,13 +377,26 @@ class Store:
         })
 
     def save_frames(self, message_id, frames, layers, k):
-        filename = f"{message_id}.msgpack"
-        (FRAMES_DIR / filename).write_bytes(self._pack_frames_blob(frames, layers, k))
         conn = self._conn()
-        conn.execute(
-            "UPDATE messages SET frames_file = ? WHERE id = ?", (filename, message_id)
+        row = conn.execute(
+            "SELECT version, frames_file FROM messages WHERE id = ?", (message_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown message {message_id}")
+        filename, final_path = self._write_unique_frame_candidate(
+            message_id, row["version"], self._pack_frames_blob(frames, layers, k)
         )
-        conn.commit()
+        try:
+            conn.execute(
+                "UPDATE messages SET frames_file = ?, version = version + 1 WHERE id = ? AND version = ?",
+                (filename, message_id, row["version"]),
+            )
+            conn.commit()
+        except Exception:
+            final_path.unlink(missing_ok=True)
+            raise
+        if row["frames_file"] and row["frames_file"] != filename:
+            (FRAMES_DIR / row["frames_file"]).unlink(missing_ok=True)
         return filename
 
     def load_frames(self, message_id):
