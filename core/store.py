@@ -1,5 +1,6 @@
 import json
 import logging
+import errno
 import os
 import sqlite3
 import threading
@@ -150,7 +151,7 @@ class Store:
         conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
         conn.commit()
         for row in rows:
-            (FRAMES_DIR / row["frames_file"]).unlink(missing_ok=True)
+            self._unlink_best_effort(FRAMES_DIR / row["frames_file"])
 
     def list_conversations(self, query=None, limit=200):
         conn = self._conn()
@@ -237,7 +238,7 @@ class Store:
             "messages": messages,
         }
 
-    def add_message(self, conversation_id, parent_id, role, content, meta=None):
+    def add_message(self, conversation_id, parent_id, role, content, meta=None, *, return_version=False):
         conn = self._conn()
         cur = conn.execute(
             "INSERT INTO messages (conversation_id, parent_id, role, content, meta, created_at) "
@@ -256,7 +257,7 @@ class Store:
             (_now(), conversation_id),
         )
         conn.commit()
-        return cur.lastrowid
+        return (cur.lastrowid, 0) if return_version else cur.lastrowid
 
     def get_message(self, message_id):
         conn = self._conn()
@@ -311,8 +312,9 @@ class Store:
                 fh.flush()
                 try:
                     os.fsync(fh.fileno())
-                except OSError:
-                    pass
+                except OSError as exc:
+                    if exc.errno not in (errno.EINVAL, errno.ENOTSUP, errno.ENOSYS):
+                        raise
             tmp.replace(final)
             self._fsync_dir_best_effort(FRAMES_DIR)
             return frame_file, final
@@ -355,7 +357,7 @@ class Store:
             if cur.rowcount != 1:
                 conn.rollback()
                 if final_path is not None:
-                    final_path.unlink(missing_ok=True)
+                    self._unlink_best_effort(final_path)
                 return False
             conn.execute(
                 "UPDATE conversations SET updated_at = ? WHERE id = ?",
@@ -368,7 +370,12 @@ class Store:
             except Exception:
                 pass
             if final_path is not None:
-                final_path.unlink(missing_ok=True)
+                current = conn.execute("SELECT frames_file FROM messages WHERE id = ?", (message_id,)).fetchone()
+                if current is not None and current["frames_file"] == frame_file:
+                    if old_file and old_file != frame_file:
+                        self._unlink_best_effort(FRAMES_DIR / old_file)
+                    return True
+                self._unlink_best_effort(final_path)
             raise
         if frame_file and old_file and old_file != frame_file:
             self._unlink_best_effort(FRAMES_DIR / old_file)
@@ -424,34 +431,53 @@ class Store:
             "vocab": {str(t): s for t, s in vocab.items()},
         })
 
-    def save_frames(self, message_id, frames, layers, k):
+    def save_frames(self, message_id, frames, layers, k, *, expected_version=None, complete_meta=None):
         conn = self._conn()
         row = conn.execute(
             "SELECT version, frames_file FROM messages WHERE id = ?", (message_id,)
         ).fetchone()
         if row is None:
             raise ValueError(f"unknown message {message_id}")
+        baseline = row["version"] if expected_version is None else expected_version
         filename, final_path = self._write_unique_frame_candidate(
-            message_id, row["version"], self._pack_frames_blob(frames, layers, k)
+            message_id, baseline, self._pack_frames_blob(frames, layers, k)
         )
+        old_file = row["frames_file"]
+        committed = False
         try:
-            cur = conn.execute(
-                "UPDATE messages SET frames_file = ?, version = version + 1 WHERE id = ? AND version = ?",
-                (filename, message_id, row["version"]),
-            )
+            conn.execute("BEGIN IMMEDIATE")
+            meta_sql = json.dumps(complete_meta, ensure_ascii=False) if complete_meta is not None else None
+            if complete_meta is not None:
+                cur = conn.execute(
+                    "UPDATE messages SET frames_file = ?, meta = ?, version = version + 1 WHERE id = ? AND version = ?",
+                    (filename, meta_sql, message_id, baseline),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE messages SET frames_file = ?, version = version + 1 WHERE id = ? AND version = ?",
+                    (filename, message_id, baseline),
+                )
             if cur.rowcount != 1:
                 conn.rollback()
-                final_path.unlink(missing_ok=True)
+                self._unlink_best_effort(final_path)
                 raise StaleMessageUpdate(f"message {message_id} changed before frames attached")
             conn.commit()
+            committed = True
         except Exception:
             try:
-                final_path.unlink(missing_ok=True)
+                if conn.in_transaction:
+                    conn.rollback()
             except Exception:
-                log.warning("failed to clean stale frame candidate %s", final_path, exc_info=True)
+                log.warning("failed to roll back frame attachment", exc_info=True)
+            current = conn.execute("SELECT frames_file FROM messages WHERE id = ?", (message_id,)).fetchone()
+            if current is not None and current["frames_file"] == filename:
+                if old_file and old_file != filename:
+                    self._unlink_best_effort(FRAMES_DIR / old_file)
+                return filename
+            self._unlink_best_effort(final_path)
             raise
-        if row["frames_file"] and row["frames_file"] != filename:
-            self._unlink_best_effort(FRAMES_DIR / row["frames_file"])
+        if old_file and old_file != filename:
+            self._unlink_best_effort(FRAMES_DIR / old_file)
         return filename
 
     def load_frames(self, message_id):
@@ -481,32 +507,50 @@ class Store:
                 raise FrameStorageError(f"could not read frame archive for message {message_id}: {exc}") from exc
         else:
             raise ValueError(f"frame archive changed while reading message {message_id}") from last_missing
-        vocab = data["vocab"]
-        frames = []
-        for entry in data["frames"]:
-            frame = {
-                "type": "frame",
-                "phase": entry["phase"],
-                "pos": entry["pos"],
-                "token_id": entry["token_id"],
-                "tok": vocab.get(str(entry["token_id"]), ""),
-                "gen": data.get("gen"),
-                "layers": {},
-            }
-            for layer, d in entry["layers"].items():
-                ids = np.frombuffer(d["ids"], np.int32).tolist()
-                m_ids = np.frombuffer(d["m_ids"], np.int32).tolist()
-                frame["layers"][layer] = {
-                    "ids": ids,
-                    "p": [round(float(v), 5) for v in np.frombuffer(d["p"], np.float16)],
-                    "strs": [vocab.get(str(t), "") for t in ids],
-                    "m_ids": m_ids,
-                    "m_p": [round(float(v), 5) for v in np.frombuffer(d["m_p"], np.float16)],
-                    "m_rank": np.frombuffer(d["m_rank"], np.int32).tolist(),
-                    "m_strs": [vocab.get(str(t), "") for t in m_ids],
+        try:
+            if not isinstance(data, dict) or data.get("version") != 1:
+                raise ValueError("unsupported frame archive version")
+            vocab = data["vocab"]
+            if not isinstance(vocab, dict) or not isinstance(data.get("frames"), list):
+                raise ValueError("invalid frame archive structure")
+            frames = []
+            for entry in data["frames"]:
+                if not isinstance(entry, dict) or not isinstance(entry.get("layers"), dict):
+                    raise ValueError("invalid frame entry")
+                frame = {
+                    "type": "frame",
+                    "phase": entry["phase"],
+                    "pos": entry["pos"],
+                    "token_id": entry["token_id"],
+                    "tok": vocab.get(str(entry["token_id"]), ""),
+                    "gen": data.get("gen"),
+                    "layers": {},
                 }
-            frames.append(frame)
-        return {"k": data["k"], "layers": data["layers"], "frames": frames}
+                for layer, d in entry["layers"].items():
+                    if not isinstance(d, dict):
+                        raise ValueError("invalid layer entry")
+                    ids_arr = np.frombuffer(d["ids"], np.int32)
+                    p_arr = np.frombuffer(d["p"], np.float16)
+                    m_ids_arr = np.frombuffer(d["m_ids"], np.int32)
+                    m_p_arr = np.frombuffer(d["m_p"], np.float16)
+                    m_rank_arr = np.frombuffer(d["m_rank"], np.int32)
+                    if len(ids_arr) != len(p_arr) or len(m_ids_arr) != len(m_p_arr) or len(m_ids_arr) != len(m_rank_arr):
+                        raise ValueError("frame vector length mismatch")
+                    ids = ids_arr.tolist()
+                    m_ids = m_ids_arr.tolist()
+                    frame["layers"][layer] = {
+                        "ids": ids,
+                        "p": [round(float(v), 5) for v in p_arr],
+                        "strs": [vocab.get(str(t), "") for t in ids],
+                        "m_ids": m_ids,
+                        "m_p": [round(float(v), 5) for v in m_p_arr],
+                        "m_rank": m_rank_arr.tolist(),
+                        "m_strs": [vocab.get(str(t), "") for t in m_ids],
+                    }
+                frames.append(frame)
+            return {"k": data["k"], "layers": [int(l) for l in data["layers"]], "frames": frames}
+        except Exception as exc:
+            raise FrameStorageError(f"corrupt frame archive for message {message_id}: {exc}") from exc
 
     def export(self, conversation_id, fmt="json", include_frames=False):
         conv = self.get_conversation(conversation_id)

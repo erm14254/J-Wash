@@ -127,6 +127,28 @@ def _raise_route_outcome(outcome: RouteOutcome):
         raise HTTPException(outcome.status, outcome.message or "request failed") from None
     return outcome.value
 
+
+class PreparedWorkerPayload:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def take(self):
+        payload, self._payload = self._payload, None
+        if payload is None:
+            raise RuntimeError("prepared payload already transferred")
+        return payload
+
+
+def _route_exception(status, exc):
+    message = str(exc)
+    try:
+        exc.__traceback__ = None
+        exc.__context__ = None
+        exc.__cause__ = None
+    except Exception:
+        pass
+    return _route_http(status, message)
+
 def _worker_success(value=None):
     return WorkerOutcome(value=value)
 
@@ -165,10 +187,15 @@ def _coordinated_interventions(snap):
 async def _retain_worker_task_or_cancel(task, dispatch):
     try:
         _retain_worker_task(task)
-    except Exception:
+    except Exception as exc:
         dispatch.cancel_from_awaiter()
-        await asyncio.gather(asyncio.shield(task), return_exceptions=True)
-        raise
+        original = exc
+        try:
+            await asyncio.gather(asyncio.shield(task), return_exceptions=True)
+        except asyncio.CancelledError:
+            await asyncio.gather(asyncio.shield(task), return_exceptions=True)
+            raise original from None
+        raise original from None
     return task
 
 
@@ -184,7 +211,11 @@ def _retain_worker_task(task):
         finally:
             _deferred_worker_tasks.discard(done_task)
 
-    task.add_done_callback(_done)
+    try:
+        task.add_done_callback(_done)
+    except Exception:
+        _deferred_worker_tasks.discard(task)
+        raise
 
 
 def _valid_devices():
@@ -716,7 +747,7 @@ def _lens_layers_resource(token, req):
     except Exception as exc:
         if isinstance(exc, HTTPException):
             return _route_http(exc.status_code, exc.detail)
-        raise
+        return _route_exception(500, exc)
     finally:
         old_state = result = None
 
@@ -768,6 +799,8 @@ def _interventions_add_resource(token, snap, req):
         return _route_http(422, str(exc))
     except HTTPException as exc:
         return _route_http(exc.status_code, exc.detail)
+    except Exception as exc:
+        return _route_exception(500, exc)
     finally:
         bundle = rules = mutate = None
 
@@ -816,6 +849,8 @@ def _interventions_patch_resource(token, snap, rule_id, req, needs_dirs):
         return _route_http(404, str(exc))
     except HTTPException as exc:
         return _route_http(exc.status_code, exc.detail)
+    except Exception as exc:
+        return _route_exception(500, exc)
     finally:
         bundle = rules = mutate = None
 
@@ -847,6 +882,8 @@ def _interventions_scale_resource(token, snap, req):
         return _route_value({"scale": scale, "mode": mode})
     except ValueError as exc:
         return _route_http(422, str(exc))
+    except Exception as exc:
+        return _route_exception(500, exc)
     finally:
         mutate = None
 
@@ -873,6 +910,8 @@ def _interventions_remove_resource(token, snap, rule_id):
             return interventions.remove(rule_id)
         rules, _ = _run_intervention_transaction(token, snap, mutate)
         return _route_value({"rules": list(rules or [])})
+    except Exception as exc:
+        return _route_exception(500, exc)
     finally:
         rules = mutate = None
 
@@ -899,6 +938,8 @@ def _interventions_clear_resource(token, snap):
             return interventions.remove()
         rules, _ = _run_intervention_transaction(token, snap, mutate)
         return _route_value({"rules": list(rules or [])})
+    except Exception as exc:
+        return _route_exception(500, exc)
     finally:
         rules = mutate = None
 
@@ -1096,6 +1137,8 @@ def _presets_apply_resource(token, snap, preset):
         return _route_http(422, str(exc))
     except HTTPException as exc:
         return _route_http(exc.status_code, exc.detail)
+    except Exception as exc:
+        return _route_exception(500, exc)
     finally:
         bundle = current_iv = rules = mutate = warnings = None
 
@@ -1132,7 +1175,10 @@ async def api_edit_export(req: ExportRequest):
             manager.coordinator.release(token)
             token = None
         return _raise_route_outcome(outcome)
-    payload_seed = outcome.value
+    prepared = outcome.value
+    outcome = None
+    payload_seed = prepared.take()
+    prepared = None
 
     try:
         publication_gate = editing.PublicationGate(
@@ -1142,10 +1188,11 @@ async def api_edit_export(req: ExportRequest):
         payload.update(publication_gate=publication_gate, format=req.format, name=req.name)
         dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
     except Exception:
+        payload_seed = payload = prepared = None
         if token is not None:
             manager.coordinator.release(token)
         raise
-    payload_seed = payload = None
+    payload_seed = payload = prepared = None
 
     def worker():
         if not dispatch.claim():
@@ -1214,14 +1261,16 @@ def _export_preflight_resource(snap, req):
                 "(or \"global projection\" on write-norm architectures) — per-layer "
                 "steering does not bake faithfully",
             )
-        return _route_value({
+        return _route_value(PreparedWorkerPayload({
             "bundle": bundle, "meta": meta, "rules": rules, "source_dir": source_dir,
             "scale": scale, "kwargs": kwargs, "export_fn": export_fn,
-        })
+        }))
     except ValueError as exc:
         return _route_http(422, str(exc))
     except HTTPException as exc:
         return _route_http(exc.status_code, exc.detail)
+    except Exception as exc:
+        return _route_exception(500, exc)
     finally:
         bundle = meta = intervention_snapshot = rules = source_dir = kwargs = export_fn = None
 
@@ -1247,14 +1296,16 @@ def _gguf_preflight_resource(snap):
         else:
             return _route_http(422, "export requires a pure-weights mode")
         source_dir = resolve_local_dir(meta["model_id"])
-        return _route_value({
+        return _route_value(PreparedWorkerPayload({
             "bundle": bundle, "meta": meta, "rules": rules, "source_dir": source_dir,
             "scale": scale, "kwargs": kwargs, "export_fn": export_fn,
-        })
+        }))
     except ValueError as exc:
         return _route_http(422, str(exc))
     except HTTPException as exc:
         return _route_http(exc.status_code, exc.detail)
+    except Exception as exc:
+        return _route_exception(500, exc)
     finally:
         bundle = meta = intervention_snapshot = rules = source_dir = kwargs = export_fn = None
 
@@ -1422,7 +1473,10 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
                 manager.coordinator.release(token)
                 token = None
             return _raise_route_outcome(outcome)
-        payload_seed = outcome.value
+        prepared = outcome.value
+        outcome = None
+        payload_seed = prepared.take()
+        prepared = None
         try:
             publication_gate = editing.PublicationGate(
                 lambda: not manager.coordinator.is_cancelled(token) and manager.coordinator.is_current(token)
@@ -1431,10 +1485,11 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
             payload.update(name="/".join((*name_parts, "hf")), publication_gate=publication_gate)
             dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
         except Exception:
+            payload_seed = payload = prepared = None
             if token is not None:
                 manager.coordinator.release(token)
             raise
-        payload_seed = payload = None
+        payload_seed = payload = prepared = None
 
         def bake_worker():
             if not dispatch.claim():
@@ -1712,7 +1767,7 @@ def _token_lookup_resource(snap, q: str):
     except Exception as exc:
         if isinstance(exc, HTTPException):
             return _route_http(exc.status_code, exc.detail)
-        raise
+        return _route_exception(500, exc)
     finally:
         tokenizer = candidates = None
 
@@ -2246,14 +2301,30 @@ def _persisted_generate(req, stop_event, emit, gen_context):
             stats=done_holder.get("stats"),
             stopped=done_holder.get("stopped"),
         )
-        message_id = store.add_message(
-            conversation_id, parent_id, "assistant", done_holder.get("text", ""), meta=meta
+        insert_meta = dict(meta)
+        if frames_acc:
+            insert_meta.update(publication_state="frames_pending", frames_expected=True)
+        message_id, inserted_version = store.add_message(
+            conversation_id, parent_id, "assistant", done_holder.get("text", ""), meta=insert_meta,
+            return_version=True,
         )
         if frames_acc:
+            complete_meta = dict(meta, publication_state="complete", frames_expected=True)
             try:
-                store.save_frames(message_id, frames_acc, layers_used, k_used)
+                store.save_frames(
+                    message_id, frames_acc, layers_used, k_used,
+                    expected_version=inserted_version, complete_meta=complete_meta,
+                )
             except StaleMessageUpdate:
                 emit({"type": "error", "message": "message changed before frames were attached; retry"})
+                return
+            except FrameStorageError as exc:
+                store.update_message(
+                    message_id, done_holder.get("text", ""),
+                    meta=dict(meta, publication_state="frames_publication_failed", frames_expected=True, error=str(exc)),
+                    clear_frames=True,
+                )
+                emit({"type": "error", "message": "frames could not be published; retry"})
                 return
         emit(dict(done_holder, conversation_id=conversation_id, message_id=message_id))
     except Exception as exc:
@@ -2442,9 +2513,17 @@ async def _run_chat(ws, req):
         await asyncio.gather(asyncio.shield(worker), return_exceptions=True)
         await _ws_send(ws, json.dumps({"type": "error", "message": str(exc)}))
         return
+    get_task = None
     try:
         while True:
-            get_task = asyncio.create_task(queue.get())
+            try:
+                get_task = asyncio.create_task(queue.get())
+            except Exception as exc:
+                stop_event.set()
+                dispatch.cancel_from_awaiter()
+                await asyncio.gather(asyncio.shield(worker), receiver, return_exceptions=True)
+                await _ws_send(ws, json.dumps({"type": "error", "message": str(exc)}))
+                return
             done, pending = await asyncio.wait(
                 {get_task, receiver, worker},
                 return_when=asyncio.FIRST_COMPLETED,
@@ -2458,15 +2537,24 @@ async def _run_chat(ws, req):
                 get_task.cancel()
                 break
             frame = get_task.result()
+            get_task = None
             await _ws_send(ws, json.dumps(frame))
             if frame["type"] in ("done", "error"):
                 break
     finally:
         stop_event.set()
+        if get_task is not None and not get_task.done():
+            get_task.cancel()
         if not worker.done():
             dispatch.cancel_from_awaiter()
         receiver.cancel()
-        await asyncio.gather(asyncio.shield(worker), receiver, return_exceptions=True)
+        await asyncio.gather(
+            asyncio.shield(worker),
+            receiver,
+            *( [get_task] if get_task is not None else [] ),
+            return_exceptions=True,
+        )
+        get_task = receiver = worker = None
 
 
 @app.websocket("/ws")

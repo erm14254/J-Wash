@@ -772,3 +772,120 @@ def test_persisted_continue_fails_closed_when_base_frames_cannot_load(monkeypatc
     app._persisted_continue({}, 1, threading.Event(), emitted.append, context)
     assert not unchanged["updated"]
     assert emitted[-1]["type"] == "error"
+
+
+def test_initial_save_frames_uses_inserted_version_not_later_edit(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c")
+    mid, version = s.add_message(cid, None, "assistant", "T", meta={"publication_state": "frames_pending"}, return_version=True)
+    s.update_message(mid, "E", meta={"edited": True}, clear_frames=True)
+    with pytest.raises(store_mod.StaleMessageUpdate):
+        s.save_frames(mid, [_frame(0)], [0], 1, expected_version=version, complete_meta={"publication_state": "complete"})
+    current = s.get_message(mid)
+    assert current["content"] == "E"
+    assert current["frames_file"] is None
+    assert not list(store_mod.FRAMES_DIR.glob("*.msgpack"))
+
+
+def test_store_save_frames_rolls_back_failed_commit_before_connection_reuse(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c")
+    mid, version = s.add_message(cid, None, "assistant", "T", meta={"publication_state": "frames_pending"}, return_version=True)
+    conn = s._conn()
+    fail_once = {"yes": True}
+
+    class CommitFailProxy:
+        def __getattr__(self, name):
+            return getattr(conn, name)
+        @property
+        def in_transaction(self):
+            return conn.in_transaction
+        def execute(self, *args, **kwargs):
+            return conn.execute(*args, **kwargs)
+        def rollback(self):
+            return conn.rollback()
+        def commit(self):
+            if fail_once["yes"]:
+                fail_once["yes"] = False
+                raise RuntimeError("commit failed")
+            return conn.commit()
+
+    monkeypatch.setattr(s, "_conn", lambda: CommitFailProxy())
+    with pytest.raises(RuntimeError):
+        s.save_frames(mid, [_frame(0)], [0], 1, expected_version=version, complete_meta={"publication_state": "complete"})
+    assert not conn.in_transaction
+    s.update_message(mid, "after", meta={"ok": True}, clear_frames=True)
+    current = s.get_message(mid)
+    assert current["content"] == "after"
+    assert current["frames_file"] is None
+
+
+def test_store_candidate_file_fsync_failure_is_actionable(tmp_path, monkeypatch):
+    import errno
+    import os
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c")
+    mid, version = s.add_message(cid, None, "assistant", "T", return_version=True)
+
+    def fail_fsync(fd):
+        raise OSError(errno.ENOSPC, "full")
+
+    monkeypatch.setattr(os, "fsync", fail_fsync)
+    with pytest.raises(store_mod.FrameStorageError):
+        s.save_frames(mid, [_frame(0)], [0], 1, expected_version=version)
+    assert s.get_message(mid)["frames_file"] is None
+    assert not list(store_mod.FRAMES_DIR.glob("*.tmp-*"))
+    assert not list(store_mod.FRAMES_DIR.glob("*.msgpack"))
+
+
+def test_delete_conversation_treats_frame_unlink_as_garbage_cleanup(tmp_path, monkeypatch):
+    from pathlib import Path
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c")
+    mid = s.add_message(cid, None, "assistant", "T")
+    frame_file = s.save_frames(mid, [_frame(0)], [0], 1)
+    original_unlink = Path.unlink
+
+    def failing_unlink(path, *args, **kwargs):
+        if path.name == frame_file:
+            raise PermissionError("open reader")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+    s.delete_conversation(cid)
+    with pytest.raises(ValueError):
+        s.get_conversation(cid)
+    assert (store_mod.FRAMES_DIR / frame_file).exists()
+
+
+def test_store_load_frames_corrupt_schema_maps_to_frame_storage_error(tmp_path, monkeypatch):
+    import msgpack
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c")
+    mid, version = s.add_message(cid, None, "assistant", "T", return_version=True)
+    filename, _ = s._write_unique_frame_candidate(mid, version, msgpack.packb({"version": 1, "frames": [{}]}))
+    conn = s._conn()
+    conn.execute("UPDATE messages SET frames_file = ?, version = version + 1 WHERE id = ?", (filename, mid))
+    conn.commit()
+    with pytest.raises(store_mod.FrameStorageError):
+        s.load_frames(mid)
