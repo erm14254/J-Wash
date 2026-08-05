@@ -480,18 +480,19 @@ class ModelManager:
 
     def load(self, model_id, dtype, quant, device):
         token = None
-        old_bundle = None
         candidate = None
+        hf_model = tokenizer = jl = None
+        published = False
         try:
-            token, snap = self.coordinator.acquire(OperationType.LOAD)
+            token, snap = self.coordinator.acquire(OperationType.LOAD, include_bundle=False)
             expected_session = snap.model_session_id
             if snap.loaded:
                 old_bundle, expected_session, _ = self.coordinator.withdraw_loaded(token)
                 with self._lock:
                     self._sync_from_bundle(None)
-                old_bundle = None
                 if self.on_model_withdraw is not None:
-                    self.on_model_withdraw(expected_session)
+                    self.on_model_withdraw(expected_session, token)
+                del old_bundle
                 _free_cuda()
             torch_dtype = torch.bfloat16 if dtype == "bf16" else torch.float16
             source = resolve_source(model_id)
@@ -542,11 +543,14 @@ class ModelManager:
             }
             candidate = LoadedModelBundle.from_parts(hf_model, tokenizer, jl, meta, capability_profile)
             self.coordinator.publish_loaded(token, candidate, expected_unloaded_session=expected_session)
+            published = True
             with self._lock:
                 self._sync_from_bundle(candidate)
             return dict(candidate.meta)
         except Exception:
-            if candidate is None:
+            if not published:
+                candidate = None
+                hf_model = tokenizer = jl = None
                 _free_cuda()
             raise
         finally:
@@ -556,7 +560,7 @@ class ModelManager:
     def unload(self):
         token = None
         try:
-            token, _snap = self.coordinator.acquire(OperationType.UNLOAD)
+            token, _snap = self.coordinator.acquire(OperationType.UNLOAD, include_bundle=False)
             return self._unload_locked(token=token)
         finally:
             if token is not None:
@@ -570,9 +574,10 @@ class ModelManager:
             return {"unloaded": False, "vram_allocated": _torch_allocated()}
         before = _torch_allocated()
         if self.on_model_withdraw is not None:
-            self.on_model_withdraw(session_id)
+            self.on_model_withdraw(session_id, token)
         with self._lock:
             self._sync_from_bundle(None)
+        del old
         _free_cuda()
         return {
             "unloaded": True,
@@ -795,22 +800,34 @@ class ModelManager:
             )
             ok = True
         finally:
+            cleanup_error = None
             if attachment is not None:
-                attachment.close()
+                try:
+                    attachment.close()
+                except Exception as exc:
+                    cleanup_error = cleanup_error or exc
             if reader is not None:
-                reader.close()
+                try:
+                    reader.close()
+                except Exception as exc:
+                    cleanup_error = cleanup_error or exc
             # aborted generation (OOM/error/hard stop): the KV cache and captured
             # activations are now dereferenced — return the blocks
-            if not ok:
-                _free_cuda()
-            elif torch.cuda.is_available():
-                # success path: when the device is nearly full (big model + long
-                # KV cache), the freed cache fragments the reserve and the next
-                # prefill hits costly allocator retries — generation gets slower
-                # with every message. Hand segments back once the reserve crosses
-                # 92 % of the device; a no-op (no sync, no gc) below that.
-                for i in range(torch.cuda.device_count()):
-                    total = torch.cuda.get_device_properties(i).total_memory
-                    if torch.cuda.memory_reserved(i) > 0.92 * total:
-                        with torch.cuda.device(i):
-                            torch.cuda.empty_cache()
+            try:
+                if not ok:
+                    _free_cuda()
+                elif torch.cuda.is_available():
+                    # success path: when the device is nearly full (big model + long
+                    # KV cache), the freed cache fragments the reserve and the next
+                    # prefill hits costly allocator retries — generation gets slower
+                    # with every message. Hand segments back once the reserve crosses
+                    # 92 % of the device; a no-op (no sync, no gc) below that.
+                    for i in range(torch.cuda.device_count()):
+                        total = torch.cuda.get_device_properties(i).total_memory
+                        if torch.cuda.memory_reserved(i) > 0.92 * total:
+                            with torch.cuda.device(i):
+                                torch.cuda.empty_cache()
+            except Exception as exc:
+                cleanup_error = cleanup_error or exc
+            if cleanup_error is not None:
+                raise cleanup_error

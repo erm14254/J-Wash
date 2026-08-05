@@ -1,4 +1,5 @@
 import pytest
+import weakref
 
 from core.model_session import (
     LoadedModelBundle,
@@ -11,6 +12,14 @@ from core.model_session import (
 
 def bundle(name="m"):
     return LoadedModelBundle.from_parts(object(), object(), object(), {"model_id": name}, {"ok": True})
+
+
+class WeakModel:
+    pass
+
+
+def weak_bundle(name="m"):
+    return LoadedModelBundle.from_parts(WeakModel(), object(), object(), {"model_id": name}, {"ok": True})
 
 
 def test_initial_load_success_and_failure_session_rules():
@@ -93,3 +102,26 @@ def test_last_generation_stale_rejected():
     c.release(t)
     assert not c.publish_last_generation(t, old_session, {"text": "stale"})
     assert c.snapshot().last_generation is None
+
+
+def test_metadata_snapshots_do_not_retain_model_bundle():
+    c = ModelSessionCoordinator()
+    t, s = c.acquire(OperationType.LOAD)
+    b = weak_bundle("a")
+    model_ref = weakref.ref(b.hf_model)
+    c.publish_loaded(t, b, expected_unloaded_session=s.model_session_id)
+    c.release(t)
+    status = c.status_snapshot()
+    admission = c.snapshot(include_bundle=False)
+    assert status.loaded and admission.loaded
+    assert not hasattr(status, "bundle")
+    assert admission.bundle is None
+    del status, admission, b
+    t, _ = c.acquire(OperationType.UNLOAD, include_bundle=False)
+    old, _, changed = c.withdraw_loaded(t)
+    assert changed
+    del old
+    c.release(t)
+    import gc
+    gc.collect()
+    assert model_ref() is None

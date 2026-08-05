@@ -68,6 +68,19 @@ class ModelSessionSnapshot:
     operation: OperationStatus | None = None
 
 
+@dataclass(frozen=True)
+class ModelStatusSnapshot:
+    model_session_id: int
+    model_state: str
+    loaded: bool
+    model_meta: MappingProxyType | None
+    capability_profile: Any
+    lens: Any = None
+    interventions: Any = None
+    last_generation: Any = None
+    operation: OperationStatus | None = None
+
+
 class OperationConflict(RuntimeError):
     pass
 
@@ -142,11 +155,11 @@ class ModelSessionCoordinator:
         self._lens_binding_id = 0
         self._intervention_revision = 0
 
-    def snapshot(self) -> ModelSessionSnapshot:
+    def snapshot(self, *, include_bundle: bool = True) -> ModelSessionSnapshot:
         with self._lock:
-            return self._snapshot_locked()
+            return self._snapshot_locked(include_bundle=include_bundle)
 
-    def _snapshot_locked(self) -> ModelSessionSnapshot:
+    def _operation_status_locked(self):
         op = None
         if self._operation is not None:
             op = OperationStatus(
@@ -157,23 +170,78 @@ class ModelSessionCoordinator:
                 start_timestamp=self._operation.start_timestamp,
                 cancellation_requested=self._operation.id in self._cancelled,
             )
+        return op
+
+    @staticmethod
+    def _light_lens(record):
+        if record is None:
+            return None
+        if isinstance(record, dict):
+            return copy.deepcopy(record)
+        meta = getattr(record, "meta", None)
+        return copy.deepcopy(meta) if meta is not None else None
+
+    @staticmethod
+    def _light_interventions(record):
+        if record is None:
+            return None
+        if isinstance(record, dict):
+            return {
+                "revision": record.get("revision"),
+                "model_session_id": record.get("model_session_id"),
+                "lens_binding_id": record.get("lens_binding_id"),
+                "scale": record.get("scale"),
+                "mode": record.get("mode"),
+                "summary": copy.deepcopy(record.get("summary") or []),
+                "active_summary": copy.deepcopy(record.get("active_summary") or []),
+            }
+        return copy.deepcopy(record)
+
+    def _snapshot_locked(self, *, include_bundle: bool = True) -> ModelSessionSnapshot:
+        op = self._operation_status_locked()
         return ModelSessionSnapshot(
             model_session_id=self._model_session_id,
             model_state="loaded" if self._bundle is not None else "unloaded",
-            bundle=self._bundle,
+            bundle=self._bundle if include_bundle else None,
             loaded=self._bundle is not None,
-            lens_binding=copy.deepcopy(self._lens_binding),
-            interventions=copy.deepcopy(self._interventions),
+            lens_binding=(
+                copy.deepcopy(self._lens_binding)
+                if include_bundle else self._light_lens(self._lens_binding)
+            ),
+            interventions=(
+                copy.deepcopy(self._interventions)
+                if include_bundle else self._light_interventions(self._interventions)
+            ),
             last_generation=copy.deepcopy(self._last_generation),
             operation=op,
         )
+
+    def status_snapshot(self) -> ModelStatusSnapshot:
+        with self._lock:
+            return ModelStatusSnapshot(
+                model_session_id=self._model_session_id,
+                model_state="loaded" if self._bundle is not None else "unloaded",
+                loaded=self._bundle is not None,
+                model_meta=(
+                    MappingProxyType(copy.deepcopy(dict(self._bundle.meta)))
+                    if self._bundle is not None else None
+                ),
+                capability_profile=(
+                    copy.deepcopy(self._bundle.capability_profile)
+                    if self._bundle is not None else None
+                ),
+                lens=self._light_lens(self._lens_binding),
+                interventions=self._light_interventions(self._interventions),
+                last_generation=copy.deepcopy(self._last_generation),
+                operation=self._operation_status_locked(),
+            )
 
     @property
     def busy(self):
         with self._lock:
             return None if self._operation is None else self._operation.type.value
 
-    def acquire(self, op_type: OperationType | str, *, requires_loaded: bool | None = None) -> tuple[OperationToken, ModelSessionSnapshot]:
+    def acquire(self, op_type: OperationType | str, *, requires_loaded: bool | None = None, include_bundle: bool = True) -> tuple[OperationToken, ModelSessionSnapshot]:
         op_type = OperationType(op_type)
         with self._lock:
             if self._operation is not None:
@@ -186,7 +254,7 @@ class ModelSessionCoordinator:
             token = OperationToken(next(self._op_ids), op_type, self._model_session_id, self._model_session_id, requires_loaded)
             self._operation = token
             self._cancelled.discard(token.id)
-            return token, self._snapshot_locked()
+            return token, self._snapshot_locked(include_bundle=include_bundle)
 
     def is_current(self, token: OperationToken) -> bool:
         with self._lock:
@@ -250,10 +318,21 @@ class ModelSessionCoordinator:
         with self._lock:
             self._lens_binding = None
 
-    def update_interventions(self, token: OperationToken | None, snapshot: Any) -> int:
+    def update_interventions(self, token: OperationToken, snapshot: Any) -> int:
         with self._lock:
-            if token is not None and self._operation != token:
+            if self._operation != token:
                 raise OperationConflict("stale intervention operation")
+            self._intervention_revision += 1
+            self._interventions = copy.deepcopy(snapshot)
+            return self._intervention_revision
+
+    def bootstrap_interventions_for_test(self, snapshot: Any) -> int:
+        """Install synthetic intervention status without operation ownership.
+
+        This is intentionally reserved for tests/bootstrap data where no
+        production request is mutating live model-bound state.
+        """
+        with self._lock:
             self._intervention_revision += 1
             self._interventions = copy.deepcopy(snapshot)
             return self._intervention_revision

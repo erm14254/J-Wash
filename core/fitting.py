@@ -259,7 +259,21 @@ class FitManager:
             run = _FitRun()
             run.reservation_release = reservation_release
             self._active_run = run
-        threading.Thread(target=self._run, args=(run, name, params), daemon=True).start()
+        orchestrator = threading.Thread(target=self._run, args=(run, name, params), daemon=True)
+        try:
+            orchestrator.start()
+        except Exception:
+            with self._lock:
+                if self._active_run is run:
+                    self._active_run = None
+                self.state = {"state": "error", "error": "failed to start fitting orchestrator"}
+            if reservation_release is not None:
+                try:
+                    reservation_release()
+                except Exception:
+                    pass
+            run.done.set()
+            raise
         return dict(self.state)
 
     def stop(self):
@@ -638,18 +652,30 @@ class FitManager:
             run.heartbeat_stop.set()
             with run.process_lock:
                 for proc in run.processes:
-                    if proc.poll() is None:
-                        proc.terminate()
+                    try:
+                        if proc.poll() is None:
+                            proc.terminate()
+                    except Exception:
+                        pass
             for proc in run.processes:
                 # ``wait`` is required even when terminate made ``poll`` turn
                 # non-None immediately: the child still needs to be reaped.
-                proc.wait()
+                try:
+                    proc.wait()
+                except Exception:
+                    pass
             heartbeat = run.heartbeat_thread
             if heartbeat is not None and heartbeat is not threading.current_thread():
-                heartbeat.join()
+                try:
+                    heartbeat.join()
+                except Exception:
+                    pass
             for thread in run.helper_threads:
                 if thread is not threading.current_thread():
-                    thread.join()
+                    try:
+                        thread.join()
+                    except Exception:
+                        pass
             with self._lock:
                 if self._active_run is run:
                     self._active_run = None

@@ -1,6 +1,7 @@
 import threading
 
 from core.ablation import HookAttachment
+from core.editing import PublicationCancelled, PublicationGate
 from core.model_session import ModelSessionCoordinator, OperationConflict, OperationType
 
 
@@ -116,3 +117,24 @@ def test_dispatch_cancellation_after_claim_leaves_release_to_worker():
     assert c.snapshot().operation.id == token.id
     assert c.snapshot().operation.cancellation_requested is True
     assert dispatch.release_from_worker() is True
+
+
+def test_publication_gate_cancellation_wins_before_rename():
+    published = []
+    gate = PublicationGate(lambda: True)
+    assert gate.cancel() is True
+    try:
+        gate.publish(lambda: published.append("renamed"))
+    except PublicationCancelled:
+        pass
+    assert published == []
+    assert gate.state == "cancelled-before-publication"
+
+
+def test_publication_gate_rename_wins_before_cancellation():
+    published = []
+    gate = PublicationGate(lambda: True)
+    gate.publish(lambda: published.append("renamed"))
+    assert gate.cancel() is False
+    assert published == ["renamed"]
+    assert gate.state == "published"

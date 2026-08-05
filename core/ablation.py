@@ -107,6 +107,7 @@ class Interventions:
         self._handles = []  # non-authoritative legacy inspection only
         self._scale = 1.0
         self._mode = "standard"
+        self._revision = 0
 
     @property
     def active(self):
@@ -155,6 +156,7 @@ class Interventions:
     def set_scale(self, scale):
         with self._lock:
             self._scale = float(scale)
+            self._revision += 1
             return self._scale
 
     def set_mode(self, mode):
@@ -162,6 +164,7 @@ class Interventions:
             raise ValueError(f"unknown intervention mode: {mode}")
         with self._lock:
             self._mode = mode
+            self._revision += 1
             return self._mode
 
     def set_scale_and_mode(self, *, scale=None, mode=None):
@@ -174,6 +177,8 @@ class Interventions:
                 self._scale = new_scale
             if mode is not None:
                 self._mode = mode
+            if new_scale is not None or mode is not None:
+                self._revision += 1
             return self._scale, self._mode
 
     def state_snapshot(self):
@@ -188,6 +193,7 @@ class Interventions:
         with self._lock:
             self._rules = []
             self._mode = "standard"
+            self._revision += 1
             return self._summary_locked()
 
     def active_rules_full(self):
@@ -257,6 +263,7 @@ class Interventions:
                 else None,
             }
             self._rules.append(rule)
+            self._revision += 1
             return self._summary_locked()
 
     def update(self, rule_id, *, factor=None, layers=None, enabled=None,
@@ -277,6 +284,7 @@ class Interventions:
                 # token / replacement / mode / layers change the directions →
                 # the lens and model are required to re-resolve them
                 if not needs_dirs:
+                    self._revision += 1
                     return self._summary_locked()
                 if lens_manager is None or jl is None:
                     raise ValueError("model and lens required to edit the rule")
@@ -310,6 +318,7 @@ class Interventions:
                     if rule["replacement_id"] is not None
                     else None
                 )
+                self._revision += 1
                 return self._summary_locked()
             raise ValueError(f"unknown rule {rule_id}")
 
@@ -319,15 +328,33 @@ class Interventions:
                 self._rules = []
             else:
                 self._rules = [r for r in self._rules if r["id"] != rule_id]
+            self._revision += 1
             return self._summary_locked()
 
     def snapshot(self):
         with self._lock:
             return {
+                "revision": self._revision,
                 "scale": self._scale,
                 "mode": self._mode,
                 "rules": [self._clone_rule_locked(r) for r in self._rules],
+                "active_rules": self._active_rules_locked(),
                 "summary": self._summary_locked(),
+                "active_summary": [
+                    {
+                        "id": rule["id"],
+                        "token_id": rule["token_id"],
+                        "token": rule["token"],
+                        "mode": rule["mode"],
+                        "factor": rule["factor"],
+                        "replacement_id": rule["replacement_id"],
+                        "replacement": rule["replacement"],
+                        "layers": list(rule["layers"]),
+                        "enabled": rule.get("enabled", True),
+                    }
+                    for rule in self._rules
+                    if rule["layers"] and rule.get("enabled", True)
+                ],
             }
 
     def attach(self, jl, *, snapshot=None):

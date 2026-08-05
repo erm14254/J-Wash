@@ -62,8 +62,15 @@ class ActivationCatcher:
             return
         self._closed = True
         handles, self._handles = self._handles, []
+        first = None
         for handle in handles:
-            handle.remove()
+            try:
+                handle.remove()
+            except Exception as exc:
+                if first is None:
+                    first = exc
+        if first is not None:
+            raise first
 
 
 def _vocab_fingerprint(tokenizer):
@@ -145,78 +152,85 @@ class LensManager:
         with self._lock:
             return LensGenerationView(self) if self.lens is not None else None
 
+    def state_record(self):
+        with self._lock:
+            return {
+                "lens": self.lens,
+                "meta": dict(self.meta) if self.meta else None,
+                "layers": list(self.layers),
+                "k": self.k,
+                "mask": self.mask,
+                "_J": self._J,
+                "_tok_strs": dict(self._tok_strs),
+                "_pref_key": self._pref_key,
+                "binding_id": self.binding_id,
+                "model_session_id": self.model_session_id,
+            }
+
+    def restore_state_record(self, record):
+        with self._lock:
+            self.lens = record["lens"]
+            self.meta = dict(record["meta"]) if record["meta"] else None
+            self.layers = list(record["layers"])
+            self.k = record["k"]
+            self.mask = record["mask"]
+            self._J = record["_J"]
+            self._tok_strs = dict(record["_tok_strs"])
+            self._pref_key = record["_pref_key"]
+            self.binding_id = record["binding_id"]
+            self.model_session_id = record["model_session_id"]
+
     def load(self, model_manager, *, repo_id=None, filename="lens.pt", revision=None,
              path=None, layers=None, k=8):
+        snap = model_manager.session_snapshot() if hasattr(model_manager, "session_snapshot") else None
+        if model_manager.hf_model is None:
+            raise ValueError("load a model first")
+        model_session_id = snap.model_session_id if snap is not None else None
+        if path:
+            lens = JacobianLens.from_pretrained(path)
+            source = {"path": path, "repo_id": None, "filename": None, "revision": None}
+        else:
+            lens = JacobianLens.from_pretrained(repo_id, filename=filename, revision=revision)
+            source = {"path": None, "repo_id": repo_id, "filename": filename, "revision": revision}
+
+        model_meta = dict(model_manager.meta)
+        if lens.d_model != model_meta["d_model"]:
+            raise ValueError(f"lens d_model ({lens.d_model}) != model ({model_meta['d_model']})")
+        n_layers = model_meta["n_layers"]
+        fitted = lens.source_layers
+        if fitted[-1] >= n_layers:
+            raise ValueError(f"the lens covers layer {fitted[-1]}, outside a model with {n_layers} layers")
+        pref_key = _lens_pref_key(source)
+        if layers:
+            tapped = sorted(set(layers) & set(fitted))
+            if not tapped:
+                raise ValueError(f"no requested layer is fitted (fitted: {fitted[0]}..{fitted[-1]})")
+        else:
+            saved = _load_lens_prefs().get(pref_key)
+            tapped = (sorted(set(saved) & set(fitted)) if saved else None) or list(fitted)
+        _save_lens_pref(pref_key, tapped)
+
+        device = model_manager.jl.input_device
+        stacked = torch.stack([lens.jacobians[l].float() for l in tapped]).to(device)
+        tokenizer = model_manager.tokenizer
+        vocab_size = model_manager.hf_model.get_output_embeddings().weight.shape[0]
+        mask = display_token_mask(tokenizer, vocab_size).to(device)
+
+        warnings = []
+        if model_meta.get("quant"):
+            warnings.append(
+                f"model loaded in {model_meta['quant']}: the lens was probably "
+                "fitted on the unquantized weights, the readouts may drift"
+            )
+        if model_meta["model_id"].startswith("local/"):
+            warnings.append("local model: cannot verify that the lens matches these exact weights")
+
         with self._lock:
-            snap = model_manager.session_snapshot() if hasattr(model_manager, "session_snapshot") else None
-            if model_manager.hf_model is None:
-                raise ValueError("load a model first")
-            model_session_id = snap.model_session_id if snap is not None else None
-            if path:
-                lens = JacobianLens.from_pretrained(path)
-                source = {"path": path, "repo_id": None, "filename": None, "revision": None}
-            else:
-                lens = JacobianLens.from_pretrained(
-                    repo_id, filename=filename, revision=revision
-                )
-                source = {"path": None, "repo_id": repo_id, "filename": filename, "revision": revision}
-
-            model_meta = model_manager.meta
-            if lens.d_model != model_meta["d_model"]:
-                raise ValueError(
-                    f"lens d_model ({lens.d_model}) != model ({model_meta['d_model']})"
-                )
-            n_layers = model_meta["n_layers"]
-            fitted = lens.source_layers
-            if fitted[-1] >= n_layers:
-                raise ValueError(
-                    f"the lens covers layer {fitted[-1]}, outside a model with {n_layers} layers"
-                )
-            pref_key = _lens_pref_key(source)
-            if layers:
-                tapped = sorted(set(layers) & set(fitted))
-                if not tapped:
-                    raise ValueError(
-                        f"no requested layer is fitted (fitted: {fitted[0]}..{fitted[-1]})"
-                    )
-            else:
-                # last range used for THIS lens, otherwise all the fitted layers
-                # (= the selection made when the fit was created; max range for a
-                # downloaded lens)
-                saved = _load_lens_prefs().get(pref_key)
-                tapped = (sorted(set(saved) & set(fitted)) if saved else None) or list(fitted)
-            _save_lens_pref(pref_key, tapped)
-            self._pref_key = pref_key
-
-            device = model_manager.jl.input_device
-            stacked = torch.stack([lens.jacobians[l].float() for l in tapped]).to(device)
-            tokenizer = model_manager.tokenizer
-            vocab_size = model_manager.hf_model.get_output_embeddings().weight.shape[0]
-            mask = display_token_mask(tokenizer, vocab_size).to(device)
-
-            warnings = []
-            if model_meta.get("quant"):
-                warnings.append(
-                    f"model loaded in {model_meta['quant']}: the lens was probably "
-                    "fitted on the unquantized weights, the readouts may drift"
-                )
-            if model_meta["model_id"].startswith("local/"):
-                warnings.append(
-                    "local model: cannot verify that the lens matches these exact weights"
-                )
-
-            self.binding_id += 1
-            self.model_session_id = model_session_id
-            self.lens = lens
-            self.layers = tapped
-            self.k = int(k)
-            self.mask = mask
-            self._J = stacked
-            self._tok_strs = {}
-            self.meta = {
+            binding_id = self.binding_id + 1
+            meta = {
                 **source,
                 "model_session_id": model_session_id,
-                "lens_binding_id": self.binding_id,
+                "lens_binding_id": binding_id,
                 "model_id": model_meta["model_id"],
                 "model_revision": model_meta.get("revision"),
                 "d_model": lens.d_model,
@@ -224,33 +238,48 @@ class LensManager:
                 "fitted_layers": [int(fitted[0]), int(fitted[-1])],
                 "fitted_layers_all": [int(l) for l in fitted],
                 "tapped_layers": [int(l) for l in tapped],
-                "k": self.k,
+                "k": int(k),
                 "warnings": warnings,
             }
-            return self.meta
+            self.binding_id = binding_id
+            self.model_session_id = model_session_id
+            self.lens = lens
+            self.layers = tapped
+            self.k = int(k)
+            self.mask = mask
+            self._J = stacked
+            self._tok_strs = {}
+            self._pref_key = pref_key
+            self.meta = meta
+            return dict(self.meta)
 
     def set_layers(self, model_manager, layers, k=None):
         with self._lock:
             if self.lens is None:
                 raise ValueError("no lens loaded")
-            fitted = self.lens.source_layers
-            tapped = sorted(set(layers) & set(fitted))
-            if not tapped:
-                raise ValueError(
-                    f"no requested layer is fitted (fitted: {fitted[0]}..{fitted[-1]})"
-                )
-            device = model_manager.jl.input_device
+            lens = self.lens
+            old_k = self.k
+            pref_key = self._pref_key
+            old_meta = dict(self.meta)
+            binding_id = self.binding_id + 1
+        fitted = lens.source_layers
+        tapped = sorted(set(layers) & set(fitted))
+        if not tapped:
+            raise ValueError(f"no requested layer is fitted (fitted: {fitted[0]}..{fitted[-1]})")
+        device = model_manager.jl.input_device
+        stacked = torch.stack([lens.jacobians[l].float() for l in tapped]).to(device)
+        new_k = int(k) if k else old_k
+        if pref_key:
+            _save_lens_pref(pref_key, tapped)
+        with self._lock:
+            if self.lens is not lens:
+                raise ValueError("lens changed while updating layers")
             self.layers = tapped
-            self._J = torch.stack(
-                [self.lens.jacobians[l].float() for l in tapped]
-            ).to(device)
-            if k:
-                self.k = int(k)
-            self.binding_id += 1
-            self.meta = dict(self.meta, lens_binding_id=self.binding_id, tapped_layers=[int(l) for l in tapped], k=self.k)
-            if getattr(self, "_pref_key", None):
-                _save_lens_pref(self._pref_key, tapped)
-            return self.meta
+            self._J = stacked
+            self.k = new_k
+            self.binding_id = binding_id
+            self.meta = dict(old_meta, lens_binding_id=self.binding_id, tapped_layers=[int(l) for l in tapped], k=self.k)
+            return dict(self.meta)
 
     def unload(self):
         with self._lock:

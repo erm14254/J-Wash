@@ -44,10 +44,15 @@ interventions = Interventions()
 neighbors = TokenNeighbors()
 
 
-def _cleanup_model_bound_state(_session_id=None):
+def _cleanup_model_bound_state(_session_id=None, token=None):
     lens_manager.unload()
     neighbors.reset()
     interventions.clear_for_model_transition()
+    snapshot = interventions.snapshot()
+    snapshot["model_session_id"] = _session_id
+    snapshot["lens_binding_id"] = None
+    if token is not None:
+        manager.coordinator.update_interventions(token, snapshot)
 
 
 manager.on_model_withdraw = _cleanup_model_bound_state
@@ -55,6 +60,21 @@ manager.on_model_withdraw = _cleanup_model_bound_state
 _ws_locks = {}
 _loop_holder = {}
 _deferred_worker_tasks = set()
+
+
+def _retain_worker_task(task):
+    _deferred_worker_tasks.add(task)
+
+    def _done(done_task):
+        try:
+            if not done_task.cancelled():
+                done_task.exception()
+        except Exception:
+            logging.getLogger(__name__).exception("background model worker failed after awaiter cancellation")
+        finally:
+            _deferred_worker_tasks.discard(done_task)
+
+    task.add_done_callback(_done)
 
 
 def _valid_devices():
@@ -136,7 +156,7 @@ _downloads = {}
 _downloads_lock = threading.Lock()
 # last synchronous /api/generate exchange (CLI/MCP): surfaced in /api/status so
 # the UI can show what an external client generates, without persisting it
-_last_generation = None
+_generation_counter = 0
 
 
 class LoadRequest(BaseModel):
@@ -240,18 +260,19 @@ def api_models():
 
 @app.get("/api/status")
 def api_status():
-    coord = manager.session_snapshot()
-    scale, mode = interventions.state_snapshot()
-    loaded = coord.loaded or manager.hf_model is not None or manager.meta is not None
-    bundle = coord.bundle
-    profile = bundle.capability_profile if bundle is not None else manager.capability_profile
-    meta = dict(bundle.meta) if bundle is not None else (manager.meta if isinstance(manager.meta, dict) else {})
+    coord = manager.coordinator.status_snapshot()
+    iv = coord.interventions or {}
+    scale = iv.get("scale", 1.0)
+    mode = iv.get("mode", "standard")
+    loaded = coord.loaded
+    profile = coord.capability_profile
+    meta = dict(coord.model_meta or {})
     capability_snapshot = capabilities.snapshot(profile, mode, loaded=loaded)
     loaded_meta = ({**meta, **capabilities.legacy(profile, loaded=True)} if loaded else None)
     return {
         "loaded": loaded_meta,
         "capabilities": capability_snapshot,
-        "busy": manager.busy,
+        "busy": None if coord.operation is None else coord.operation.type,
         "model_session_id": coord.model_session_id,
         "model_state": coord.model_state,
         "operation": None if coord.operation is None else {
@@ -262,21 +283,30 @@ def api_status():
             "start_timestamp": coord.operation.start_timestamp,
             "cancellation_requested": coord.operation.cancellation_requested,
         },
-        "lens": lens_manager.meta,
+        "lens": coord.lens,
         "gpus": gpu_stats(),
         "downloads": list(_downloads.values()),
         "convert": _convert_state,
         "fit": fit_manager.state,
         "gguf": dict(_gguf_state),
-        "interventions": interventions.summary(),
+        "interventions": iv.get("summary", []),
         "interventions_scale": scale,
         "interventions_mode": mode,
-        "last_generation": coord.last_generation if coord.last_generation is not None else _last_generation,
+        "last_generation": coord.last_generation,
     }
 
 
 def _conflict(exc):
     return HTTPException(409, str(exc))
+
+
+def _publish_intervention_snapshot(token, snap):
+    data = interventions.snapshot()
+    data["model_session_id"] = snap.model_session_id
+    lens = manager.coordinator.status_snapshot().lens
+    data["lens_binding_id"] = (lens or {}).get("lens_binding_id") if isinstance(lens, dict) else None
+    manager.coordinator.update_interventions(token, data)
+    return data
 
 @app.post("/api/load")
 async def api_load(req: LoadRequest):
@@ -298,24 +328,42 @@ async def api_load(req: LoadRequest):
 
 @app.post("/api/models/delete")
 async def api_delete_model(req: DeleteModelRequest):
+    from core.model_manager import delete_model
+    stop_event = ThreadingEvent()
     token = None
     try:
-        token, _ = manager.coordinator.acquire(OperationType.MODEL_DELETE)
+        token, snap = manager.coordinator.acquire(OperationType.MODEL_DELETE)
+        if snap.bundle is not None and snap.bundle.meta.get("model_id") == req.model_id:
+            manager.coordinator.release(token)
+            token = None
+            raise HTTPException(409, "unload this model before deleting it")
     except OperationConflict as exc:
         raise _conflict(exc)
-    if manager.meta and manager.meta.get("model_id") == req.model_id:
-        manager.coordinator.release(token)
-        raise HTTPException(409, "unload this model before deleting it")
-    from core.model_manager import delete_model
+    dispatch = WorkerDispatch(manager.coordinator, token, stop_event)
+
+    def worker():
+        if not dispatch.claim():
+            return None
+        try:
+            return delete_model(req.model_id)
+        finally:
+            dispatch.release_from_worker()
+
     try:
-        return await asyncio.to_thread(delete_model, req.model_id)
+        task = asyncio.create_task(asyncio.to_thread(worker))
+    except Exception:
+        dispatch.cancel_from_awaiter()
+        raise
+    _retain_worker_task(task)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        dispatch.cancel_from_awaiter()
+        raise
     except ValueError as exc:
         raise HTTPException(400, str(exc))
     except Exception as exc:
         raise HTTPException(500, str(exc))
-    finally:
-        if token is not None:
-            manager.coordinator.release(token)
 
 
 # --- user settings (Options tab) --------------------------------------------
@@ -403,29 +451,51 @@ async def api_lens_load(req: LensLoadRequest):
     if not req.repo_id and not req.path:
         raise HTTPException(422, "repo_id or path required")
     token = None
+    stop_event = ThreadingEvent()
     try:
         token, _ = manager.coordinator.acquire(OperationType.LENS_UPDATE, requires_loaded=True)
-        result = await asyncio.to_thread(
-            lens_manager.load,
-            manager,
-            repo_id=req.repo_id,
-            filename=req.filename,
-            revision=req.revision,
-            path=req.path,
-            layers=req.layers,
-            k=req.k,
-        )
-        manager.coordinator.update_lens_binding(token, result)
-        return result
     except OperationConflict as exc:
         raise _conflict(exc)
     except ModelStateError as exc:
         raise HTTPException(422, str(exc))
+    dispatch = WorkerDispatch(manager.coordinator, token, stop_event)
+
+    def worker():
+        if not dispatch.claim():
+            return None
+        old_state = lens_manager.state_record()
+        try:
+            result = lens_manager.load(
+                manager,
+                repo_id=req.repo_id,
+                filename=req.filename,
+                revision=req.revision,
+                path=req.path,
+                layers=req.layers,
+                k=req.k,
+            )
+            try:
+                manager.coordinator.update_lens_binding(token, result)
+            except Exception:
+                lens_manager.restore_state_record(old_state)
+                raise
+            return result
+        finally:
+            dispatch.release_from_worker()
+
+    try:
+        task = asyncio.create_task(asyncio.to_thread(worker))
+    except Exception:
+        dispatch.cancel_from_awaiter()
+        raise
+    _retain_worker_task(task)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        dispatch.cancel_from_awaiter()
+        raise
     except Exception as exc:
         raise HTTPException(500, str(exc))
-    finally:
-        if token is not None:
-            manager.coordinator.release(token)
 
 
 @app.post("/api/lens/unload")
@@ -448,8 +518,13 @@ def api_lens_layers(req: LensLayersRequest):
     token = None
     try:
         token, _ = manager.coordinator.acquire(OperationType.LENS_UPDATE, requires_loaded=True)
+        old_state = lens_manager.state_record()
         result = lens_manager.set_layers(manager, req.layers, k=req.k)
-        manager.coordinator.update_lens_binding(token, result)
+        try:
+            manager.coordinator.update_lens_binding(token, result)
+        except Exception:
+            lens_manager.restore_state_record(old_state)
+            raise
         return result
     except OperationConflict as exc:
         raise _conflict(exc)
@@ -469,23 +544,33 @@ def api_interventions():
 
 @app.post("/api/interventions")
 def api_interventions_add(req: InterventionRequest):
-    if manager.hf_model is None or lens_manager.lens is None:
-        raise HTTPException(422, "model and lens required")
+    token = snap = None
     try:
-        capabilities.require(manager.capability_profile, "modes", "standard", loaded=True)
-        return {
-            "rules": interventions.add(
+        token, snap = manager.coordinator.acquire(OperationType.INTERVENTION_UPDATE, requires_loaded=True)
+        bundle = _bundle_from_snapshot_or_legacy(snap)
+        if lens_manager.lens is None:
+            raise HTTPException(422, "model and lens required")
+        capabilities.require(bundle.capability_profile, "modes", "standard", loaded=True)
+        rules = interventions.add(
                 lens_manager,
-                manager.jl,
+                bundle.jl,
                 token_id=req.token_id,
                 mode=req.mode,
                 factor=req.factor,
                 replacement_id=req.replacement_id,
                 layers=req.layers,
             )
-        }
+        _publish_intervention_snapshot(token, snap)
+        return {"rules": rules}
+    except OperationConflict as exc:
+        raise _conflict(exc)
+    except ModelStateError as exc:
+        raise HTTPException(422, str(exc))
     except ValueError as exc:
         raise HTTPException(422, str(exc))
+    finally:
+        if token is not None:
+            manager.coordinator.release(token)
 
 
 @app.patch("/api/interventions/{rule_id}")
@@ -493,9 +578,13 @@ def api_interventions_patch(rule_id: int, req: InterventionPatch):
     needs_dirs = any(
         x is not None for x in (req.layers, req.token_id, req.replacement_id, req.mode)
     )
+    token = snap = None
     try:
-        return {
-            "rules": interventions.update(
+        token, snap = manager.coordinator.acquire(
+            OperationType.INTERVENTION_UPDATE, requires_loaded=True if needs_dirs else None
+        )
+        bundle = _bundle_from_snapshot_or_legacy(snap) if needs_dirs else None
+        rules = interventions.update(
                 rule_id,
                 factor=req.factor,
                 layers=req.layers,
@@ -504,23 +593,39 @@ def api_interventions_patch(rule_id: int, req: InterventionPatch):
                 replacement_id=req.replacement_id,
                 mode=req.mode,
                 lens_manager=lens_manager if needs_dirs else None,
-                jl=manager.jl if needs_dirs else None,
+                jl=bundle.jl if needs_dirs else None,
             )
-        }
+        _publish_intervention_snapshot(token, snap)
+        return {"rules": rules}
+    except OperationConflict as exc:
+        raise _conflict(exc)
+    except ModelStateError as exc:
+        raise HTTPException(422, str(exc))
     except ValueError as exc:
         raise HTTPException(404, str(exc))
+    finally:
+        if token is not None:
+            manager.coordinator.release(token)
 
 
 @app.patch("/api/interventions")
 def api_interventions_scale(req: InterventionsScale):
+    token = snap = None
     try:
+        token, snap = manager.coordinator.acquire(OperationType.INTERVENTION_UPDATE)
         if req.mode is not None:
-            capabilities.require(manager.capability_profile, "modes", req.mode,
-                                 loaded=(manager.hf_model is not None
-                                         or manager.meta is not None))
+            status = manager.coordinator.status_snapshot()
+            capabilities.require(status.capability_profile, "modes", req.mode,
+                                 loaded=status.loaded)
         scale, mode = interventions.set_scale_and_mode(scale=req.scale, mode=req.mode)
+        _publish_intervention_snapshot(token, snap)
     except ValueError as exc:
         raise HTTPException(422, str(exc))
+    except OperationConflict as exc:
+        raise _conflict(exc)
+    finally:
+        if token is not None:
+            manager.coordinator.release(token)
     return {
         "scale": scale,
         "mode": mode,
@@ -529,12 +634,32 @@ def api_interventions_scale(req: InterventionsScale):
 
 @app.delete("/api/interventions/{rule_id}")
 def api_interventions_remove(rule_id: int):
-    return {"rules": interventions.remove(rule_id)}
+    token = snap = None
+    try:
+        token, snap = manager.coordinator.acquire(OperationType.INTERVENTION_UPDATE)
+        rules = interventions.remove(rule_id)
+        _publish_intervention_snapshot(token, snap)
+        return {"rules": rules}
+    except OperationConflict as exc:
+        raise _conflict(exc)
+    finally:
+        if token is not None:
+            manager.coordinator.release(token)
 
 
 @app.delete("/api/interventions")
 def api_interventions_clear():
-    return {"rules": interventions.remove()}
+    token = snap = None
+    try:
+        token, snap = manager.coordinator.acquire(OperationType.INTERVENTION_UPDATE)
+        rules = interventions.remove()
+        _publish_intervention_snapshot(token, snap)
+        return {"rules": rules}
+    except OperationConflict as exc:
+        raise _conflict(exc)
+    finally:
+        if token is not None:
+            manager.coordinator.release(token)
 
 
 @app.get("/api/presets")
@@ -557,43 +682,54 @@ def api_presets_save(name: str):
 @app.post("/api/presets/{name}/apply")
 def api_presets_apply(name: str):
     name = _safe_name(name)
-    if manager.hf_model is None or lens_manager.lens is None:
-        raise HTTPException(422, "model and lens required")
     try:
         preset = editing.load_preset(name)
     except ValueError as exc:
         raise HTTPException(404, str(exc))
+    token = snap = None
     try:
-        capabilities.ensure_unquantized(manager.jl, manager.meta)
+        token, snap = manager.coordinator.acquire(OperationType.INTERVENTION_UPDATE, requires_loaded=True)
+        bundle = _bundle_from_snapshot_or_legacy(snap)
+        if lens_manager.lens is None:
+            raise HTTPException(422, "model and lens required")
+        capabilities.ensure_unquantized(bundle.jl, dict(bundle.meta))
+        warnings = []
+        if preset.get("model_id") and preset["model_id"] != bundle.meta["model_id"]:
+            warnings.append(
+                f"preset saved for {preset['model_id']}, loaded model: {bundle.meta['model_id']}"
+            )
+        rules = None
+        for rule in preset.get("rules", []):
+            try:
+                rules = interventions.add(
+                    lens_manager,
+                    bundle.jl,
+                    token_id=rule["token_id"],
+                    mode=rule["mode"],
+                    factor=rule["factor"],
+                    replacement_id=rule.get("replacement_id"),
+                    layers=rule.get("layers"),
+                    enabled=rule.get("enabled", True),
+                )
+            except ValueError as exc:
+                warnings.append(f"rule {rule.get('token')!r} skipped: {exc}")
+        if preset.get("scale") is not None:
+            interventions.set_scale(preset["scale"])
+        _publish_intervention_snapshot(token, snap)
+        return {
+            "rules": rules or interventions.summary(),
+            "scale": interventions.global_scale,
+            "warnings": warnings,
+        }
+    except OperationConflict as exc:
+        raise _conflict(exc)
+    except ModelStateError as exc:
+        raise HTTPException(422, str(exc))
     except ValueError as exc:
         raise HTTPException(422, str(exc))
-    warnings = []
-    if preset.get("model_id") and manager.meta and preset["model_id"] != manager.meta["model_id"]:
-        warnings.append(
-            f"preset saved for {preset['model_id']}, loaded model: {manager.meta['model_id']}"
-        )
-    rules = None
-    for rule in preset.get("rules", []):
-        try:
-            rules = interventions.add(
-                lens_manager,
-                manager.jl,
-                token_id=rule["token_id"],
-                mode=rule["mode"],
-                factor=rule["factor"],
-                replacement_id=rule.get("replacement_id"),
-                layers=rule.get("layers"),
-                enabled=rule.get("enabled", True),
-            )
-        except ValueError as exc:
-            warnings.append(f"rule {rule.get('token')!r} skipped: {exc}")
-    if preset.get("scale") is not None:
-        interventions.set_scale(preset["scale"])
-    return {
-        "rules": rules or interventions.summary(),
-        "scale": interventions.global_scale,
-        "warnings": warnings,
-    }
+    finally:
+        if token is not None:
+            manager.coordinator.release(token)
 
 
 @app.delete("/api/presets/{name}")
@@ -613,11 +749,12 @@ async def api_edit_export(req: ExportRequest):
         token, snap = manager.coordinator.acquire(OperationType.EXPORT, requires_loaded=True)
         bundle = snap.bundle
         meta = dict(bundle.meta)
-        rules = interventions.active_rules_full()
+        intervention_snapshot = interventions.snapshot()
+        rules = intervention_snapshot["active_rules"]
         if not rules:
             raise HTTPException(422, "no active intervention to export (rules disabled or without layers?)")
         source_dir = resolve_local_dir(meta["model_id"])
-        scale, mode = interventions.state_snapshot()
+        scale, mode = intervention_snapshot["scale"], intervention_snapshot["mode"]
         capabilities.ensure_unquantized(bundle.jl, meta)
         capabilities.require(bundle.capability_profile, "exports", req.format, mode, loaded=True)
         kwargs = {}
@@ -651,9 +788,12 @@ async def api_edit_export(req: ExportRequest):
         raise
 
     dispatch = WorkerDispatch(manager.coordinator, token, stop_event)
+    publication_gate = editing.PublicationGate(
+        lambda: not manager.coordinator.is_cancelled(token) and manager.coordinator.is_current(token)
+    )
 
     def guard():
-        if manager.coordinator.is_cancelled(token) or not manager.coordinator.is_current(token):
+        if publication_gate.state != "pending" or manager.coordinator.is_cancelled(token) or not manager.coordinator.is_current(token):
             raise RuntimeError("export ownership was cancelled or superseded before publication")
 
     def worker():
@@ -662,7 +802,7 @@ async def api_edit_export(req: ExportRequest):
         try:
             call_kwargs = dict(kwargs)
             if export_fn is editing.export_rebase:
-                call_kwargs["publication_guard"] = guard
+                call_kwargs["publication_guard"] = publication_gate
             return export_fn(
                 rules, bundle.jl, meta, fmt=req.format, name=req.name,
                 source_dir=source_dir, scale=scale, **call_kwargs,
@@ -672,14 +812,18 @@ async def api_edit_export(req: ExportRequest):
             gc.collect()
             dispatch.release_from_worker()
 
-    task = asyncio.create_task(asyncio.to_thread(worker))
     try:
-        result = await task
+        task = asyncio.create_task(asyncio.to_thread(worker))
+    except Exception:
+        dispatch.cancel_from_awaiter()
+        raise
+    _retain_worker_task(task)
+    try:
+        result = await asyncio.shield(task)
         return result
     except asyncio.CancelledError:
+        publication_gate.cancel()
         dispatch.cancel_from_awaiter()
-        _deferred_worker_tasks.add(task)
-        task.add_done_callback(lambda t: (_deferred_worker_tasks.discard(t), None if t.cancelled() else t.exception()))
         raise
     except ValueError as exc:
         raise HTTPException(422, str(exc))
@@ -836,10 +980,11 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
             token, snap = manager.coordinator.acquire(OperationType.GGUF_BAKE, requires_loaded=True)
             bundle = _bundle_from_snapshot_or_legacy(snap)
             meta = dict(bundle.meta)
-            rules = interventions.active_rules_full()
+            intervention_snapshot = interventions.snapshot()
+            rules = intervention_snapshot["active_rules"]
             if not rules:
                 raise HTTPException(422, "no active intervention to export")
-            scale, mode = interventions.state_snapshot()
+            scale, mode = intervention_snapshot["scale"], intervention_snapshot["mode"]
             capabilities.ensure_unquantized(bundle.jl, meta)
             capabilities.require(bundle.capability_profile, "exports", "gguf", mode, loaded=True)
             if mode in ("readthrough", "exact"):
@@ -866,9 +1011,12 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
                 manager.coordinator.release(token)
             raise
         dispatch = WorkerDispatch(manager.coordinator, token, stop_event)
+        publication_gate = editing.PublicationGate(
+            lambda: not manager.coordinator.is_cancelled(token) and manager.coordinator.is_current(token)
+        )
 
         def guard():
-            if manager.coordinator.is_cancelled(token) or not manager.coordinator.is_current(token):
+            if publication_gate.state != "pending" or manager.coordinator.is_cancelled(token) or not manager.coordinator.is_current(token):
                 raise RuntimeError("GGUF bake ownership was cancelled or superseded before publication")
 
         def bake_worker():
@@ -877,20 +1025,24 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
             try:
                 call_kwargs = dict(kwargs)
                 if export_fn is editing.export_rebase:
-                    call_kwargs["publication_guard"] = guard
+                    call_kwargs["publication_guard"] = publication_gate
                 return export_fn(
                     rules, bundle.jl, meta, fmt="full", name="/".join((*name_parts, "hf")),
                     source_dir=source_dir, scale=scale, **call_kwargs,
                 )
             finally:
                 dispatch.release_from_worker()
-        task = asyncio.create_task(asyncio.to_thread(bake_worker))
         try:
-            await task
-        except asyncio.CancelledError:
+            task = asyncio.create_task(asyncio.to_thread(bake_worker))
+        except Exception:
             dispatch.cancel_from_awaiter()
-            _deferred_worker_tasks.add(task)
-            task.add_done_callback(lambda t: (_deferred_worker_tasks.discard(t), None if t.cancelled() else t.exception()))
+            raise
+        _retain_worker_task(task)
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            publication_gate.cancel()
+            dispatch.cancel_from_awaiter()
             raise
         except ValueError as exc:
             raise HTTPException(422, str(exc))
@@ -961,7 +1113,7 @@ def _captured_generation_context(token, snap, stop_event):
 
 @app.post("/api/generate")
 async def api_generate_sync(req: GenerateSyncRequest):
-    global _last_generation
+    global _generation_counter
     token = None
     stop_event = ThreadingEvent()
     try:
@@ -981,6 +1133,7 @@ async def api_generate_sync(req: GenerateSyncRequest):
             done["error"] = frame.get("message")
 
     def worker():
+        global _generation_counter
         if not dispatch.claim():
             return
         try:
@@ -990,8 +1143,9 @@ async def api_generate_sync(req: GenerateSyncRequest):
             )
             if done.get("error"):
                 return
+            _generation_counter += 1
             last = {
-                "n": ((_last_generation or {}).get("n", 0) + 1),
+                "n": _generation_counter,
                 "prompt": next((m.get("content", "") for m in reversed(req.messages) if m.get("role") == "user"), ""),
                 "text": done.get("text", ""),
                 "stats": done.get("stats"),
@@ -1001,21 +1155,22 @@ async def api_generate_sync(req: GenerateSyncRequest):
         finally:
             dispatch.release_from_worker()
 
-    task = asyncio.create_task(asyncio.to_thread(worker))
     try:
-        await task
+        task = asyncio.create_task(asyncio.to_thread(worker))
+    except Exception:
+        dispatch.cancel_from_awaiter()
+        raise
+    _retain_worker_task(task)
+    try:
+        await asyncio.shield(task)
     except asyncio.CancelledError:
         dispatch.cancel_from_awaiter()
-        _deferred_worker_tasks.add(task)
-        task.add_done_callback(lambda t: (_deferred_worker_tasks.discard(t), None if t.cancelled() else t.exception()))
         raise
     except Exception as exc:
         raise HTTPException(500, str(exc))
     if done.get("error"):
         raise HTTPException(500, done["error"])
     last = done.get("last_generation")
-    if last is not None:
-        _last_generation = last
     for ws in list(_ws_locks):
         try:
             await _ws_send(ws, json.dumps({"type": "api_generation"}))
@@ -1032,22 +1187,38 @@ class NeighborsRequest(BaseModel):
 @app.post("/api/token-neighbors")
 async def api_token_neighbors(req: NeighborsRequest):
     token = None
+    stop_event = ThreadingEvent()
     try:
         token, snap = manager.coordinator.acquire(OperationType.MODEL_READ, requires_loaded=True)
         bundle = snap.bundle
         key = (snap.model_session_id, dict(bundle.meta).get("model_id"), dict(bundle.meta).get("revision"))
-        result = await asyncio.to_thread(
-            neighbors.lookup, bundle.jl, bundle.tokenizer, key, req.token_ids[:64], req.k,
-        )
     except OperationConflict as exc:
         raise _conflict(exc)
     except ModelStateError as exc:
         raise HTTPException(422, str(exc))
+    dispatch = WorkerDispatch(manager.coordinator, token, stop_event)
+
+    def worker():
+        if not dispatch.claim():
+            return None
+        try:
+            return neighbors.lookup(bundle.jl, bundle.tokenizer, key, req.token_ids[:64], req.k)
+        finally:
+            dispatch.release_from_worker()
+
+    try:
+        task = asyncio.create_task(asyncio.to_thread(worker))
+    except Exception:
+        dispatch.cancel_from_awaiter()
+        raise
+    _retain_worker_task(task)
+    try:
+        result = await asyncio.shield(task)
+    except asyncio.CancelledError:
+        dispatch.cancel_from_awaiter()
+        raise
     except ValueError as exc:
         raise HTTPException(422, str(exc))
-    finally:
-        if token is not None:
-            manager.coordinator.release(token)
     return {"neighbors": {str(tid): entries for tid, entries in result.items()}}
 
 
@@ -1145,18 +1316,37 @@ def api_fit_stop():
 @app.post("/api/lens/pin")
 async def api_lens_pin(req: PinRequest):
     token = None
+    stop_event = ThreadingEvent()
     try:
-        token, _ = manager.coordinator.acquire(OperationType.MODEL_READ, requires_loaded=True)
-        return await asyncio.to_thread(lens_manager.pin_ranks, req.gen_id, req.token_ids, manager.jl)
+        token, snap = manager.coordinator.acquire(OperationType.MODEL_READ, requires_loaded=True)
+        jl = snap.bundle.jl
     except OperationConflict as exc:
         raise _conflict(exc)
     except ModelStateError as exc:
         raise HTTPException(422, str(exc))
+    dispatch = WorkerDispatch(manager.coordinator, token, stop_event)
+
+    def worker():
+        if not dispatch.claim():
+            return None
+        try:
+            return lens_manager.pin_ranks(req.gen_id, req.token_ids, jl)
+        finally:
+            dispatch.release_from_worker()
+
+    try:
+        task = asyncio.create_task(asyncio.to_thread(worker))
+    except Exception:
+        dispatch.cancel_from_awaiter()
+        raise
+    _retain_worker_task(task)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        dispatch.cancel_from_awaiter()
+        raise
     except ValueError as exc:
         raise HTTPException(422, str(exc))
-    finally:
-        if token is not None:
-            manager.coordinator.release(token)
 
 
 # Alternative/duplicate weight folders, never needed for transformers inference
@@ -1618,10 +1808,13 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
 
 
 async def _watch_stop(ws, stop_event):
-    while True:
-        msg = json.loads(await ws.receive_text())
-        if msg.get("type") == "stop":
-            stop_event.set()
+    try:
+        while True:
+            msg = json.loads(await ws.receive_text())
+            if msg.get("type") == "stop":
+                stop_event.set()
+    finally:
+        stop_event.set()
 
 
 async def _run_chat(ws, req):
@@ -1662,11 +1855,29 @@ async def _run_chat(ws, req):
         finally:
             dispatch.release_from_worker()
 
-    worker = asyncio.create_task(asyncio.to_thread(worker_body))
+    try:
+        worker = asyncio.create_task(asyncio.to_thread(worker_body))
+    except Exception:
+        dispatch.cancel_from_awaiter()
+        raise
+    _retain_worker_task(worker)
     receiver = asyncio.create_task(_watch_stop(ws, stop_event))
     try:
         while True:
-            frame = await queue.get()
+            get_task = asyncio.create_task(queue.get())
+            done, pending = await asyncio.wait(
+                {get_task, receiver, worker},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if receiver in done and not get_task.done():
+                get_task.cancel()
+                stop_event.set()
+                dispatch.cancel_from_awaiter()
+                break
+            if worker in done and not get_task.done():
+                get_task.cancel()
+                break
+            frame = get_task.result()
             await _ws_send(ws, json.dumps(frame))
             if frame["type"] in ("done", "error"):
                 break
@@ -1675,7 +1886,7 @@ async def _run_chat(ws, req):
         if not worker.done():
             dispatch.cancel_from_awaiter()
         receiver.cancel()
-        await asyncio.gather(worker, receiver, return_exceptions=True)
+        await asyncio.gather(asyncio.shield(worker), receiver, return_exceptions=True)
 
 
 @app.websocket("/ws")

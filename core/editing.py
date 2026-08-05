@@ -6,6 +6,7 @@ import shutil
 import stat
 import time
 import uuid
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -1554,6 +1555,40 @@ def apply_transform_bounded(entry, tensor, *, row_budget=REBASE_EXPORT_ROW_BUDGE
     return destination, delta_max
 
 
+class PublicationCancelled(RuntimeError):
+    pass
+
+
+class PublicationGate:
+    def __init__(self, current=None):
+        self._lock = threading.Lock()
+        self._state = "pending"
+        self._current = current
+
+    @property
+    def state(self):
+        with self._lock:
+            return self._state
+
+    def cancel(self):
+        with self._lock:
+            if self._state == "pending":
+                self._state = "cancelled-before-publication"
+                return True
+            return False
+
+    def publish(self, publish_fn):
+        with self._lock:
+            if self._state != "pending":
+                raise PublicationCancelled("export publication was cancelled before publication")
+            if self._current is not None and not self._current():
+                self._state = "cancelled-before-publication"
+                raise PublicationCancelled("export ownership was cancelled or superseded before publication")
+            result = publish_fn()
+            self._state = "published"
+            return result
+
+
 def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.0, exact=False, publication_guard=None):
     """Transactionally construct and atomically publish a rebase export.
 
@@ -1589,9 +1624,12 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
                 rules, jl, model_meta, fmt=fmt, name=name, source_dir=source_dir,
                 scale=scale, exact=exact, out_dir=stage, inventory=inventory,
             )
-            if publication_guard is not None:
-                publication_guard()
-            stage.replace(final_dir)
+            if hasattr(publication_guard, "publish"):
+                publication_guard.publish(lambda: stage.replace(final_dir))
+            else:
+                if publication_guard is not None:
+                    publication_guard()
+                stage.replace(final_dir)
             result["out_dir"] = str(final_dir)
             return result
         finally:
