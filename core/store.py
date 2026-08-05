@@ -569,6 +569,8 @@ class Store:
                 (_now(), row["conversation_id"]),
             )
             conn.commit()
+        except StaleMessageUpdate:
+            raise
         except Exception as exc:
             self._abort_transaction_or_discard(conn)
             try:

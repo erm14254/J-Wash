@@ -227,7 +227,7 @@ class OperationHandoff:
 
     def _set_state(self, state):
         allowed = {
-            HandoffState.ACQUIRED: {HandoffState.PREPARING, HandoffState.CLOSED},
+            HandoffState.ACQUIRED: {HandoffState.PREPARING, HandoffState.DISPATCH_READY, HandoffState.CLOSED},
             HandoffState.PREPARING: {HandoffState.PREPARING, HandoffState.DISPATCH_READY, HandoffState.CLOSED},
             HandoffState.DISPATCH_READY: {HandoffState.WRAPPER_READY, HandoffState.CLOSED},
             HandoffState.WRAPPER_READY: {HandoffState.TASK_CREATED, HandoffState.CLOSED},
