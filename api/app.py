@@ -2216,10 +2216,16 @@ def api_conversation_delete(cid: int):
 def api_message_frames(mid: int):
     try:
         return store.load_frames(mid)
-    except ValueError as exc:
-        raise HTTPException(404, str(exc))
+    except FramesNotAttached as exc:
+        raise HTTPException(404, str(exc)) from None
+    except FramePointerTurnover as exc:
+        raise HTTPException(409, str(exc)) from None
+    except FrameFileMissing as exc:
+        raise HTTPException(422, str(exc)) from None
     except FrameStorageError as exc:
         raise HTTPException(422, str(exc)) from None
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from None
 
 
 class MessagePatch(BaseModel):
