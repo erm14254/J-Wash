@@ -220,7 +220,7 @@ def test_model_transition_cleanup_does_not_restore_rules_after_publication_failu
         }]
         app.interventions._revision = 1
         app.interventions._scale = 2.5
-        app.interventions.mode = "readthrough"
+        app.interventions._mode = "readthrough"
 
         def fail_update(_token, _snapshot):
             raise RuntimeError("publication failed")
