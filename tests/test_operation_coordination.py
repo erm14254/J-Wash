@@ -622,7 +622,7 @@ def test_store_round_trips_production_frame_phases(tmp_path, monkeypatch):
     s.save_frames(mid, [_frame(0, "reading"), _frame(1, "thinking")], [0], 1)
     loaded = s.load_frames(mid)
     assert [frame["phase"] for frame in loaded["frames"]] == ["reading", "thinking"]
-    body, _ = s.export(cid, include_frames=True)
+    body, _ = s.export(cid, fmt="md", include_frames=True)
     assert "2 lens frames" in body
     s._discard_conn()
     reopened = store_mod.Store()
