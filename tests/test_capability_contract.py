@@ -311,8 +311,7 @@ def test_intervention_patch_returns_the_committed_pair(monkeypatch):
     import api.app as app
     iv = Interventions()
     monkeypatch.setattr(app, "interventions", iv)
-    monkeypatch.setattr(app.manager, "meta", {"model_id": "local"})
-    monkeypatch.setattr(app.manager, "capability_profile", _profile())
+    _install_loaded_bundle(app, monkeypatch, profile=_profile())
     response = app.api_interventions_scale(
         SimpleNamespace(scale=2.25, mode="readthrough")
     )

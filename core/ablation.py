@@ -140,14 +140,14 @@ class Interventions:
     def _summary_locked(self):
         return [
             {
-                "id": rule["id"],
-                "token_id": rule["token_id"],
-                "token": rule["token"],
-                "mode": rule["mode"],
-                "factor": rule["factor"],
-                "replacement_id": rule["replacement_id"],
-                "replacement": rule["replacement"],
-                "layers": list(rule["layers"]),
+                "id": rule.get("id"),
+                "token_id": rule.get("token_id"),
+                "token": rule.get("token"),
+                "mode": rule.get("mode"),
+                "factor": rule.get("factor"),
+                "replacement_id": rule.get("replacement_id"),
+                "replacement": rule.get("replacement"),
+                "layers": list(rule.get("layers") or []),
                 "enabled": rule.get("enabled", True),
             }
             for rule in self._rules
@@ -342,14 +342,14 @@ class Interventions:
                 "summary": self._summary_locked(),
                 "active_summary": [
                     {
-                        "id": rule["id"],
-                        "token_id": rule["token_id"],
-                        "token": rule["token"],
-                        "mode": rule["mode"],
-                        "factor": rule["factor"],
-                        "replacement_id": rule["replacement_id"],
-                        "replacement": rule["replacement"],
-                        "layers": list(rule["layers"]),
+                        "id": rule.get("id"),
+                        "token_id": rule.get("token_id"),
+                        "token": rule.get("token"),
+                        "mode": rule.get("mode"),
+                        "factor": rule.get("factor"),
+                        "replacement_id": rule.get("replacement_id"),
+                        "replacement": rule.get("replacement"),
+                        "layers": list(rule.get("layers") or []),
                         "enabled": rule.get("enabled", True),
                     }
                     for rule in self._rules
