@@ -373,6 +373,22 @@ class FitManager:
         except Exception:
             return False
 
+
+    @staticmethod
+    def _wait_for_normal_process_exit(run, proc, worker_state=None, *, poll_interval=0.25):
+        """Wait for healthy worker completion without treating time as failure."""
+        while True:
+            if run.cancel.is_set() or run.helper_failure.is_set():
+                return False
+            try:
+                if proc.poll() is not None:
+                    return True
+            except Exception:
+                return False
+            if worker_state is not None and worker_state.get("state") == "done":
+                return FitManager._bounded_wait(proc, FIT_PROCESS_SHUTDOWN_TIMEOUT)
+            run.cancel.wait(poll_interval)
+
     @staticmethod
     def _request_process_shutdown(proc, *, reap=True, timeout=FIT_PROCESS_SHUTDOWN_TIMEOUT):
         running = True
@@ -679,9 +695,11 @@ class FitManager:
             for t in drainers:
                 t.start()
                 run.helper_threads.append(t)
-            for proc in run.processes:
-                if not self._bounded_wait(proc, FIT_PROCESS_SHUTDOWN_TIMEOUT):
-                    self._request_process_shutdown(proc, reap=True)
+            for proc, worker_state in zip(run.processes, workers):
+                if not self._wait_for_normal_process_exit(run, proc, worker_state):
+                    if run.cancel.is_set():
+                        raise _FitCancelled()
+                    raise _FitHelperFailed()
             # Popen.wait() does not guarantee that Python reader threads have
             # consumed all bytes buffered in stdout.  Drain stdout to EOF before
             # evaluating failures or allowing merge/publication to begin.

@@ -1454,3 +1454,41 @@ def test_helper_failure_before_lens_save_blocks_publication(fit_env, monkeypatch
     assert manager.state["state"] == "error"
     assert saved == []
     assert not (fit_env[1] / "fit" / "meta.json").exists()
+
+
+def test_healthy_worker_not_killed_by_cleanup_timeout(fit_env, monkeypatch):
+    monkeypatch.setattr(fitting, "_load_corpus", lambda *a: ["prompt"])
+    monkeypatch.setattr(fitting.JacobianLens, "load", lambda path: _Lens())
+    monkeypatch.setattr(fitting.JacobianLens, "merge", lambda lenses: lenses[0])
+
+    release_stdout = threading.Event()
+    release_wait = threading.Event()
+    proc = _Process(
+        release=release_wait,
+        stdout=_BlockingStdout(release_stdout, '{"event":"progress","done":1,"total":1}\n{"event":"done"}\n'),
+    )
+    popen_started = threading.Event()
+
+    def popen(*args, **kwargs):
+        popen_started.set()
+        return proc
+
+    monkeypatch.setattr(fitting.subprocess, "Popen", popen)
+    manager = fitting.FitManager(heartbeat_interval=0.01)
+    _start(manager)
+    _wait(popen_started, "fit worker was not started")
+    run = manager._active_run
+    assert run is not None
+
+    # Simulate time passing beyond the cleanup timeout while the worker is healthy:
+    # no stop, no helper failure, and no terminal done event yet.
+    assert not run.done.wait(0.05)
+    assert manager.state["state"] in {"loading", "running"}
+    assert not proc.terminated
+
+    release_stdout.set()
+    release_wait.set()
+    _wait(run.done, "fit did not finish after healthy process completion")
+    assert not proc.terminated
+    assert manager.state["state"] == "done"
+    assert manager._active_run is None

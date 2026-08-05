@@ -486,7 +486,7 @@ class ModelManager:
     def busy(self):
         return self.coordinator.busy
 
-    def _sync_from_bundle(self, bundle):
+    def _sync_from_bundle(self, bundle, *, prepared_meta=None):
         if bundle is None:
             self.hf_model = self.tokenizer = self.jl = self.meta = None
             self.capability_profile = None
@@ -494,7 +494,7 @@ class ModelManager:
         self.hf_model = bundle.hf_model
         self.tokenizer = bundle.tokenizer
         self.jl = bundle.jl
-        self.meta = dict(bundle.meta)
+        self.meta = prepared_meta
         self.capability_profile = bundle.capability_profile
 
     def session_snapshot(self):
@@ -577,11 +577,13 @@ class ModelManager:
                 "load_seconds": round(time.perf_counter() - started, 1),
             }
             candidate = LoadedModelBundle.from_parts(hf_model, tokenizer, jl, meta, capability_profile)
+            prepared_meta = dict(candidate.meta)
+            result = dict(prepared_meta)
             self.coordinator.publish_loaded(token, candidate, expected_unloaded_session=expected_session)
             published = True
             with self._lock:
-                self._sync_from_bundle(candidate)
-            result = dict(candidate.meta)
+                self._sync_from_bundle(candidate, prepared_meta=prepared_meta)
+            prepared_meta = None
             candidate = hf_model = tokenizer = jl = None
             return result
         except OperationConflict:

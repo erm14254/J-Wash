@@ -383,3 +383,73 @@ def test_http_generation_metadata_preserves_captured_intervention_provenance(mon
     assert provenance["summary"][0]["id"] == 1
     assert provenance["active_summary"] == []
     assert result["last_generation"]["meta"]["intervention_provenance"] == provenance
+
+
+def test_persisted_continue_records_segment_provenance(monkeypatch):
+    import json
+    import threading
+    from types import SimpleNamespace
+    from api import app
+
+    class FakeStore:
+        def __init__(self):
+            self.meta = {
+                "intervention_provenance": {"revision": 1, "mode": "standard", "scale": 1.0},
+                "model_session_id": 1,
+            }
+            self.updated = None
+
+        def get_message(self, message_id):
+            return {
+                "id": message_id,
+                "conversation_id": 99,
+                "parent_id": 1,
+                "role": "assistant",
+                "content": "old",
+                "meta": json.dumps(self.meta),
+                "frames_file": None,
+            }
+
+        def path_to_root(self, message_id):
+            return [{"role": "user", "content": "u"}, {"role": "assistant", "content": "old"}]
+
+        def update_message(self, message_id, content, meta=None):
+            self.updated = (message_id, content, meta)
+
+        def save_frames(self, *args, **kwargs):
+            raise AssertionError("no lens frames expected")
+
+    continuation_meta = {
+        "intervention_provenance": {
+            "revision": 2,
+            "mode": "readthrough",
+            "scale": 1.5,
+            "model_session_id": 4,
+            "lens_binding_id": 7,
+            "summary": [{"id": 1}],
+            "active_summary": [{"id": 1}],
+        },
+        "model_session_id": 4,
+        "lens": None,
+    }
+
+    def fake_generate(**kwargs):
+        kwargs["emit"]({"type": "done", "text": " new", "stats": {"tokens": 2}, "stopped": False, "meta": continuation_meta})
+
+    fake_store = FakeStore()
+    monkeypatch.setattr(app, "store", fake_store)
+    monkeypatch.setattr(app.manager, "generate", fake_generate)
+    emitted = []
+    context = SimpleNamespace(lens=None, intervention_snapshot={"rules": []})
+
+    app._persisted_continue({}, 10, threading.Event(), emitted.append, context)
+
+    assert fake_store.updated[1] == "old new"
+    saved_meta = fake_store.updated[2]
+    assert saved_meta["intervention_provenance"]["revision"] == 2
+    assert saved_meta["intervention_provenance"]["mode"] == "readthrough"
+    assert saved_meta["intervention_provenance"]["scale"] == 1.5
+    assert saved_meta["continuations"][-1]["start_offset"] == 3
+    assert saved_meta["continuations"][-1]["end_offset"] == 7
+    assert saved_meta["continuations"][-1]["meta"]["intervention_provenance"]["revision"] == 2
+    assert emitted[-1]["meta"]["intervention_provenance"]["revision"] == 2

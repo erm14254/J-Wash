@@ -420,21 +420,35 @@ async def api_delete_model(req: DeleteModelRequest):
     stop_event = ThreadingEvent()
     token = None
     try:
-        token, snap = manager.coordinator.acquire(OperationType.MODEL_DELETE)
-        if snap.bundle is not None and snap.bundle.meta.get("model_id") == req.model_id:
+        token, snap = manager.coordinator.acquire(OperationType.MODEL_DELETE, include_bundle=False)
+        status = manager.coordinator.status_snapshot()
+        loaded_model_id = (status.model_meta or {}).get("model_id") if status.model_meta is not None else None
+        snap = status = None
+        if loaded_model_id == req.model_id:
             manager.coordinator.release(token)
             token = None
             raise HTTPException(409, "unload this model before deleting it")
     except OperationConflict as exc:
         raise _conflict(exc)
-    dispatch = WorkerDispatch(manager.coordinator, token, stop_event)
+    except Exception:
+        if token is not None:
+            manager.coordinator.release(token)
+        raise
+    try:
+        dispatch = WorkerDispatch(manager.coordinator, token, stop_event)
+    except Exception:
+        if token is not None:
+            manager.coordinator.release(token)
+        raise
+
+    model_id = req.model_id
 
     def worker():
         if not dispatch.claim():
             return _worker_success()
         try:
             try:
-                return _worker_success(delete_model(req.model_id))
+                return _worker_success(delete_model(model_id))
             except Exception as exc:
                 return _worker_failure(exc, default_status=500, value_status=400)
         finally:
@@ -542,20 +556,26 @@ async def api_lens_load(req: LensLoadRequest):
     token = None
     stop_event = ThreadingEvent()
     try:
-        token, _ = manager.coordinator.acquire(OperationType.LENS_UPDATE, requires_loaded=True)
+        token, snap = manager.coordinator.acquire(OperationType.LENS_UPDATE, requires_loaded=True, include_bundle=False)
+        snap = None
     except OperationConflict as exc:
         raise _conflict(exc)
     except ModelStateError as exc:
         raise HTTPException(422, str(exc))
-    payload = {
-        "repo_id": req.repo_id,
-        "filename": req.filename,
-        "revision": req.revision,
-        "path": req.path,
-        "layers": req.layers,
-        "k": req.k,
-    }
-    dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+    try:
+        payload = {
+            "repo_id": req.repo_id,
+            "filename": req.filename,
+            "revision": req.revision,
+            "path": req.path,
+            "layers": req.layers,
+            "k": req.k,
+        }
+        dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+    except Exception:
+        if token is not None:
+            manager.coordinator.release(token)
+        raise
     payload = None
 
     def worker():
@@ -794,13 +814,26 @@ def api_presets():
 @app.post("/api/presets/{name}")
 def api_presets_save(name: str):
     name = _safe_name(name)
-    rules = interventions.summary()
-    if not rules:
-        raise HTTPException(422, "no active intervention to save")
-    return editing.save_preset(
-        name, rules, manager.meta.get("model_id") if manager.meta else None,
-        scale=interventions.global_scale,
-    )
+    token = snap = None
+    try:
+        token, snap = manager.coordinator.acquire(OperationType.MODEL_READ, requires_loaded=True, include_bundle=True)
+        bundle = snap.bundle
+        iv = _coordinated_interventions(snap)
+        rules = [dict(rule) for rule in (iv.get("summary") or [])]
+        if not rules:
+            raise HTTPException(422, "no active intervention to save")
+        model_id = bundle.meta.get("model_id") if bundle is not None else None
+        scale = iv.get("scale")
+        result = editing.save_preset(name, rules, model_id, scale=scale)
+        return result
+    except OperationConflict as exc:
+        raise _conflict(exc)
+    except ModelStateError as exc:
+        raise HTTPException(422, str(exc))
+    finally:
+        snap = bundle = iv = rules = result = None
+        if token is not None:
+            manager.coordinator.release(token)
 
 
 @app.post("/api/presets/{name}/apply")
@@ -1955,6 +1988,21 @@ def _persisted_generate(req, stop_event, emit, gen_context):
         emit({"type": "error", "message": str(exc)})
 
 
+def _continuation_metadata(previous_meta, start_offset, end_offset, done_meta, stats, stopped):
+    latest_meta = dict(done_meta or {})
+    latest_meta.update(stats=stats, stopped=stopped, continued=True)
+    continuations = list((previous_meta or {}).get("continuations") or [])
+    continuations.append({
+        "start_offset": start_offset,
+        "end_offset": end_offset,
+        "meta": dict(latest_meta),
+    })
+    merged = dict(previous_meta or {})
+    merged.update(latest_meta)
+    merged["continuations"] = continuations
+    return merged
+
+
 def _persisted_continue(req, message_id, stop_event, emit, gen_context):
     """Extend an existing assistant reply: generate with the turn left open,
     append the text to the message, and merge the new lens frames into its
@@ -1983,13 +2031,13 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
         ablator=interventions if gen_context.intervention_snapshot.get("rules") else None,
         continue_final=True,
     )
-    new_content = msg["content"] + done_holder.get("text", "")
-    meta = json.loads(msg["meta"]) if msg.get("meta") else {}
-    meta = dict(
-        meta,
-        stats=done_holder.get("stats"),
-        stopped=done_holder.get("stopped"),
-        continued=True,
+    old_content = msg["content"]
+    appended = done_holder.get("text", "")
+    new_content = old_content + appended
+    previous_meta = json.loads(msg["meta"]) if msg.get("meta") else {}
+    meta = _continuation_metadata(
+        previous_meta, len(old_content), len(new_content),
+        done_holder.get("meta"), done_holder.get("stats"), done_holder.get("stopped"),
     )
     store.update_message(message_id, new_content, meta=meta)
     if frames_acc:
