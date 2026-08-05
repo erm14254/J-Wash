@@ -387,6 +387,9 @@ class FitManager:
                 return False
             if worker_state is not None and worker_state.get("state") == "done":
                 return FitManager._bounded_wait(proc, FIT_PROCESS_SHUTDOWN_TIMEOUT)
+            readers = getattr(run, "reader_threads", ())
+            if readers and all(not reader.is_alive() for reader in readers):
+                return FitManager._bounded_wait(proc, FIT_PROCESS_SHUTDOWN_TIMEOUT)
             run.cancel.wait(poll_interval)
 
     @staticmethod

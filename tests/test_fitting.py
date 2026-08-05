@@ -1463,10 +1463,8 @@ def test_healthy_worker_not_killed_by_cleanup_timeout(fit_env, monkeypatch):
 
     release_stdout = threading.Event()
     release_wait = threading.Event()
-    proc = _Process(
-        release=release_wait,
-        stdout=_BlockingStdout(release_stdout, '{"event":"progress","done":1,"total":1}\n{"event":"done"}\n'),
-    )
+    proc = _Process(release=release_wait)
+    proc.stdout = _BlockingStdout(release_stdout, '{"event":"progress","done":1,"total":1}\n{"event":"done"}\n')
     popen_started = threading.Event()
 
     def popen(*args, **kwargs):
