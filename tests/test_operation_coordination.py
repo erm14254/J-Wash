@@ -595,7 +595,7 @@ def test_preset_save_persists_coordinated_provenance(monkeypatch):
     assert captured["rules"][0]["id"] == 1
 
 
-def _frame(pos=0, phase="gen"):
+def _frame(pos=0, phase="gen", layer_key=0):
     return {
         "type": "frame",
         "phase": phase,
@@ -603,7 +603,7 @@ def _frame(pos=0, phase="gen"):
         "token_id": 1,
         "tok": "a",
         "layers": {
-            0: {
+            layer_key: {
                 "ids": [1], "strs": ["a"], "p": [1.0],
                 "m_ids": [2], "m_strs": ["b"], "m_p": [0.5], "m_rank": [1],
             }
@@ -619,7 +619,7 @@ def test_store_round_trips_production_frame_phases(tmp_path, monkeypatch):
     s = store_mod.Store()
     cid = s.create_conversation("c")
     mid = s.add_message(cid, None, "assistant", "T", meta={"publication_state": "complete"})
-    s.save_frames(mid, [_frame(0, "reading"), _frame(1, "thinking")], [0], 1)
+    s.save_frames(mid, [_frame(0, "reading", "0"), _frame(1, "thinking", "0")], [0], 1)
     loaded = s.load_frames(mid)
     assert [frame["phase"] for frame in loaded["frames"]] == ["reading", "thinking"]
     body, _ = s.export(cid, fmt="md", include_frames=True)
@@ -643,6 +643,35 @@ def test_store_accepts_legacy_frame_phases(tmp_path, monkeypatch):
     assert [frame["phase"] for frame in loaded["frames"]] == ["prompt", "gen"]
 
 
+def test_store_accepts_multiple_production_string_layer_keys(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c")
+    mid = s.add_message(cid, None, "assistant", "T")
+    frame = _frame(0, "reading", "0")
+    frame["layers"]["12"] = dict(frame["layers"]["0"])
+    s.save_frames(mid, [frame], [0, 12], 1)
+    loaded = s.load_frames(mid)
+    assert loaded["layers"] == [0, 12]
+    assert set(loaded["frames"][0]["layers"]) == {0, 12}
+
+
+def test_update_message_identical_stale_writer_does_not_reconcile_as_committed(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c")
+    mid, version = s.add_message(cid, None, "assistant", "old", return_version=True)
+    s.update_message(mid, "same", meta={"edited": True}, clear_frames=True, expected_version=version)
+    with pytest.raises(store_mod.StaleMessageUpdate):
+        s.update_message(mid, "same", meta={"edited": True}, clear_frames=True, expected_version=version)
+
+
 def test_persisted_continue_merges_existing_production_phase_archive(tmp_path, monkeypatch):
     from api import app
     from core import store as store_mod
@@ -653,11 +682,11 @@ def test_persisted_continue_merges_existing_production_phase_archive(tmp_path, m
     monkeypatch.setattr(app, "store", s)
     cid = s.create_conversation("c")
     mid = s.add_message(cid, None, "assistant", "T", meta={"publication_state": "complete"})
-    s.save_frames(mid, [_frame(0, "reading"), _frame(1, "thinking")], [0], 1)
+    s.save_frames(mid, [_frame(0, "reading", "0"), _frame(1, "thinking", "0")], [0], 1)
     emitted = []
 
     def generate(**kwargs):
-        kwargs["emit"]({"type": "frame", **_frame(2, "thinking")})
+        kwargs["emit"]({"type": "frame", **_frame(2, "thinking", "0")})
         kwargs["emit"]({"type": "done", "text": " plus", "meta": {"model_id": "m"}, "stats": {}, "stopped": False})
 
     monkeypatch.setattr(app.manager, "generate", generate)
@@ -1090,7 +1119,12 @@ def test_load_frames_rejects_semantic_archive_corruption(tmp_path, monkeypatch):
         ("invalid-k", {"k": -1}),
         ("duplicate-layers", {"layers": [0, 0]}),
         ("invalid-phase", {"frames": [{"phase": "bad"}]}),
-        ("invalid-layer-key", {"frames": [{"layers": {"0": {}}}]}),
+        ("invalid-layer-key", {"frames": [{"layers": {"01": {}}}]}),
+        ("bytes-layer-key", {"frames": [{"layers": {b"0": {}}}]}),
+        ("float-layer-key", {"frames": [{"layers": {0.0: {}}}]}),
+        ("bool-layer-key", {"frames": [{"layers": {True: {}}}]}),
+        ("layer-mismatch", {"frames": [{"layers": {"12": {}}}]}),
+        ("duplicate-normalized-layer", {"frames": [{"layers": {0: {}, "0": {}}}]}),
     ]
     for name, patch in cases:
         mid = s.add_message(cid, None, "assistant", name)

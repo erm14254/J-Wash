@@ -226,12 +226,25 @@ class OperationHandoff:
         self.state = HandoffState.ACQUIRED
 
     def _set_state(self, state):
+        allowed = {
+            HandoffState.ACQUIRED: {HandoffState.PREPARING, HandoffState.CLOSED},
+            HandoffState.PREPARING: {HandoffState.PREPARING, HandoffState.DISPATCH_READY, HandoffState.CLOSED},
+            HandoffState.DISPATCH_READY: {HandoffState.WRAPPER_READY, HandoffState.CLOSED},
+            HandoffState.WRAPPER_READY: {HandoffState.TASK_CREATED, HandoffState.CLOSED},
+            HandoffState.TASK_CREATED: {HandoffState.TASK_RETAINED, HandoffState.CLOSED},
+            HandoffState.TASK_RETAINED: {HandoffState.TRANSFERRED, HandoffState.CLOSED},
+            HandoffState.TRANSFERRED: set(),
+            HandoffState.CLOSED: {HandoffState.CLOSED},
+        }
+        if state not in allowed[self.state]:
+            raise RuntimeError(f"invalid operation handoff transition {self.state.value}->{state.value}")
         self.state = state
 
     def set_heavy(self, **refs):
         if self.closed:
             raise RuntimeError("handoff is closed")
-        self._set_state(HandoffState.PREPARING)
+        if self.state in (HandoffState.ACQUIRED, HandoffState.PREPARING):
+            self._set_state(HandoffState.PREPARING)
         self.heavy.update(refs)
 
     def clear_heavy(self):
@@ -240,6 +253,8 @@ class OperationHandoff:
     def set_dispatch(self, dispatch):
         if self.closed:
             raise RuntimeError("handoff is closed")
+        if self.dispatch is not None:
+            raise RuntimeError("operation handoff dispatch already set")
         self.dispatch = dispatch
         self._set_state(HandoffState.DISPATCH_READY)
 
@@ -248,6 +263,8 @@ class OperationHandoff:
         self._set_state(HandoffState.WRAPPER_READY)
 
     def set_task(self, task):
+        if self.dispatch is None:
+            raise RuntimeError("operation handoff task requires dispatch")
         self.task = task
         self._set_state(HandoffState.TASK_CREATED)
 
@@ -287,6 +304,9 @@ class OperationHandoff:
                             raise
                     except Exception:
                         logging.getLogger(__name__).exception("worker drain failed during operation handoff cleanup")
+                if not self.transferred:
+                    self.closed = True
+                    self._set_state(HandoffState.CLOSED)
             elif self.token is not None and not self.closed:
                 self.coordinator.release(self.token)
                 self.closed = True
@@ -2373,8 +2393,14 @@ def api_message_patch(mid: int, req: MessagePatch):
 def api_conversation_export(cid: int, format: str = "json", frames: int = 0):
     try:
         body, media_type = store.export(cid, fmt=format, include_frames=bool(frames))
+    except FramesNotAttached as exc:
+        raise HTTPException(404, str(exc)) from None
+    except FramePointerTurnover as exc:
+        raise HTTPException(409, str(exc)) from None
+    except (FrameFileMissing, FrameStorageError) as exc:
+        raise HTTPException(422, str(exc)) from None
     except ValueError as exc:
-        raise HTTPException(404, str(exc))
+        raise HTTPException(404, str(exc)) from None
     ext = "json" if format == "json" else "md"
     return Response(
         content=body,

@@ -80,6 +80,28 @@ class StorageMutationOutcome:
 SUPPORTED_FRAME_PHASES = frozenset({"reading", "thinking", "prompt", "gen"})
 
 
+def _normalize_frame_layer_key(key):
+    """Return canonical integer layer IDs for supported archive map keys.
+
+    Production archives historically store frame-layer maps with string keys
+    like "0"; remediation heads may have written integer keys.  Bool values are
+    rejected even though bool is an int subclass.
+    """
+    if isinstance(key, bool):
+        raise ValueError("invalid frame layer key")
+    if isinstance(key, int):
+        if key < 0:
+            raise ValueError("invalid frame layer key")
+        return key
+    if isinstance(key, str):
+        if key == "0":
+            return 0
+        if key and key[0] in "123456789" and key.isdecimal():
+            return int(key)
+        raise ValueError("invalid frame layer key")
+    raise ValueError("invalid frame layer key")
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
     id INTEGER PRIMARY KEY,
@@ -311,6 +333,8 @@ class Store:
             conn.commit()
             return self._mutation_outcome("committed", "update_conversation", message_id=conversation_id)
         except Exception as exc:
+            if isinstance(exc, StaleMessageUpdate):
+                raise
             self._abort_transaction_or_discard(conn)
             try:
                 with self._independent_read_connection() as read:
@@ -330,12 +354,13 @@ class Store:
 
     def delete_conversation(self, conversation_id):
         conn = self._conn()
-        rows = conn.execute(
-            "SELECT frames_file FROM messages WHERE conversation_id = ? AND frames_file IS NOT NULL",
-            (conversation_id,),
-        ).fetchall()
+        rows = []
         try:
             conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT frames_file FROM messages WHERE conversation_id = ? AND frames_file IS NOT NULL",
+                (conversation_id,),
+            ).fetchall()
             conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
             conn.commit()
         except Exception as exc:
@@ -890,9 +915,13 @@ class Store:
                 last_pos = entry["pos"]
                 if not isinstance(entry.get("token_id"), int):
                     raise ValueError("invalid frame token id")
-                if any(not isinstance(l, int) for l in entry["layers"].keys()):
-                    raise ValueError("invalid frame layer key")
-                if set(entry["layers"].keys()) != set(data["layers"]):
+                normalized_layers = {}
+                for raw_layer, layer_data in entry["layers"].items():
+                    layer_id = _normalize_frame_layer_key(raw_layer)
+                    if layer_id in normalized_layers:
+                        raise ValueError("duplicate frame layer key")
+                    normalized_layers[layer_id] = layer_data
+                if set(normalized_layers) != set(data["layers"]):
                     raise ValueError("frame layers do not match archive layers")
                 if data.get("gen") is not None and (not isinstance(data.get("gen"), int) or data.get("gen") < 0):
                     raise ValueError("invalid frame generation index")
@@ -905,7 +934,7 @@ class Store:
                     "gen": data.get("gen"),
                     "layers": {},
                 }
-                for layer, d in entry["layers"].items():
+                for layer, d in normalized_layers.items():
                     if not isinstance(d, dict):
                         raise ValueError("invalid layer entry")
                     ids_arr = np.frombuffer(d["ids"], np.int32)
