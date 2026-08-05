@@ -332,13 +332,20 @@ class LensManager:
     @staticmethod
     def cleanup_withdrawn(_old):
         import gc
+        first_error = None
+        if isinstance(_old, dict):
+            _old.clear()
         _old = None
-        gc.collect()
+        try:
+            gc.collect()
+        except Exception as exc:
+            first_error = exc
         try:
             torch.cuda.empty_cache()
         except Exception as exc:
-            return exc
-        return None
+            if first_error is None:
+                first_error = exc
+        return first_error
 
     def start_gen(self):
         gen_id = next(self._gen_counter)

@@ -16,6 +16,7 @@ from core.gpus import gpu_stats
 
 FITS_DIR = config.DATA_DIR / "fits"
 WORKER = config.ROOT / "scripts" / "fit_worker.py"
+FIT_PROCESS_SHUTDOWN_TIMEOUT = 5.0
 
 # Fit corpus. Any HuggingFace dataset id works as-is: wikitext is the default
 # and keeps a dedicated streamed path, every other id goes through the generic
@@ -259,8 +260,8 @@ class FitManager:
             run = _FitRun()
             run.reservation_release = reservation_release
             self._active_run = run
-        orchestrator = threading.Thread(target=self._run, args=(run, name, params), daemon=True)
         try:
+            orchestrator = threading.Thread(target=self._run, args=(run, name, params), daemon=True)
             orchestrator.start()
         except Exception:
             with self._lock:
@@ -289,15 +290,7 @@ class FitManager:
                 self.state["state"] = "stopping"
         with run.process_lock:
             for proc in run.processes:
-                try:
-                    running = proc.poll() is None
-                except Exception:
-                    running = True
-                if running:
-                    try:
-                        proc.terminate()
-                    except Exception:
-                        pass
+                self._request_process_shutdown(proc, reap=False)
         self._emit()
         return dict(self.state)
 
@@ -355,11 +348,55 @@ class FitManager:
             pass
 
     @staticmethod
-    def _join_run_helpers(run):
+    def _request_process_shutdown(proc, *, reap=True, timeout=FIT_PROCESS_SHUTDOWN_TIMEOUT):
+        confirmed = False
+        running = True
+        try:
+            running = proc.poll() is None
+        except Exception:
+            running = True
+        if running:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        if not reap:
+            return False
+        try:
+            proc.wait(timeout=timeout)
+            confirmed = True
+        except TypeError:
+            try:
+                proc.wait()
+                confirmed = True
+            except Exception:
+                confirmed = False
+        except Exception:
+            confirmed = False
+        if not confirmed:
+            try:
+                if proc.poll() is None and hasattr(proc, "kill"):
+                    proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=timeout)
+                confirmed = True
+            except TypeError:
+                try:
+                    proc.wait()
+                    confirmed = True
+                except Exception:
+                    confirmed = False
+            except Exception:
+                confirmed = False
+        return confirmed
+
+    def _join_run_helpers(self, run):
         """Reap children and join helpers without holding the manager lock."""
         for proc in run.processes:
             try:
-                proc.wait()
+                self._request_process_shutdown(proc, reap=True)
             except Exception:
                 pass
         for thread in run.helper_threads:
@@ -391,8 +428,7 @@ class FitManager:
         with run.process_lock:
             processes = list(run.processes)
         for proc in processes:
-            if proc.poll() is None:
-                self._terminate_after_helper_failure(proc)
+            self._request_process_shutdown(proc, reap=True)
         self._join_run_helpers(run)
         heartbeat = run.heartbeat_thread
         if heartbeat is not None and heartbeat is not threading.current_thread():
@@ -662,16 +698,12 @@ class FitManager:
             run.heartbeat_stop.set()
             with run.process_lock:
                 for proc in run.processes:
-                    try:
-                        if proc.poll() is None:
-                            proc.terminate()
-                    except Exception:
-                        pass
+                    self._request_process_shutdown(proc, reap=False)
             for proc in run.processes:
                 # ``wait`` is required even when terminate made ``poll`` turn
                 # non-None immediately: the child still needs to be reaped.
                 try:
-                    proc.wait()
+                    self._request_process_shutdown(proc, reap=True)
                 except Exception:
                     pass
             heartbeat = run.heartbeat_thread

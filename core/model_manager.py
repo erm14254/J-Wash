@@ -546,13 +546,24 @@ class ModelManager:
             published = True
             with self._lock:
                 self._sync_from_bundle(candidate)
-            return dict(candidate.meta)
-        except Exception:
+            result = dict(candidate.meta)
+            candidate = hf_model = tokenizer = jl = None
+            return result
+        except OperationConflict:
+            raise
+        except Exception as exc:
+            failure_message = str(exc)
+            try:
+                exc.__traceback__ = None
+                exc.__context__ = None
+                exc.__cause__ = None
+            except Exception:
+                pass
             if not published:
                 candidate = None
                 hf_model = tokenizer = jl = None
                 _free_cuda()
-            raise
+            raise RuntimeError(failure_message) from None
         finally:
             if token is not None:
                 self.coordinator.release(token)

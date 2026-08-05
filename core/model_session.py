@@ -81,6 +81,18 @@ class ModelStatusSnapshot:
     operation: OperationStatus | None = None
 
 
+@dataclass(frozen=True)
+class WorkerOutcome:
+    value: Any = None
+    failure_kind: str | None = None
+    failure_message: str | None = None
+    http_status: int | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.failure_kind is None
+
+
 class OperationConflict(RuntimeError):
     pass
 
@@ -161,15 +173,36 @@ class ModelSessionCoordinator:
         self._cancelled: set[int] = set()
         self._op_ids = itertools.count(1)
         self._lens_binding = None
-        self._interventions = None
+        self._interventions = self.empty_intervention_record(0)
         self._last_generation = None
         self._lens_binding_id = 0
         self._intervention_revision = 0
         self._copy_hook = None
 
+    @staticmethod
+    def empty_intervention_record(session_id: int = 0, *, revision: int = 0, scale: float = 1.0):
+        return MappingProxyType({
+            "revision": revision,
+            "model_session_id": session_id,
+            "lens_binding_id": None,
+            "scale": scale,
+            "mode": "standard",
+            "summary": (),
+            "active_summary": (),
+            "rules": (),
+            "active_rules": (),
+        })
+
+    def _observe_copy_outside_lock(self, value):
+        hook = self._copy_hook
+        if hook is not None:
+            hook(value)
+
     def snapshot(self, *, include_bundle: bool = True) -> ModelSessionSnapshot:
         with self._lock:
-            return self._snapshot_locked(include_bundle=include_bundle)
+            raw = self._snapshot_refs_locked(include_bundle=include_bundle)
+        self._observe_copy_outside_lock(raw)
+        return self._snapshot_from_refs(raw)
 
     def _copy_small(self, value):
         if self._copy_hook is not None:
@@ -219,8 +252,8 @@ class ModelSessionCoordinator:
                 "lens_binding_id": record.get("lens_binding_id"),
                 "scale": record.get("scale"),
                 "mode": record.get("mode"),
-                "summary": copy.deepcopy(record.get("summary") or []),
-                "active_summary": copy.deepcopy(record.get("active_summary") or []),
+                "summary": list(record.get("summary") or []),
+                "active_summary": list(record.get("active_summary") or []),
                 "rules": [ModelSessionCoordinator._clone_rule_container(r) for r in record.get("rules") or []],
                 "active_rules": [ModelSessionCoordinator._clone_rule_container(r) for r in record.get("active_rules") or []],
             }
@@ -243,10 +276,12 @@ class ModelSessionCoordinator:
     def _light_lens(record):
         if record is None:
             return None
+        if isinstance(record, MappingProxyType):
+            record = dict(record)
         if isinstance(record, dict):
-            return copy.deepcopy(record)
+            return MappingProxyType(dict(record))
         meta = getattr(record, "meta", None)
-        return copy.deepcopy(meta) if meta is not None else None
+        return MappingProxyType(dict(meta)) if meta is not None else None
 
     @staticmethod
     def _light_interventions(record):
@@ -261,49 +296,65 @@ class ModelSessionCoordinator:
                 "lens_binding_id": record.get("lens_binding_id"),
                 "scale": record.get("scale"),
                 "mode": record.get("mode"),
-                "summary": copy.deepcopy(record.get("summary") or []),
-                "active_summary": copy.deepcopy(record.get("active_summary") or []),
+                "summary": tuple(record.get("summary") or ()),
+                "active_summary": tuple(record.get("active_summary") or ()),
             }
-        return copy.deepcopy(record)
+        return record
 
-    def _snapshot_locked(self, *, include_bundle: bool = True) -> ModelSessionSnapshot:
+    def _snapshot_refs_locked(self, *, include_bundle: bool = True):
         op = self._operation_status_locked()
+        return {
+            "model_session_id": self._model_session_id,
+            "model_state": "loaded" if self._bundle is not None else "unloaded",
+            "bundle": self._bundle if include_bundle else None,
+            "loaded": self._bundle is not None,
+            "lens_binding": self._lens_binding,
+            "interventions": self._interventions,
+            "last_generation": self._last_generation,
+            "operation": op,
+            "include_bundle": include_bundle,
+        }
+
+    @classmethod
+    def _snapshot_from_refs(cls, raw) -> ModelSessionSnapshot:
+        include_bundle = raw["include_bundle"]
         return ModelSessionSnapshot(
-            model_session_id=self._model_session_id,
-            model_state="loaded" if self._bundle is not None else "unloaded",
-            bundle=self._bundle if include_bundle else None,
-            loaded=self._bundle is not None,
-            lens_binding=(
-                self._copy_small(self._lens_binding)
-                if include_bundle else self._light_lens(self._lens_binding)
-            ),
-            interventions=(
-                self._copy_intervention_record(self._interventions)
-                if include_bundle else self._light_interventions(self._interventions)
-            ),
-            last_generation=self._copy_small(self._last_generation),
-            operation=op,
+            model_session_id=raw["model_session_id"],
+            model_state=raw["model_state"],
+            bundle=raw["bundle"],
+            loaded=raw["loaded"],
+            lens_binding=raw["lens_binding"] if include_bundle else cls._light_lens(raw["lens_binding"]),
+            interventions=raw["interventions"] if include_bundle else cls._light_interventions(raw["interventions"]),
+            last_generation=raw["last_generation"],
+            operation=raw["operation"],
         )
 
     def status_snapshot(self) -> ModelStatusSnapshot:
         with self._lock:
-            return ModelStatusSnapshot(
-                model_session_id=self._model_session_id,
-                model_state="loaded" if self._bundle is not None else "unloaded",
-                loaded=self._bundle is not None,
-                model_meta=(
-                    MappingProxyType(self._copy_small(dict(self._bundle.meta)))
-                    if self._bundle is not None else None
-                ),
-                capability_profile=(
-                    self._copy_small(self._bundle.capability_profile)
-                    if self._bundle is not None else None
-                ),
-                lens=self._light_lens(self._lens_binding),
-                interventions=self._light_interventions(self._interventions),
-                last_generation=self._copy_small(self._last_generation),
-                operation=self._operation_status_locked(),
-            )
+            bundle = self._bundle
+            raw = {
+                "model_session_id": self._model_session_id,
+                "model_state": "loaded" if bundle is not None else "unloaded",
+                "loaded": bundle is not None,
+                "model_meta": bundle.meta if bundle is not None else None,
+                "capability_profile": bundle.capability_profile if bundle is not None else None,
+                "lens": self._lens_binding,
+                "interventions": self._interventions,
+                "last_generation": self._last_generation,
+                "operation": self._operation_status_locked(),
+            }
+        self._observe_copy_outside_lock(raw)
+        return ModelStatusSnapshot(
+            model_session_id=raw["model_session_id"],
+            model_state=raw["model_state"],
+            loaded=raw["loaded"],
+            model_meta=raw["model_meta"],
+            capability_profile=raw["capability_profile"],
+            lens=self._light_lens(raw["lens"]),
+            interventions=self._light_interventions(raw["interventions"]),
+            last_generation=raw["last_generation"],
+            operation=raw["operation"],
+        )
 
     @property
     def busy(self):
@@ -323,13 +374,16 @@ class ModelSessionCoordinator:
             token = OperationToken(next(self._op_ids), op_type, self._model_session_id, self._model_session_id, requires_loaded)
             self._operation = token
             self._cancelled.discard(token.id)
-            try:
-                return token, self._snapshot_locked(include_bundle=include_bundle)
-            except Exception:
+            raw = self._snapshot_refs_locked(include_bundle=include_bundle)
+        try:
+            self._observe_copy_outside_lock(raw)
+            return token, self._snapshot_from_refs(raw)
+        except Exception:
+            with self._lock:
                 if self._operation == token:
                     self._operation = None
                     self._cancelled.discard(token.id)
-                raise
+            raise
 
     def is_current(self, token: OperationToken) -> bool:
         with self._lock:
@@ -367,7 +421,12 @@ class ModelSessionCoordinator:
             self._bundle = bundle
             return self._model_session_id
 
-    def withdraw_loaded(self, token: OperationToken | None = None) -> tuple[LoadedModelBundle | None, int, bool]:
+    def withdraw_loaded(self, token: OperationToken | None = None, *, intervention_record: Any = None) -> tuple[LoadedModelBundle | None, int, bool]:
+        prepared_interventions = (
+            self._freeze_intervention_record(intervention_record)
+            if intervention_record is not None
+            else None
+        )
         with self._lock:
             if token is not None and self._operation != token:
                 raise OperationConflict("stale model operation")
@@ -378,7 +437,10 @@ class ModelSessionCoordinator:
             self._bundle = None
             self._lens_binding = None
             self._last_generation = None
-            self._interventions = None
+            self._interventions = prepared_interventions or self.empty_intervention_record(
+                self._model_session_id,
+                revision=self._intervention_revision,
+            )
             return old, self._model_session_id, True
 
     def update_lens_binding(self, token: OperationToken, binding: Any) -> int:

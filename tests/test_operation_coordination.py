@@ -175,3 +175,62 @@ def test_intervention_update_invalid_replace_is_transactional():
     with pytest.raises(ValueError, match="replacement_id required"):
         iv.update(1, mode="replace", lens_manager=type("LM", (), {"lens": object()})(), jl=type("JL", (), {"tokenizer": object(), "layers": [object()], "_lm_head": None})())
     assert iv.state_record() == before
+
+
+def test_lens_cleanup_clears_real_withdrawn_container_before_cuda_cleanup(monkeypatch):
+    import weakref
+    import gc
+    import core.lens_manager as lens_module
+    from core.lens_manager import LensManager
+
+    class TensorLike:
+        pass
+
+    lens = LensManager()
+    live = TensorLike()
+    lens.lens = TensorLike()
+    lens.mask = live
+    lens._J = TensorLike()
+    old = lens.withdraw()
+    mask_ref = weakref.ref(live)
+    seen = {}
+
+    def fake_empty_cache():
+        seen["during_cuda_keys"] = list(old.keys())
+
+    monkeypatch.setattr(lens_module.torch.cuda, "empty_cache", fake_empty_cache)
+    err = lens.cleanup_withdrawn(old)
+    del live
+    gc.collect()
+    assert err is None
+    assert old == {}
+    assert seen["during_cuda_keys"] == []
+    assert mask_ref() is None
+
+
+def test_model_transition_cleanup_does_not_restore_rules_after_publication_failure(monkeypatch):
+    from api import app
+
+    previous = app.interventions.state_record()
+    try:
+        app.interventions._rules = [{
+            "id": 1, "token_id": 1, "token": "a", "mode": "scale", "factor": 0.0,
+            "replacement_id": None, "replacement": None, "layers": [0], "enabled": True,
+            "dirs_a": {0: object()}, "dirs_b": None,
+        }]
+        app.interventions._revision = 1
+        app.interventions.global_scale = 2.5
+        app.interventions.mode = "readthrough"
+
+        def fail_update(_token, _snapshot):
+            raise RuntimeError("publication failed")
+
+        monkeypatch.setattr(app.manager.coordinator, "update_interventions", fail_update)
+        app._cleanup_model_bound_state(42, token=object())
+        snap = app.interventions.snapshot()
+        assert snap["rules"] == []
+        assert snap["active_rules"] == []
+        assert snap["scale"] == 2.5
+        assert snap["mode"] == "standard"
+    finally:
+        app.interventions.restore_state_record(previous)

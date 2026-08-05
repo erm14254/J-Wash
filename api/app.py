@@ -27,7 +27,7 @@ from core import fitting
 from core.fitting import FitManager
 from core.gpus import gpu_stats
 from core.lens_manager import LensManager
-from core.model_session import GenerationContext, LoadedModelBundle, OperationConflict, OperationType, ModelStateError, WorkerDispatch
+from core.model_session import GenerationContext, LoadedModelBundle, OperationConflict, OperationType, ModelStateError, WorkerDispatch, WorkerOutcome
 from core.model_manager import (
     ModelManager,
     _resolve_revision,
@@ -56,7 +56,6 @@ def _cleanup_model_bound_state(_session_id=None, token=None):
         neighbors.reset()
     except Exception as exc:
         errors.append(exc)
-    previous = interventions.state_record()
     try:
         interventions.clear_for_model_transition()
         snapshot = interventions.snapshot()
@@ -65,7 +64,6 @@ def _cleanup_model_bound_state(_session_id=None, token=None):
         if token is not None:
             manager.coordinator.update_interventions(token, snapshot)
     except Exception as exc:
-        interventions.restore_state_record(previous)
         errors.append(exc)
     cleanup_error = lens_manager.cleanup_withdrawn(old_lens)
     if cleanup_error is not None:
@@ -83,6 +81,41 @@ manager.on_model_withdraw = _cleanup_model_bound_state
 _ws_locks = {}
 _loop_holder = {}
 _deferred_worker_tasks = set()
+
+
+def _worker_success(value=None):
+    return WorkerOutcome(value=value)
+
+
+def _worker_failure(exc, *, default_status=500, value_status=422):
+    if isinstance(exc, HTTPException):
+        return WorkerOutcome(
+            failure_kind="http",
+            failure_message=str(exc.detail),
+            http_status=exc.status_code,
+        )
+    status = value_status if isinstance(exc, ValueError) else default_status
+    return WorkerOutcome(
+        failure_kind=exc.__class__.__name__,
+        failure_message=str(exc),
+        http_status=status,
+    )
+
+
+def _raise_worker_outcome(outcome: WorkerOutcome):
+    if outcome is None:
+        return None
+    if not isinstance(outcome, WorkerOutcome):
+        return outcome
+    if outcome.ok:
+        return outcome.value
+    raise HTTPException(outcome.http_status or 500, outcome.failure_message or "model worker failed") from None
+
+
+def _coordinated_interventions(snap):
+    if snap.interventions is None:
+        raise HTTPException(500, "coordinated intervention state unavailable")
+    return snap.interventions
 
 
 def _retain_worker_task(task):
@@ -306,7 +339,7 @@ def api_status():
             "start_timestamp": coord.operation.start_timestamp,
             "cancellation_requested": coord.operation.cancellation_requested,
         },
-        "lens": coord.lens,
+        "lens": dict(coord.lens) if hasattr(coord.lens, "items") else coord.lens,
         "gpus": gpu_stats(),
         "downloads": list(_downloads.values()),
         "convert": _convert_state,
@@ -327,7 +360,7 @@ def _publish_intervention_snapshot(token, snap):
     data = interventions.snapshot()
     data["model_session_id"] = snap.model_session_id
     lens = manager.coordinator.status_snapshot().lens
-    data["lens_binding_id"] = (lens or {}).get("lens_binding_id") if isinstance(lens, dict) else None
+    data["lens_binding_id"] = (lens or {}).get("lens_binding_id") if hasattr(lens or {}, "get") else None
     manager.coordinator.update_interventions(token, data)
     return data
 
@@ -377,9 +410,12 @@ async def api_delete_model(req: DeleteModelRequest):
 
     def worker():
         if not dispatch.claim():
-            return None
+            return _worker_success()
         try:
-            return delete_model(req.model_id)
+            try:
+                return _worker_success(delete_model(req.model_id))
+            except Exception as exc:
+                return _worker_failure(exc, default_status=500, value_status=400)
         finally:
             dispatch.release_from_worker()
 
@@ -390,14 +426,12 @@ async def api_delete_model(req: DeleteModelRequest):
         raise
     _retain_worker_task(task)
     try:
-        return await asyncio.shield(task)
+        return _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
         dispatch.cancel_from_awaiter()
         raise
-    except ValueError as exc:
-        raise HTTPException(400, str(exc))
-    except Exception as exc:
-        raise HTTPException(500, str(exc))
+    except HTTPException:
+        raise
 
 
 # --- user settings (Options tab) --------------------------------------------
@@ -505,27 +539,32 @@ async def api_lens_load(req: LensLoadRequest):
 
     def worker():
         if not dispatch.claim():
-            return None
+            return _worker_success()
         payload = dispatch.take_payload()
-        old_state = lens_manager.state_record()
+        old_state = None
         try:
-            result = lens_manager.load(
-                manager,
-                repo_id=payload["repo_id"],
-                filename=payload["filename"],
-                revision=payload["revision"],
-                path=payload["path"],
-                layers=payload["layers"],
-                k=payload["k"],
-            )
             try:
+                old_state = lens_manager.state_record()
+                result = lens_manager.load(
+                    manager,
+                    repo_id=payload["repo_id"],
+                    filename=payload["filename"],
+                    revision=payload["revision"],
+                    path=payload["path"],
+                    layers=payload["layers"],
+                    k=payload["k"],
+                )
                 manager.coordinator.update_lens_binding(token, result)
-            except Exception:
-                lens_manager.restore_state_record(old_state)
-                raise
-            return result
+                return _worker_success(result)
+            except Exception as exc:
+                if old_state is not None:
+                    try:
+                        lens_manager.restore_state_record(old_state)
+                    except Exception:
+                        logging.getLogger(__name__).exception("failed to restore lens state after worker failure")
+                return _worker_failure(exc)
         finally:
-            payload = old_state = None
+            payload = old_state = result = None
             dispatch.release_from_worker()
 
     try:
@@ -535,19 +574,20 @@ async def api_lens_load(req: LensLoadRequest):
         raise
     _retain_worker_task(task)
     try:
-        return await asyncio.shield(task)
+        return _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
         dispatch.cancel_from_awaiter()
         raise
-    except Exception as exc:
-        raise HTTPException(500, str(exc))
+    except HTTPException:
+        raise
 
 
 @app.post("/api/lens/unload")
 def api_lens_unload():
     token = None
+    old = None
     try:
-        token, _ = manager.coordinator.acquire(OperationType.LENS_UPDATE)
+        token, _snap = manager.coordinator.acquire(OperationType.LENS_UPDATE, include_bundle=False)
         old = lens_manager.withdraw()
         try:
             manager.coordinator.clear_lens_binding(token)
@@ -555,6 +595,7 @@ def api_lens_unload():
             lens_manager.restore_withdrawn(old)
             raise
         cleanup_error = lens_manager.cleanup_withdrawn(old)
+        old = None
         if cleanup_error is not None:
             logging.getLogger(__name__).warning(
                 "lens cleanup failed after authoritative unload",
@@ -811,7 +852,7 @@ async def api_edit_export(req: ExportRequest):
         token, snap = manager.coordinator.acquire(OperationType.EXPORT, requires_loaded=True)
         bundle = snap.bundle
         meta = dict(bundle.meta)
-        intervention_snapshot = snap.interventions or interventions.snapshot()
+        intervention_snapshot = _coordinated_interventions(snap)
         rules = intervention_snapshot["active_rules"]
         if not rules:
             raise HTTPException(422, "no active intervention to export (rules disabled or without layers?)")
@@ -849,40 +890,49 @@ async def api_edit_export(req: ExportRequest):
             manager.coordinator.release(token)
         raise
 
-    publication_gate = editing.PublicationGate(
-        lambda: not manager.coordinator.is_cancelled(token) and manager.coordinator.is_current(token)
-    )
-    payload = {
-        "bundle": bundle,
-        "meta": meta,
-        "rules": rules,
-        "source_dir": source_dir,
-        "scale": scale,
-        "kwargs": kwargs,
-        "export_fn": export_fn,
-        "format": req.format,
-        "name": req.name,
-        "publication_gate": publication_gate,
-    }
-    dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+    try:
+        publication_gate = editing.PublicationGate(
+            lambda: not manager.coordinator.is_cancelled(token) and manager.coordinator.is_current(token)
+        )
+        payload = {
+            "bundle": bundle,
+            "meta": meta,
+            "rules": rules,
+            "source_dir": source_dir,
+            "scale": scale,
+            "kwargs": kwargs,
+            "export_fn": export_fn,
+            "format": req.format,
+            "name": req.name,
+            "publication_gate": publication_gate,
+        }
+        dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+    except Exception:
+        if token is not None:
+            manager.coordinator.release(token)
+        raise
     snap = bundle = meta = intervention_snapshot = rules = source_dir = kwargs = export_fn = payload = None
 
     def worker():
         if not dispatch.claim():
-            return None
+            return _worker_success()
         payload = dispatch.take_payload()
         try:
-            call_kwargs = dict(payload["kwargs"])
-            if payload["export_fn"] is editing.export_rebase:
-                call_kwargs["publication_guard"] = payload["publication_gate"]
-            return payload["export_fn"](
-                payload["rules"], payload["bundle"].jl, payload["meta"],
-                fmt=payload["format"], name=payload["name"],
-                source_dir=payload["source_dir"], scale=payload["scale"], **call_kwargs,
-            )
+            try:
+                call_kwargs = dict(payload["kwargs"])
+                if payload["export_fn"] is editing.export_rebase:
+                    call_kwargs["publication_guard"] = payload["publication_gate"]
+                result = payload["export_fn"](
+                    payload["rules"], payload["bundle"].jl, payload["meta"],
+                    fmt=payload["format"], name=payload["name"],
+                    source_dir=payload["source_dir"], scale=payload["scale"], **call_kwargs,
+                )
+                return _worker_success(result)
+            except Exception as exc:
+                return _worker_failure(exc)
         finally:
             import gc
-            payload = None
+            payload = call_kwargs = result = None
             gc.collect()
             dispatch.release_from_worker()
 
@@ -893,16 +943,13 @@ async def api_edit_export(req: ExportRequest):
         raise
     _retain_worker_task(task)
     try:
-        result = await asyncio.shield(task)
-        return result
+        return _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
         publication_gate.cancel()
         dispatch.cancel_from_awaiter()
         raise
-    except ValueError as exc:
-        raise HTTPException(422, str(exc))
-    except Exception as exc:
-        raise HTTPException(500, str(exc))
+    except HTTPException:
+        raise
 
 
 # --- direct GGUF export (via a user-provided llama.cpp folder) ---------------
@@ -1054,7 +1101,7 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
             token, snap = manager.coordinator.acquire(OperationType.GGUF_BAKE, requires_loaded=True)
             bundle = _bundle_from_snapshot_or_legacy(snap)
             meta = dict(bundle.meta)
-            intervention_snapshot = snap.interventions or interventions.snapshot()
+            intervention_snapshot = _coordinated_interventions(snap)
             rules = intervention_snapshot["active_rules"]
             if not rules:
                 raise HTTPException(422, "no active intervention to export")
@@ -1084,38 +1131,47 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
             if token is not None:
                 manager.coordinator.release(token)
             raise
-        publication_gate = editing.PublicationGate(
-            lambda: not manager.coordinator.is_cancelled(token) and manager.coordinator.is_current(token)
-        )
-        payload = {
-            "bundle": bundle,
-            "meta": meta,
-            "rules": rules,
-            "source_dir": source_dir,
-            "scale": scale,
-            "kwargs": kwargs,
-            "export_fn": export_fn,
-            "name": "/".join((*name_parts, "hf")),
-            "publication_gate": publication_gate,
-        }
-        dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+        try:
+            publication_gate = editing.PublicationGate(
+                lambda: not manager.coordinator.is_cancelled(token) and manager.coordinator.is_current(token)
+            )
+            payload = {
+                "bundle": bundle,
+                "meta": meta,
+                "rules": rules,
+                "source_dir": source_dir,
+                "scale": scale,
+                "kwargs": kwargs,
+                "export_fn": export_fn,
+                "name": "/".join((*name_parts, "hf")),
+                "publication_gate": publication_gate,
+            }
+            dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+        except Exception:
+            if token is not None:
+                manager.coordinator.release(token)
+            raise
         snap = bundle = meta = intervention_snapshot = rules = source_dir = kwargs = export_fn = payload = None
 
         def bake_worker():
             if not dispatch.claim():
-                return
+                return _worker_success()
             payload = dispatch.take_payload()
             try:
-                call_kwargs = dict(payload["kwargs"])
-                if payload["export_fn"] is editing.export_rebase:
-                    call_kwargs["publication_guard"] = payload["publication_gate"]
-                return payload["export_fn"](
-                    payload["rules"], payload["bundle"].jl, payload["meta"],
-                    fmt="full", name=payload["name"],
-                    source_dir=payload["source_dir"], scale=payload["scale"], **call_kwargs,
-                )
+                try:
+                    call_kwargs = dict(payload["kwargs"])
+                    if payload["export_fn"] is editing.export_rebase:
+                        call_kwargs["publication_guard"] = payload["publication_gate"]
+                    result = payload["export_fn"](
+                        payload["rules"], payload["bundle"].jl, payload["meta"],
+                        fmt="full", name=payload["name"],
+                        source_dir=payload["source_dir"], scale=payload["scale"], **call_kwargs,
+                    )
+                    return _worker_success(result)
+                except Exception as exc:
+                    return _worker_failure(exc)
             finally:
-                payload = None
+                payload = call_kwargs = result = None
                 dispatch.release_from_worker()
         try:
             task = asyncio.create_task(asyncio.to_thread(bake_worker))
@@ -1124,15 +1180,13 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
             raise
         _retain_worker_task(task)
         try:
-            await asyncio.shield(task)
+            _raise_worker_outcome(await asyncio.shield(task))
         except asyncio.CancelledError:
             publication_gate.cancel()
             dispatch.cancel_from_awaiter()
             raise
-        except ValueError as exc:
-            raise HTTPException(422, str(exc))
-        except Exception as exc:
-            raise HTTPException(500, str(exc))
+        except HTTPException:
+            raise
         baked = "baked"
 
     _gguf_state.update(state="running", name=validated_name, step="starting", error=None, result=None)
@@ -1191,7 +1245,7 @@ def _captured_generation_context(token, snap, stop_event):
         meta=bundle.meta,
         capability_profile=bundle.capability_profile,
         lens=lens_manager.snapshot_for_generation(),
-        intervention_snapshot=snap.interventions or interventions.snapshot(),
+        intervention_snapshot=_coordinated_interventions(snap),
         stop_event=stop_event,
     )
 
@@ -1226,25 +1280,29 @@ async def api_generate_sync(req: GenerateSyncRequest):
     def worker():
         global _generation_counter
         if not dispatch.claim():
-            return
+            return _worker_success()
         payload = dispatch.take_payload()
         try:
-            context = payload["context"]
-            manager.generate(
-                payload["messages"], payload["sampling"], stop_event, emit,
-                lens=context, ablator=interventions if context.intervention_snapshot.get("rules") else None,
-            )
-            if done.get("error"):
-                return
-            _generation_counter += 1
-            last = {
-                "n": _generation_counter,
-                "prompt": next((m.get("content", "") for m in reversed(payload["messages"]) if m.get("role") == "user"), ""),
-                "text": done.get("text", ""),
-                "stats": done.get("stats"),
-            }
-            manager.coordinator.publish_last_generation(token, context.model_session_id, last)
-            done["last_generation"] = last
+            try:
+                context = payload["context"]
+                manager.generate(
+                    payload["messages"], payload["sampling"], stop_event, emit,
+                    lens=context, ablator=interventions if context.intervention_snapshot.get("rules") else None,
+                )
+                if done.get("error"):
+                    return _worker_failure(RuntimeError(done["error"]))
+                _generation_counter += 1
+                last = {
+                    "n": _generation_counter,
+                    "prompt": next((m.get("content", "") for m in reversed(payload["messages"]) if m.get("role") == "user"), ""),
+                    "text": done.get("text", ""),
+                    "stats": done.get("stats"),
+                }
+                manager.coordinator.publish_last_generation(token, context.model_session_id, last)
+                done["last_generation"] = last
+                return _worker_success({"text": done.get("text", ""), "stats": done.get("stats"), "last_generation": last})
+            except Exception as exc:
+                return _worker_failure(exc)
         finally:
             payload = context = None
             dispatch.release_from_worker()
@@ -1256,21 +1314,18 @@ async def api_generate_sync(req: GenerateSyncRequest):
         raise
     _retain_worker_task(task)
     try:
-        await asyncio.shield(task)
+        outcome_value = _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
         dispatch.cancel_from_awaiter()
         raise
-    except Exception as exc:
-        raise HTTPException(500, str(exc))
-    if done.get("error"):
-        raise HTTPException(500, done["error"])
-    last = done.get("last_generation")
+    except HTTPException:
+        raise
     for ws in list(_ws_locks):
         try:
             await _ws_send(ws, json.dumps({"type": "api_generation"}))
         except Exception:
             pass
-    return {"text": done.get("text", ""), "stats": done.get("stats")}
+    return {"text": (outcome_value or {}).get("text", ""), "stats": (outcome_value or {}).get("stats")}
 
 
 class NeighborsRequest(BaseModel):
@@ -1296,15 +1351,19 @@ async def api_token_neighbors(req: NeighborsRequest):
 
     def worker():
         if not dispatch.claim():
-            return None
+            return _worker_success()
         payload = dispatch.take_payload()
         try:
-            return neighbors.lookup(
-                payload["bundle"].jl, payload["bundle"].tokenizer,
-                payload["key"], payload["token_ids"], payload["k"],
-            )
+            try:
+                result = neighbors.lookup(
+                    payload["bundle"].jl, payload["bundle"].tokenizer,
+                    payload["key"], payload["token_ids"], payload["k"],
+                )
+                return _worker_success(result)
+            except Exception as exc:
+                return _worker_failure(exc)
         finally:
-            payload = None
+            payload = result = None
             dispatch.release_from_worker()
 
     try:
@@ -1314,12 +1373,12 @@ async def api_token_neighbors(req: NeighborsRequest):
         raise
     _retain_worker_task(task)
     try:
-        result = await asyncio.shield(task)
+        result = _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
         dispatch.cancel_from_awaiter()
         raise
-    except ValueError as exc:
-        raise HTTPException(422, str(exc))
+    except HTTPException:
+        raise
     return {"neighbors": {str(tid): entries for tid, entries in result.items()}}
 
 
@@ -1431,12 +1490,16 @@ async def api_lens_pin(req: PinRequest):
 
     def worker():
         if not dispatch.claim():
-            return None
+            return _worker_success()
         payload = dispatch.take_payload()
         try:
-            return lens_manager.pin_ranks(payload["gen_id"], payload["token_ids"], payload["jl"])
+            try:
+                result = lens_manager.pin_ranks(payload["gen_id"], payload["token_ids"], payload["jl"])
+                return _worker_success(result)
+            except Exception as exc:
+                return _worker_failure(exc)
         finally:
-            payload = None
+            payload = result = None
             dispatch.release_from_worker()
 
     try:
@@ -1446,12 +1509,12 @@ async def api_lens_pin(req: PinRequest):
         raise
     _retain_worker_task(task)
     try:
-        return await asyncio.shield(task)
+        return _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
         dispatch.cancel_from_awaiter()
         raise
-    except ValueError as exc:
-        raise HTTPException(422, str(exc))
+    except HTTPException:
+        raise
 
 
 # Alternative/duplicate weight folders, never needed for transformers inference
@@ -1953,15 +2016,19 @@ async def _run_chat(ws, req):
 
     def worker_body():
         if not dispatch.claim():
-            return
+            return _worker_success()
         payload = dispatch.take_payload()
         try:
-            request = payload["request"]
-            context = payload["context"]
-            if "messages" in request:
-                _generate_safely(request["messages"], request.get("sampling", {}), stop_event, emit, context)
-            else:
-                _persisted_generate(request, stop_event, emit, context)
+            try:
+                request = payload["request"]
+                context = payload["context"]
+                if "messages" in request:
+                    _generate_safely(request["messages"], request.get("sampling", {}), stop_event, emit, context)
+                else:
+                    _persisted_generate(request, stop_event, emit, context)
+                return _worker_success()
+            except Exception as exc:
+                return _worker_failure(exc)
         finally:
             payload = context = request = None
             dispatch.release_from_worker()

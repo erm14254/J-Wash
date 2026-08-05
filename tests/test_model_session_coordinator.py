@@ -1,5 +1,6 @@
 import pytest
 import weakref
+import threading
 
 from core.model_session import (
     LoadedModelBundle,
@@ -143,6 +144,42 @@ def test_acquire_rolls_back_when_snapshot_copy_fails():
     assert c.status_snapshot().operation is None
     successor, _ = c.acquire(OperationType.UNLOAD, include_bundle=False)
     assert c.release(successor)
+
+
+def test_snapshot_copy_hook_runs_after_lock_release_and_does_not_block_release():
+    c = ModelSessionCoordinator()
+    token, snap = c.acquire(OperationType.LOAD)
+    c.publish_loaded(token, bundle("lock-boundary"), expected_unloaded_session=snap.model_session_id)
+    c.release(token)
+    active, _ = c.acquire(OperationType.GENERATE, requires_loaded=True)
+    entered = threading.Event()
+    unblock = threading.Event()
+    hook_assertions = []
+
+    def blocking_hook(_value):
+        hook_assertions.append(not c._lock.locked())
+        entered.set()
+        assert unblock.wait(2), "snapshot outward-copy hook was not unblocked"
+
+    c._copy_hook = blocking_hook
+    errors = []
+
+    def snapshot_worker():
+        try:
+            c.snapshot()
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=snapshot_worker)
+    thread.start()
+    assert entered.wait(2), "snapshot outward construction did not reach hook"
+    assert c.release(active) is True
+    unblock.set()
+    thread.join(2)
+    assert not thread.is_alive(), "snapshot outward construction did not finish"
+    c._copy_hook = None
+    assert hook_assertions == [True]
+    assert errors == []
 
 
 class NoDeepcopyTensor:
