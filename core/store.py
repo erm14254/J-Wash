@@ -25,6 +25,18 @@ class StaleMessageUpdate(RuntimeError):
 class FrameStorageError(RuntimeError):
     """Frame archive publication or loading failed coherently."""
 
+
+class FramesNotAttached(ValueError):
+    """No frame archive is currently attached to the message."""
+
+
+class FramePointerTurnover(RuntimeError):
+    """The committed frame pointer changed too often while reading."""
+
+
+class FrameFileMissing(FrameStorageError):
+    """The committed frame archive is missing from disk."""
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS conversations (
     id INTEGER PRIMARY KEY,
@@ -240,24 +252,46 @@ class Store:
 
     def add_message(self, conversation_id, parent_id, role, content, meta=None, *, return_version=False):
         conn = self._conn()
-        cur = conn.execute(
-            "INSERT INTO messages (conversation_id, parent_id, role, content, meta, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                conversation_id,
-                parent_id,
-                role,
-                content,
-                json.dumps(meta, ensure_ascii=False) if meta else None,
-                _now(),
-            ),
-        )
-        conn.execute(
-            "UPDATE conversations SET updated_at = ? WHERE id = ?",
-            (_now(), conversation_id),
-        )
-        conn.commit()
-        return (cur.lastrowid, 0) if return_version else cur.lastrowid
+        message_id = None
+        now = _now()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM messages")
+            message_id = int(cur.fetchone()[0])
+            conn.execute(
+                "INSERT INTO messages (id, conversation_id, parent_id, role, content, meta, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    message_id,
+                    conversation_id,
+                    parent_id,
+                    role,
+                    content,
+                    json.dumps(meta, ensure_ascii=False) if meta else None,
+                    now,
+                ),
+            )
+            conn.execute(
+                "UPDATE conversations SET updated_at = ? WHERE id = ?",
+                (now, conversation_id),
+            )
+            conn.commit()
+        except Exception:
+            clean = self._rollback_or_discard(conn)
+            read = self._fresh_conn() if not clean else conn
+            try:
+                if message_id is not None:
+                    row = read.execute(
+                        "SELECT id, version FROM messages WHERE id = ? AND conversation_id = ?",
+                        (message_id, conversation_id),
+                    ).fetchone()
+                    if row is not None:
+                        return (row["id"], row["version"]) if return_version else row["id"]
+            finally:
+                if read is not conn:
+                    read.close()
+            raise
+        return (message_id, 0) if return_version else message_id
 
     def get_message(self, message_id):
         conn = self._conn()
@@ -344,7 +378,7 @@ class Store:
                 (message_id,),
             ).fetchone()
             if row is None:
-                conn.rollback()
+                self._rollback_or_discard(conn)
                 raise ValueError(f"unknown message {message_id}")
             old_file = row["frames_file"]
             target_frame = frame_file if frame_file is not None else old_file
@@ -355,7 +389,7 @@ class Store:
                 (content, meta_json, target_frame, message_id, expected_version),
             )
             if cur.rowcount != 1:
-                conn.rollback()
+                self._rollback_or_discard(conn)
                 if final_path is not None:
                     self._unlink_best_effort(final_path)
                 return False
@@ -365,10 +399,7 @@ class Store:
             )
             conn.commit()
         except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
+            self._rollback_or_discard(conn)
             if final_path is not None:
                 current = conn.execute("SELECT frames_file FROM messages WHERE id = ?", (message_id,)).fetchone()
                 if current is not None and current["frames_file"] == frame_file:
@@ -431,6 +462,25 @@ class Store:
             "vocab": {str(t): s for t, s in vocab.items()},
         })
 
+    def mark_frame_publication_failed(self, message_id, *, expected_version, failure_meta):
+        conn = self._conn()
+        meta_sql = json.dumps(failure_meta, ensure_ascii=False)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "UPDATE messages SET meta = ?, frames_file = NULL, version = version + 1 "
+                "WHERE id = ? AND version = ?",
+                (meta_sql, message_id, expected_version),
+            )
+            if cur.rowcount != 1:
+                self._rollback_or_discard(conn)
+                return False
+            conn.commit()
+            return True
+        except Exception:
+            self._rollback_or_discard(conn)
+            raise
+
     def save_frames(self, message_id, frames, layers, k, *, expected_version=None, complete_meta=None):
         conn = self._conn()
         row = conn.execute(
@@ -458,24 +508,25 @@ class Store:
                     (filename, message_id, baseline),
                 )
             if cur.rowcount != 1:
-                conn.rollback()
+                self._rollback_or_discard(conn)
                 self._unlink_best_effort(final_path)
                 raise StaleMessageUpdate(f"message {message_id} changed before frames attached")
             conn.commit()
             committed = True
         except Exception:
+            clean = self._rollback_or_discard(conn)
+            read_conn = self._fresh_conn() if not clean else conn
+            current = read_conn.execute("SELECT frames_file FROM messages WHERE id = ?", (message_id,)).fetchone()
             try:
-                if conn.in_transaction:
-                    conn.rollback()
-            except Exception:
-                log.warning("failed to roll back frame attachment", exc_info=True)
-            current = conn.execute("SELECT frames_file FROM messages WHERE id = ?", (message_id,)).fetchone()
-            if current is not None and current["frames_file"] == filename:
-                if old_file and old_file != filename:
-                    self._unlink_best_effort(FRAMES_DIR / old_file)
-                return filename
-            self._unlink_best_effort(final_path)
-            raise
+                if current is not None and current["frames_file"] == filename:
+                    if old_file and old_file != filename:
+                        self._unlink_best_effort(FRAMES_DIR / old_file)
+                    return filename
+                self._unlink_best_effort(final_path)
+                raise
+            finally:
+                if read_conn is not conn:
+                    read_conn.close()
         if old_file and old_file != filename:
             self._unlink_best_effort(FRAMES_DIR / old_file)
         return filename
@@ -488,7 +539,7 @@ class Store:
                 "SELECT frames_file, version FROM messages WHERE id = ?", (message_id,)
             ).fetchone()
             if row is None or row["frames_file"] is None:
-                raise ValueError(f"no frames for message {message_id}")
+                raise FramesNotAttached(f"no frames for message {message_id}")
             frame_file, version = row["frames_file"], row["version"]
             try:
                 data = msgpack.unpackb((FRAMES_DIR / frame_file).read_bytes(), strict_map_key=False)
@@ -502,11 +553,11 @@ class Store:
                 ):
                     last_missing = exc
                     continue
-                raise ValueError(f"frame archive missing for message {message_id}") from exc
+                raise FrameFileMissing(f"frame archive missing for message {message_id}") from exc
             except Exception as exc:
                 raise FrameStorageError(f"could not read frame archive for message {message_id}: {exc}") from exc
         else:
-            raise ValueError(f"frame archive changed while reading message {message_id}") from last_missing
+            raise FramePointerTurnover(f"frame archive changed while reading message {message_id}") from last_missing
         try:
             if not isinstance(data, dict) or data.get("version") != 1:
                 raise ValueError("unsupported frame archive version")
@@ -559,7 +610,7 @@ class Store:
                 if message["has_frames"]:
                     try:
                         message["frames"] = self.load_frames(message["id"])
-                    except ValueError:
+                    except FramesNotAttached:
                         pass
         if fmt == "json":
             return json.dumps(conv, ensure_ascii=False, indent=1), "application/json"

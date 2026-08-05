@@ -35,7 +35,7 @@ from core.model_manager import (
     resolve_local_dir,
     resolve_source,
 )
-from core.store import Store, FrameStorageError, StaleMessageUpdate
+from core.store import Store, FrameStorageError, StaleMessageUpdate, FramesNotAttached, FramePointerTurnover, FrameFileMissing
 
 manager = ModelManager()
 lens_manager = LensManager()
@@ -191,9 +191,8 @@ async def _retain_worker_task_or_cancel(task, dispatch):
         dispatch.cancel_from_awaiter()
         original = exc
         try:
-            await asyncio.gather(asyncio.shield(task), return_exceptions=True)
+            await _drain_worker_uninterruptibly(task)
         except asyncio.CancelledError:
-            await asyncio.gather(asyncio.shield(task), return_exceptions=True)
             raise original from None
         raise original from None
     return task
@@ -217,6 +216,28 @@ def _retain_worker_task(task):
         _deferred_worker_tasks.discard(task)
         raise
 
+
+
+
+async def _drain_worker_uninterruptibly(task):
+    async def _drain():
+        return await asyncio.gather(asyncio.shield(task), return_exceptions=True)
+    drain = asyncio.create_task(_drain())
+    cancelled = False
+    try:
+        while not drain.done():
+            try:
+                await asyncio.shield(drain)
+            except asyncio.CancelledError:
+                cancelled = True
+        result = drain.result()
+    finally:
+        if not drain.done():
+            drain.cancel()
+            await asyncio.gather(drain, return_exceptions=True)
+    if cancelled:
+        raise asyncio.CancelledError()
+    return result
 
 def _valid_devices():
     """Accepted devices = "auto" + one cuda:N per GPU actually present.
@@ -2304,6 +2325,8 @@ def _persisted_generate(req, stop_event, emit, gen_context):
         insert_meta = dict(meta)
         if frames_acc:
             insert_meta.update(publication_state="frames_pending", frames_expected=True)
+        else:
+            insert_meta.update(publication_state="complete", frames_expected=False)
         message_id, inserted_version = store.add_message(
             conversation_id, parent_id, "assistant", done_holder.get("text", ""), meta=insert_meta,
             return_version=True,
@@ -2318,13 +2341,22 @@ def _persisted_generate(req, stop_event, emit, gen_context):
             except StaleMessageUpdate:
                 emit({"type": "error", "message": "message changed before frames were attached; retry"})
                 return
-            except FrameStorageError as exc:
-                store.update_message(
-                    message_id, done_holder.get("text", ""),
-                    meta=dict(meta, publication_state="frames_publication_failed", frames_expected=True, error=str(exc)),
-                    clear_frames=True,
+            except Exception as exc:
+                failure_meta = dict(
+                    meta, publication_state="frames_publication_failed", frames_expected=True,
+                    frames_error_kind=exc.__class__.__name__, frames_error=str(exc),
                 )
-                emit({"type": "error", "message": "frames could not be published; retry"})
+                try:
+                    marked = store.mark_frame_publication_failed(
+                        message_id, expected_version=inserted_version, failure_meta=failure_meta
+                    )
+                except Exception as mark_exc:
+                    emit({"type": "error", "message": f"frames could not be published; terminalization failed: {mark_exc}"})
+                    return
+                if not marked:
+                    emit({"type": "error", "message": "message changed before frame failure could be recorded; retry"})
+                    return
+                emit({"type": "error", "message": "frames could not be published; retry", "message_id": message_id})
                 return
         emit(dict(done_holder, conversation_id=conversation_id, message_id=message_id))
     except Exception as exc:
@@ -2520,6 +2552,7 @@ async def _run_chat(ws, req):
                 get_task = asyncio.create_task(queue.get())
             except Exception as exc:
                 stop_event.set()
+                receiver.cancel()
                 dispatch.cancel_from_awaiter()
                 await asyncio.gather(asyncio.shield(worker), receiver, return_exceptions=True)
                 await _ws_send(ws, json.dumps({"type": "error", "message": str(exc)}))

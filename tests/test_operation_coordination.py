@@ -889,3 +889,74 @@ def test_store_load_frames_corrupt_schema_maps_to_frame_storage_error(tmp_path, 
     conn.commit()
     with pytest.raises(store_mod.FrameStorageError):
         s.load_frames(mid)
+
+
+def test_mark_frame_publication_failed_uses_exact_version_and_preserves_patch(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c")
+    mid, version = s.add_message(
+        cid, None, "assistant", "T",
+        meta={"publication_state": "frames_pending", "frames_expected": True},
+        return_version=True,
+    )
+    s.update_message(mid, "E", meta={"edited": True}, clear_frames=True)
+    ok = s.mark_frame_publication_failed(
+        mid,
+        expected_version=version,
+        failure_meta={"publication_state": "frames_publication_failed", "frames_expected": True},
+    )
+    assert ok is False
+    current = s.get_message(mid)
+    assert current["content"] == "E"
+    assert current["meta"] == {"edited": True}
+
+
+def test_mark_frame_publication_failed_marks_pending_without_rewriting_content(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c")
+    mid, version = s.add_message(
+        cid, None, "assistant", "T",
+        meta={"publication_state": "frames_pending", "frames_expected": True},
+        return_version=True,
+    )
+    ok = s.mark_frame_publication_failed(
+        mid,
+        expected_version=version,
+        failure_meta={
+            "publication_state": "frames_publication_failed",
+            "frames_expected": True,
+            "frames_error_kind": "FrameStorageError",
+            "frames_error": "full",
+        },
+    )
+    assert ok is True
+    current = s.get_message(mid)
+    assert current["content"] == "T"
+    assert current["frames_file"] is None
+    assert current["version"] == version + 1
+    assert current["meta"]["publication_state"] == "frames_publication_failed"
+
+
+def test_load_frames_state_taxonomy(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c")
+    mid = s.add_message(cid, None, "assistant", "T")
+    with pytest.raises(store_mod.FramesNotAttached):
+        s.load_frames(mid)
+    conn = s._conn()
+    conn.execute("UPDATE messages SET frames_file = ?, version = version + 1 WHERE id = ?", ("missing.msgpack", mid))
+    conn.commit()
+    with pytest.raises(store_mod.FrameFileMissing):
+        s.load_frames(mid)
