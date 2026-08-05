@@ -656,7 +656,9 @@ def api_lens_layers(req: LensLayersRequest):
 
 @app.get("/api/interventions")
 def api_interventions():
-    return {"rules": interventions.summary()}
+    snap = manager.coordinator.status_snapshot()
+    iv = snap.interventions or {}
+    return {"rules": list(iv.get("summary") or [])}
 
 
 @app.post("/api/interventions")
@@ -1318,10 +1320,11 @@ async def api_generate_sync(req: GenerateSyncRequest):
                     "prompt": next((m.get("content", "") for m in reversed(payload["messages"]) if m.get("role") == "user"), ""),
                     "text": done.get("text", ""),
                     "stats": done.get("stats"),
+                    "meta": done.get("meta"),
                 }
                 manager.coordinator.publish_last_generation(token, context.model_session_id, last)
                 done["last_generation"] = last
-                return _worker_success({"text": done.get("text", ""), "stats": done.get("stats"), "last_generation": last})
+                return _worker_success({"text": done.get("text", ""), "stats": done.get("stats"), "meta": done.get("meta"), "last_generation": last})
             except Exception as exc:
                 return _worker_failure(exc)
         finally:
@@ -1455,12 +1458,13 @@ def api_fit(req: FitRequest):
         manager.coordinator.release(token)
         raise HTTPException(422, f"invalid device(s): {', '.join(bad)}")
     source = resolve_source(req.model_id)
+    transferred = False
 
     def release_fit():
         manager.coordinator.release(token)
 
     try:
-        return fit_manager.start(
+        result = fit_manager.start(
             model_id=req.model_id,
             source=source,
             model_revision=_resolve_revision(source),
@@ -1476,11 +1480,15 @@ def api_fit(req: FitRequest):
             continue_from=req.continue_from,
             reservation_release=release_fit,
         )
+        transferred = True
+        return result
     except ValueError as exc:
-        manager.coordinator.release(token)
+        if not transferred:
+            manager.coordinator.release(token)
         raise HTTPException(409, str(exc))
     except Exception:
-        manager.coordinator.release(token)
+        if not transferred:
+            manager.coordinator.release(token)
         raise
 
 

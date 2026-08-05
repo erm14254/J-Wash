@@ -297,3 +297,89 @@ def test_http_generation_with_coordinated_mappingproxy_intervention(monkeypatch)
     assert captured["snapshot_type"] is MappingProxyType
     assert captured["direction_identity"] is direction
     assert jl.layers[0].handles == []
+
+
+def test_http_generation_metadata_preserves_captured_intervention_provenance(monkeypatch):
+    import asyncio
+    import torch
+    from types import SimpleNamespace
+    from api import app
+    from core.model_session import LoadedModelBundle, ModelSessionCoordinator, OperationType
+
+    class FakeTokenizer:
+        chat_template = ""
+        unk_token_id = -1
+
+        def apply_chat_template(self, *args, **kwargs):
+            return torch.tensor([[1]])
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "ok" if ids else ""
+
+        def encode(self, *args, **kwargs):
+            return [1]
+
+        def convert_tokens_to_ids(self, _token):
+            return -1
+
+    class FakeModel:
+        generation_config = SimpleNamespace(eos_token_id=2)
+
+        def __init__(self):
+            self.config = SimpleNamespace(get_text_config=lambda: SimpleNamespace(num_hidden_layers=1, hidden_size=4))
+            self.emb = SimpleNamespace(weight=torch.zeros(4, 4))
+
+        def get_input_embeddings(self):
+            return self.emb
+
+        def __call__(self, **kwargs):
+            logits = torch.zeros(1, 1, 5)
+            logits[0, 0, 3] = 10
+            return SimpleNamespace(logits=logits, past_key_values=None)
+
+    class Layer:
+        def register_forward_hook(self, hook):
+            return SimpleNamespace(remove=lambda: None)
+
+    class FakeJL:
+        _jwash_declared_quant = None
+        layers = [Layer()]
+
+    coordinator = ModelSessionCoordinator()
+    monkeypatch.setattr(app.manager, "coordinator", coordinator)
+    monkeypatch.setattr(app.lens_manager, "snapshot_for_generation", lambda: None)
+    token, snap = coordinator.acquire(OperationType.LOAD)
+    coordinator.publish_loaded(
+        token,
+        LoadedModelBundle.from_parts(
+            FakeModel(), FakeTokenizer(), FakeJL(), {"model_id": "fake", "chat_template_fallback": False}, {"ok": True}
+        ),
+        expected_unloaded_session=snap.model_session_id,
+    )
+    coordinator.release(token)
+    session_id = coordinator.status_snapshot().model_session_id
+    coordinator.bootstrap_interventions_for_test({
+        "revision": 9,
+        "model_session_id": session_id,
+        "lens_binding_id": 3,
+        "scale": 2.0,
+        "mode": "readthrough",
+        "rules": [{"id": 1, "token_id": 1, "token": "a", "mode": "scale", "factor": 0.0, "layers": [], "enabled": False}],
+        "active_rules": [],
+        "summary": [{"id": 1, "token_id": 1, "token": "a", "mode": "scale", "factor": 0.0, "layers": [], "enabled": False}],
+        "active_summary": [],
+    })
+
+    result = asyncio.run(app.api_generate_sync(SimpleNamespace(
+        messages=[{"role": "user", "content": "hi"}],
+        sampling={"max_tokens": 1, "temperature": 0, "top_p": 1, "top_k": 0, "seed": -1},
+    )))
+    provenance = result["meta"]["intervention_provenance"]
+    assert provenance["revision"] == 9
+    assert provenance["mode"] == "readthrough"
+    assert provenance["scale"] == 2.0
+    assert provenance["model_session_id"] == session_id
+    assert provenance["lens_binding_id"] == 3
+    assert provenance["summary"][0]["id"] == 1
+    assert provenance["active_summary"] == []
+    assert result["last_generation"]["meta"]["intervention_provenance"] == provenance

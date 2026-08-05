@@ -280,3 +280,88 @@ def test_intervention_publication_failure_preserves_previous_revision():
         c.update_interventions(token, dict(first, revision=2, summary=[BadSummary()]))
     c.release(token)
     assert c.status_snapshot().interventions["revision"] == 1
+
+class WeakDirection:
+    pass
+
+
+def test_status_snapshot_is_tensor_free_for_direction_bearing_interventions():
+    c = ModelSessionCoordinator()
+    token, snap = c.acquire(OperationType.LOAD)
+    b = weak_bundle("status-directions")
+    c.publish_loaded(token, b, expected_unloaded_session=snap.model_session_id)
+    c.release(token)
+
+    direction = WeakDirection()
+    direction_ref = weakref.ref(direction)
+    token, _ = c.acquire(OperationType.INTERVENTION_UPDATE, requires_loaded=True)
+    c.update_interventions(token, {
+        "revision": 5,
+        "model_session_id": c.status_snapshot().model_session_id,
+        "lens_binding_id": 11,
+        "scale": 1.5,
+        "mode": "readthrough",
+        "rules": [{"id": 1, "layers": [0], "enabled": True, "dirs_a": {0: direction}}],
+        "active_rules": [{"id": 1, "layers": [0], "enabled": True, "dirs_a": {0: direction}}],
+        "summary": [{"id": 1, "layers": [0], "enabled": True}],
+        "active_summary": [{"id": 1, "layers": [0], "enabled": True}],
+    })
+    c.release(token)
+    del direction
+
+    entered = threading.Event()
+    unblock = threading.Event()
+    first_call = threading.Event()
+
+    def blocking_hook(value):
+        if first_call.is_set():
+            return
+        # Status outward conversion sees only the light intervention view.
+        assert "dirs_a" not in repr(value.get("interventions"))
+        first_call.set()
+        entered.set()
+        assert unblock.wait(2), "status outward conversion was not unblocked"
+
+    c._copy_hook = blocking_hook
+    errors = []
+
+    def status_worker():
+        try:
+            status = c.status_snapshot()
+            assert "rules" not in status.interventions
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=status_worker)
+    thread.start()
+    assert entered.wait(2), "status conversion did not reach tensor-free hook"
+    c._copy_hook = None
+    unload, _ = c.acquire(OperationType.UNLOAD, include_bundle=False)
+    old, _, changed = c.withdraw_loaded(unload)
+    assert changed
+    del old, b
+    c.release(unload)
+    import gc
+    gc.collect()
+    assert direction_ref() is None
+    unblock.set()
+    thread.join(2)
+    assert not thread.is_alive(), "status tensor-free worker did not finish"
+    assert errors == []
+
+
+def test_publish_loaded_rebound_failure_is_not_partial(monkeypatch):
+    c = ModelSessionCoordinator()
+    token, snap = c.acquire(OperationType.LOAD)
+
+    def fail_empty(*args, **kwargs):
+        raise RuntimeError("rebound failed")
+
+    monkeypatch.setattr(c, "empty_intervention_record", fail_empty)
+    with pytest.raises(RuntimeError, match="rebound failed"):
+        c.publish_loaded(token, bundle("candidate"), expected_unloaded_session=snap.model_session_id)
+    c.release(token)
+    snap = c.status_snapshot()
+    assert snap.model_session_id == 0
+    assert snap.loaded is False
+    assert c.snapshot().bundle is None

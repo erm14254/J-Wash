@@ -22,6 +22,28 @@ SKIP_LOCAL_DIRS = {"vendor", "ui", "data", "hf_cache", "lenses", "core", "api", 
 # look it up on the Hub before any fallback.
 INSTRUCT_SIBLING_SUFFIXES = ("-Instruct", "-instruct", "-it", "-Chat", "-chat")
 
+
+def _intervention_provenance(snapshot):
+    if not isinstance(snapshot, Mapping):
+        return None
+    def clone_summary(items):
+        out = []
+        for item in items or ():
+            cloned = dict(item)
+            if cloned.get("layers") is not None:
+                cloned["layers"] = list(cloned["layers"])
+            out.append(cloned)
+        return out
+    return {
+        "revision": snapshot.get("revision"),
+        "mode": snapshot.get("mode"),
+        "scale": snapshot.get("scale"),
+        "model_session_id": snapshot.get("model_session_id"),
+        "lens_binding_id": snapshot.get("lens_binding_id"),
+        "summary": clone_summary(snapshot.get("summary")),
+        "active_summary": clone_summary(snapshot.get("active_summary")),
+    }
+
 # End-of-turn markers per model family; added to the stop tokens when they appear
 # in the applied template (useful when a base model is given an instruct template:
 # it must stop on <|eot_id|>, <|im_end|>, <end_of_turn>, etc.)
@@ -646,6 +668,7 @@ class ModelManager:
             meta = dict(context.meta)
             lens = context.lens
             ablator_snapshot = context.intervention_snapshot
+            intervention_provenance = _intervention_provenance(ablator_snapshot)
             stop_event = context.stop_event
         else:
             context = None
@@ -653,6 +676,7 @@ class ModelManager:
             jl = self.jl
             meta = self.meta or {}
             ablator_snapshot = None
+            intervention_provenance = None
         reader = None
         attachment = None
         ok = False
@@ -839,8 +863,14 @@ class ModelManager:
                         meta or {},
                         sampling=sampling,
                         lens=dict(lens.meta) if lens is not None and lens.meta else None,
-                        interventions=ablator_snapshot.get("summary") if isinstance(ablator_snapshot, Mapping) else (ablator.summary() if ablator is not None else None),
-                        interventions_scale=ablator_snapshot.get("scale") if isinstance(ablator_snapshot, Mapping) else (ablator.global_scale if ablator is not None else None),
+                        interventions=intervention_provenance["summary"] if intervention_provenance is not None else (ablator.summary() if ablator is not None else None),
+                        interventions_scale=intervention_provenance["scale"] if intervention_provenance is not None else (ablator.global_scale if ablator is not None else None),
+                        interventions_revision=intervention_provenance["revision"] if intervention_provenance is not None else None,
+                        interventions_mode=intervention_provenance["mode"] if intervention_provenance is not None else None,
+                        interventions_model_session_id=intervention_provenance["model_session_id"] if intervention_provenance is not None else None,
+                        interventions_lens_binding_id=intervention_provenance["lens_binding_id"] if intervention_provenance is not None else None,
+                        interventions_active_summary=intervention_provenance["active_summary"] if intervention_provenance is not None else None,
+                        intervention_provenance=intervention_provenance,
                         model_session_id=context.model_session_id if context is not None else None,
                     ),
                 }

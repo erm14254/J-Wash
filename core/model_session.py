@@ -174,6 +174,7 @@ class ModelSessionCoordinator:
         self._op_ids = itertools.count(1)
         self._lens_binding = None
         self._interventions = self.empty_intervention_record(0)
+        self._interventions_status = self._light_interventions(self._interventions)
         self._last_generation = None
         self._lens_binding_id = 0
         self._intervention_revision = 0
@@ -224,6 +225,8 @@ class ModelSessionCoordinator:
     def _freeze_intervention_record(cls, record):
         if record is None:
             return None
+        if isinstance(record, MappingProxyType):
+            record = dict(record)
         if not isinstance(record, dict):
             return record
         frozen = {
@@ -238,6 +241,11 @@ class ModelSessionCoordinator:
             "active_rules": [cls._clone_rule_container(r) for r in record.get("active_rules") or []],
         }
         return MappingProxyType(frozen)
+
+    @classmethod
+    def _prepare_intervention_views(cls, record):
+        full = cls._freeze_intervention_record(record)
+        return full, cls._light_interventions(full)
 
     @staticmethod
     def _copy_intervention_record(record):
@@ -289,16 +297,25 @@ class ModelSessionCoordinator:
             return None
         if isinstance(record, MappingProxyType):
             record = dict(record)
+
+        def light_item(item):
+            if not isinstance(item, dict):
+                return item
+            out = {k: v for k, v in item.items() if k not in {"dirs_a", "dirs_b", "direction", "tensor"}}
+            if out.get("layers") is not None:
+                out["layers"] = tuple(out["layers"])
+            return MappingProxyType(out)
+
         if isinstance(record, dict):
-            return {
+            return MappingProxyType({
                 "revision": record.get("revision"),
                 "model_session_id": record.get("model_session_id"),
                 "lens_binding_id": record.get("lens_binding_id"),
                 "scale": record.get("scale"),
                 "mode": record.get("mode"),
-                "summary": tuple(record.get("summary") or ()),
-                "active_summary": tuple(record.get("active_summary") or ()),
-            }
+                "summary": tuple(light_item(item) for item in (record.get("summary") or ())),
+                "active_summary": tuple(light_item(item) for item in (record.get("active_summary") or ())),
+            })
         return record
 
     def _snapshot_refs_locked(self, *, include_bundle: bool = True):
@@ -341,7 +358,7 @@ class ModelSessionCoordinator:
                 "model_meta": model_meta,
                 "capability_profile": capability_profile,
                 "lens": self._lens_binding,
-                "interventions": self._interventions,
+                "interventions": self._interventions_status,
                 "last_generation": self._last_generation,
                 "operation": self._operation_status_locked(),
             }
@@ -353,7 +370,7 @@ class ModelSessionCoordinator:
             model_meta=raw["model_meta"],
             capability_profile=raw["capability_profile"],
             lens=self._light_lens(raw["lens"]),
-            interventions=self._light_interventions(raw["interventions"]),
+            interventions=raw["interventions"],
             last_generation=raw["last_generation"],
             operation=raw["operation"],
         )
@@ -411,44 +428,64 @@ class ModelSessionCoordinator:
             return True
 
     def publish_loaded(self, token: OperationToken, bundle: LoadedModelBundle, *, expected_unloaded_session: int | None = None) -> int:
+        expected = token.expected_session if expected_unloaded_session is None else expected_unloaded_session
         with self._lock:
             if self._operation != token:
                 raise OperationConflict("stale model operation")
             if self._bundle is not None:
                 raise ModelStateError("model already loaded")
-            expected = token.expected_session if expected_unloaded_session is None else expected_unloaded_session
             if self._model_session_id != expected:
                 raise OperationConflict("stale model session")
-            self._model_session_id += 1
+            current_interventions = self._interventions
+            next_session = self._model_session_id + 1
+        prepared_interventions = current_interventions
+        prepared_status = self._interventions_status
+        if current_interventions is not None and not (current_interventions.get("rules") or ()):
+            prepared_interventions, prepared_status = self._prepare_intervention_views(self.empty_intervention_record(
+                next_session,
+                revision=current_interventions.get("revision") or self._intervention_revision,
+                scale=current_interventions.get("scale", 1.0),
+            ))
+        with self._lock:
+            if self._operation != token:
+                raise OperationConflict("stale model operation")
+            if self._bundle is not None or self._model_session_id != expected:
+                raise OperationConflict("stale model session")
+            self._model_session_id = next_session
             self._bundle = bundle
-            if self._interventions is not None and not (self._interventions.get("rules") or ()):
-                self._interventions = self.empty_intervention_record(
-                    self._model_session_id,
-                    revision=self._interventions.get("revision") or self._intervention_revision,
-                    scale=self._interventions.get("scale", 1.0),
-                )
+            self._interventions = prepared_interventions
+            self._interventions_status = prepared_status
             return self._model_session_id
 
     def withdraw_loaded(self, token: OperationToken | None = None, *, intervention_record: Any = None) -> tuple[LoadedModelBundle | None, int, bool]:
-        prepared_interventions = (
-            self._freeze_intervention_record(intervention_record)
-            if intervention_record is not None
-            else None
-        )
+        with self._lock:
+            if token is not None and self._operation != token:
+                raise OperationConflict("stale model operation")
+            if self._bundle is None:
+                return None, self._model_session_id, False
+            next_session = self._model_session_id + 1
+            revision = self._intervention_revision
+        if intervention_record is not None:
+            prepared_interventions, prepared_status = self._prepare_intervention_views(intervention_record)
+        else:
+            prepared_interventions, prepared_status = self._prepare_intervention_views(self.empty_intervention_record(
+                next_session,
+                revision=revision,
+            ))
         with self._lock:
             if token is not None and self._operation != token:
                 raise OperationConflict("stale model operation")
             old = self._bundle
             if old is None:
                 return None, self._model_session_id, False
-            self._model_session_id += 1
+            if self._model_session_id + 1 != next_session:
+                raise OperationConflict("stale model session")
+            self._model_session_id = next_session
             self._bundle = None
             self._lens_binding = None
             self._last_generation = None
-            self._interventions = prepared_interventions or self.empty_intervention_record(
-                self._model_session_id,
-                revision=self._intervention_revision,
-            )
+            self._interventions = prepared_interventions
+            self._interventions_status = prepared_status
             return old, self._model_session_id, True
 
     def update_lens_binding(self, token: OperationToken, binding: Any) -> int:
@@ -467,12 +504,13 @@ class ModelSessionCoordinator:
             self._lens_binding = None
 
     def update_interventions(self, token: OperationToken, snapshot: Any) -> int:
-        prepared = self._freeze_intervention_record(snapshot)
+        prepared, prepared_status = self._prepare_intervention_views(snapshot)
         with self._lock:
             if self._operation != token:
                 raise OperationConflict("stale intervention operation")
             self._intervention_revision += 1
             self._interventions = prepared
+            self._interventions_status = prepared_status
             return self._intervention_revision
 
     def bootstrap_interventions_for_test(self, snapshot: Any) -> int:
@@ -481,10 +519,11 @@ class ModelSessionCoordinator:
         This is intentionally reserved for tests/bootstrap data where no
         production request is mutating live model-bound state.
         """
-        prepared = self._freeze_intervention_record(snapshot)
+        prepared, prepared_status = self._prepare_intervention_views(snapshot)
         with self._lock:
             self._intervention_revision += 1
             self._interventions = prepared
+            self._interventions_status = prepared_status
             return self._intervention_revision
 
     def publish_last_generation(self, token: OperationToken, session_id: int, data: Any) -> bool:
