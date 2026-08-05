@@ -1349,7 +1349,12 @@ async def api_generate_sync(req: GenerateSyncRequest):
             await _ws_send(ws, json.dumps({"type": "api_generation"}))
         except Exception:
             pass
-    return {"text": (outcome_value or {}).get("text", ""), "stats": (outcome_value or {}).get("stats")}
+    return {
+        "text": (outcome_value or {}).get("text", ""),
+        "stats": (outcome_value or {}).get("stats"),
+        "meta": (outcome_value or {}).get("meta"),
+        "last_generation": (outcome_value or {}).get("last_generation"),
+    }
 
 
 class NeighborsRequest(BaseModel):
