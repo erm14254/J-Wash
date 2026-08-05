@@ -182,6 +182,47 @@ def test_snapshot_copy_hook_runs_after_lock_release_and_does_not_block_release()
     assert errors == []
 
 
+def test_status_snapshot_does_not_retain_bundle_during_outward_construction():
+    c = ModelSessionCoordinator()
+    token, snap = c.acquire(OperationType.LOAD)
+    b = weak_bundle("status")
+    model_ref = weakref.ref(b.hf_model)
+    c.publish_loaded(token, b, expected_unloaded_session=snap.model_session_id)
+    c.release(token)
+    entered = threading.Event()
+    unblock = threading.Event()
+
+    def blocking_hook(_value):
+        entered.set()
+        assert unblock.wait(2), "status outward construction was not unblocked"
+
+    c._copy_hook = blocking_hook
+    errors = []
+
+    def status_worker():
+        try:
+            c.status_snapshot()
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=status_worker)
+    thread.start()
+    assert entered.wait(2), "status outward construction did not reach hook"
+    unload, _ = c.acquire(OperationType.UNLOAD, include_bundle=False)
+    old, _, changed = c.withdraw_loaded(unload)
+    assert changed
+    del b, old
+    c.release(unload)
+    import gc
+    gc.collect()
+    assert model_ref() is None
+    unblock.set()
+    thread.join(2)
+    c._copy_hook = None
+    assert not thread.is_alive(), "status outward construction did not finish"
+    assert errors == []
+
+
 class NoDeepcopyTensor:
     def __deepcopy__(self, memo):
         raise AssertionError("direction tensor was deep-copied")

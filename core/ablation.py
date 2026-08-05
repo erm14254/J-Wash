@@ -1,6 +1,7 @@
 import copy
 import itertools
 import threading
+from collections.abc import Mapping
 
 import torch
 
@@ -56,6 +57,46 @@ def abliteration_direction(weight_u, rule):
         v_b = weight_u[rule["replacement_id"]].detach().float().cpu()
         v_b = v_b / v_b.norm().clamp_min(1e-8)
     return v_a, v_b
+
+
+def clone_intervention_snapshot(snapshot):
+    """Clone a coordinated intervention record for one operation.
+
+    This intentionally avoids generic deepcopy of MappingProxyType records and
+    preserves tensor identities in direction maps.
+    """
+    if snapshot is None:
+        return None
+    if not isinstance(snapshot, Mapping):
+        snapshot = dict(snapshot)
+
+    def clone_rule(rule):
+        cloned = dict(rule)
+        if cloned.get("layers") is not None:
+            cloned["layers"] = list(cloned["layers"])
+        if cloned.get("dirs_a") is not None:
+            cloned["dirs_a"] = dict(cloned["dirs_a"])
+        if cloned.get("dirs_b") is not None:
+            cloned["dirs_b"] = dict(cloned["dirs_b"])
+        return cloned
+
+    def clone_summary_item(item):
+        cloned = dict(item)
+        if cloned.get("layers") is not None:
+            cloned["layers"] = list(cloned["layers"])
+        return cloned
+
+    return {
+        "revision": snapshot.get("revision"),
+        "model_session_id": snapshot.get("model_session_id"),
+        "lens_binding_id": snapshot.get("lens_binding_id"),
+        "scale": snapshot.get("scale", 1.0),
+        "mode": snapshot.get("mode", "standard"),
+        "rules": [clone_rule(rule) for rule in snapshot.get("rules") or ()],
+        "active_rules": [clone_rule(rule) for rule in snapshot.get("active_rules") or ()],
+        "summary": [clone_summary_item(item) for item in snapshot.get("summary") or ()],
+        "active_summary": [clone_summary_item(item) for item in snapshot.get("active_summary") or ()],
+    }
 
 
 # Rule application modes:
@@ -381,7 +422,7 @@ class Interventions:
     def attach(self, jl, *, snapshot=None):
         from core.capabilities import ensure_unquantized, PUBLIC_REASONS
         ensure_unquantized(jl)
-        snap = copy.deepcopy(snapshot) if snapshot is not None else self.snapshot()
+        snap = clone_intervention_snapshot(snapshot) if snapshot is not None else self.snapshot()
         mode = snap["mode"]
         if mode == "abliteration":
             raise ValueError(PUBLIC_REASONS["global_projection_unvalidated"])

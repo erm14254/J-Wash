@@ -42,9 +42,34 @@ store = Store()
 fit_manager = FitManager()
 interventions = Interventions()
 neighbors = TokenNeighbors()
+_transition_intervention_rollback = None
+
+
+def _prepare_model_transition_interventions(target_session_id):
+    global _transition_intervention_rollback
+    previous = interventions.state_record()
+    try:
+        interventions.clear_for_model_transition()
+        snapshot = interventions.snapshot()
+        snapshot["model_session_id"] = target_session_id
+        snapshot["lens_binding_id"] = None
+        _transition_intervention_rollback = previous
+        return snapshot
+    except Exception:
+        interventions.restore_state_record(previous)
+        raise
+
+
+def _rollback_model_transition_interventions():
+    global _transition_intervention_rollback
+    previous, _transition_intervention_rollback = _transition_intervention_rollback, None
+    if previous is not None:
+        interventions.restore_state_record(previous)
 
 
 def _cleanup_model_bound_state(_session_id=None, token=None):
+    global _transition_intervention_rollback
+    _transition_intervention_rollback = None
     errors = []
     old_lens = None
     try:
@@ -56,15 +81,9 @@ def _cleanup_model_bound_state(_session_id=None, token=None):
         neighbors.reset()
     except Exception as exc:
         errors.append(exc)
-    try:
-        interventions.clear_for_model_transition()
-        snapshot = interventions.snapshot()
-        snapshot["model_session_id"] = _session_id
-        snapshot["lens_binding_id"] = None
-        if token is not None:
-            manager.coordinator.update_interventions(token, snapshot)
-    except Exception as exc:
-        errors.append(exc)
+    # Intervention clearing is prepared and installed atomically with the
+    # authoritative coordinator withdrawal.  This cleanup callback only owns
+    # resource/cache cleanup after that transition has linearized.
     cleanup_error = lens_manager.cleanup_withdrawn(old_lens)
     if cleanup_error is not None:
         errors.append(cleanup_error)
@@ -77,6 +96,8 @@ def _cleanup_model_bound_state(_session_id=None, token=None):
 
 
 manager.on_model_withdraw = _cleanup_model_bound_state
+manager.on_model_transition_prepare = _prepare_model_transition_interventions
+manager.on_model_transition_rollback = _rollback_model_transition_interventions
 
 _ws_locks = {}
 _loop_holder = {}

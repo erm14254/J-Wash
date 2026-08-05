@@ -331,13 +331,15 @@ class ModelSessionCoordinator:
 
     def status_snapshot(self) -> ModelStatusSnapshot:
         with self._lock:
-            bundle = self._bundle
+            loaded = self._bundle is not None
+            model_meta = self._bundle.meta if loaded else None
+            capability_profile = self._bundle.capability_profile if loaded else None
             raw = {
                 "model_session_id": self._model_session_id,
-                "model_state": "loaded" if bundle is not None else "unloaded",
-                "loaded": bundle is not None,
-                "model_meta": bundle.meta if bundle is not None else None,
-                "capability_profile": bundle.capability_profile if bundle is not None else None,
+                "model_state": "loaded" if loaded else "unloaded",
+                "loaded": loaded,
+                "model_meta": model_meta,
+                "capability_profile": capability_profile,
                 "lens": self._lens_binding,
                 "interventions": self._interventions,
                 "last_generation": self._last_generation,
@@ -419,6 +421,12 @@ class ModelSessionCoordinator:
                 raise OperationConflict("stale model session")
             self._model_session_id += 1
             self._bundle = bundle
+            if self._interventions is not None and not (self._interventions.get("rules") or ()):
+                self._interventions = self.empty_intervention_record(
+                    self._model_session_id,
+                    revision=self._interventions.get("revision") or self._intervention_revision,
+                    scale=self._interventions.get("scale", 1.0),
+                )
             return self._model_session_id
 
     def withdraw_loaded(self, token: OperationToken | None = None, *, intervention_record: Any = None) -> tuple[LoadedModelBundle | None, int, bool]:

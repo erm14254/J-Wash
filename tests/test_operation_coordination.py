@@ -234,3 +234,68 @@ def test_model_transition_cleanup_does_not_restore_rules_after_publication_failu
         assert snap["mode"] == "standard"
     finally:
         app.interventions.restore_state_record(previous)
+
+
+def test_http_generation_with_coordinated_mappingproxy_intervention(monkeypatch):
+    import asyncio
+    from types import MappingProxyType, SimpleNamespace
+    from api import app
+    from core.model_session import LoadedModelBundle, ModelSessionCoordinator, OperationType
+
+    class Layer:
+        def __init__(self):
+            self.handles = []
+
+        def register_forward_hook(self, hook):
+            handle = SimpleNamespace(remove=lambda: self.handles.remove(handle))
+            self.handles.append(handle)
+            return handle
+
+    class FakeJL:
+        def __init__(self):
+            self.layers = [Layer()]
+            self._jwash_declared_quant = None
+
+    coordinator = ModelSessionCoordinator()
+    monkeypatch.setattr(app.manager, "coordinator", coordinator)
+    jl = FakeJL()
+    token, snap = coordinator.acquire(OperationType.LOAD)
+    coordinator.publish_loaded(
+        token,
+        LoadedModelBundle.from_parts(object(), object(), jl, {"model_id": "m", "quant": None}, {"ok": True}),
+        expected_unloaded_session=snap.model_session_id,
+    )
+    coordinator.release(token)
+    direction = object()
+    rule = {
+        "id": 1, "token_id": 1, "token": "a", "mode": "scale", "factor": 0.0,
+        "replacement_id": None, "replacement": None, "layers": [0], "enabled": True,
+        "dirs_a": {0: direction}, "dirs_b": None,
+    }
+    coordinator.bootstrap_interventions_for_test({
+        "revision": 7,
+        "model_session_id": coordinator.status_snapshot().model_session_id,
+        "lens_binding_id": None,
+        "scale": 1.0,
+        "mode": "standard",
+        "rules": [rule],
+        "active_rules": [rule],
+        "summary": [rule],
+        "active_summary": [rule],
+    })
+
+    captured = {}
+
+    def fake_generate(_messages, _sampling, _stop_event, emit, lens=None, ablator=None):
+        attachment = ablator.attach(lens.jl, snapshot=lens.intervention_snapshot)
+        captured["snapshot_type"] = type(lens.intervention_snapshot)
+        captured["direction_identity"] = lens.intervention_snapshot["rules"][0]["dirs_a"][0]
+        attachment.close()
+        emit({"type": "done", "text": "ok", "stats": {"tokens": 0}})
+
+    monkeypatch.setattr(app.manager, "generate", fake_generate)
+    result = asyncio.run(app.api_generate_sync(SimpleNamespace(messages=[{"role": "user", "content": "hi"}], sampling={})))
+    assert result["text"] == "ok"
+    assert captured["snapshot_type"] is MappingProxyType
+    assert captured["direction_identity"] is direction
+    assert jl.layers[0].handles == []

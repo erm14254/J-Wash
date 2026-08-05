@@ -3,6 +3,7 @@ import json
 import os
 import threading
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 import torch
@@ -456,6 +457,8 @@ class ModelManager:
         self.capability_profile = None
         self.coordinator = ModelSessionCoordinator()
         self.on_model_withdraw = None
+        self.on_model_transition_prepare = None
+        self.on_model_transition_rollback = None
 
     @property
     def busy(self):
@@ -487,7 +490,17 @@ class ModelManager:
             token, snap = self.coordinator.acquire(OperationType.LOAD, include_bundle=False)
             expected_session = snap.model_session_id
             if snap.loaded:
-                old_bundle, expected_session, _ = self.coordinator.withdraw_loaded(token)
+                intervention_record = None
+                if self.on_model_transition_prepare is not None:
+                    intervention_record = self.on_model_transition_prepare(expected_session + 1)
+                try:
+                    old_bundle, expected_session, _ = self.coordinator.withdraw_loaded(
+                        token, intervention_record=intervention_record
+                    )
+                except Exception:
+                    if self.on_model_transition_rollback is not None:
+                        self.on_model_transition_rollback()
+                    raise
                 with self._lock:
                     self._sync_from_bundle(None)
                 del old_bundle
@@ -578,23 +591,46 @@ class ModelManager:
                 self.coordinator.release(token)
 
     def _unload_locked(self, token=None):
-        old, session_id, changed = self.coordinator.withdraw_loaded(token)
+        try:
+            before = _torch_allocated()
+        except Exception:
+            before = None
+        intervention_record = None
+        if self.coordinator.snapshot(include_bundle=False).loaded and self.on_model_transition_prepare is not None:
+            intervention_record = self.on_model_transition_prepare(self.coordinator.snapshot(include_bundle=False).model_session_id + 1)
+        try:
+            old, session_id, changed = self.coordinator.withdraw_loaded(token, intervention_record=intervention_record)
+        except Exception:
+            if self.on_model_transition_rollback is not None:
+                self.on_model_transition_rollback()
+            raise
         if not changed:
             with self._lock:
                 self._sync_from_bundle(None)
-            return {"unloaded": False, "vram_allocated": _torch_allocated()}
-        before = _torch_allocated()
+            try:
+                allocated = _torch_allocated()
+            except Exception:
+                allocated = None
+            return {"unloaded": False, "vram_allocated": allocated}
         with self._lock:
             self._sync_from_bundle(None)
-        del old
+        old = None
         if self.on_model_withdraw is not None:
             self.on_model_withdraw(session_id, token)
         _free_cuda()
+        try:
+            allocated_after = _torch_allocated()
+        except Exception:
+            allocated_after = None
+        try:
+            reserved_after = _torch_reserved()
+        except Exception:
+            reserved_after = None
         return {
             "unloaded": True,
             "vram_allocated_before": before,
-            "vram_allocated_after": _torch_allocated(),
-            "vram_reserved_after": _torch_reserved(),
+            "vram_allocated_after": allocated_after,
+            "vram_reserved_after": reserved_after,
         }
 
     @torch.no_grad()
@@ -803,8 +839,8 @@ class ModelManager:
                         meta or {},
                         sampling=sampling,
                         lens=dict(lens.meta) if lens is not None and lens.meta else None,
-                        interventions=ablator_snapshot.get("summary") if isinstance(ablator_snapshot, dict) else (ablator.summary() if ablator is not None else None),
-                        interventions_scale=ablator_snapshot.get("scale") if isinstance(ablator_snapshot, dict) else (ablator.global_scale if ablator is not None else None),
+                        interventions=ablator_snapshot.get("summary") if isinstance(ablator_snapshot, Mapping) else (ablator.summary() if ablator is not None else None),
+                        interventions_scale=ablator_snapshot.get("scale") if isinstance(ablator_snapshot, Mapping) else (ablator.global_scale if ablator is not None else None),
                         model_session_id=context.model_session_id if context is not None else None,
                     ),
                 }
