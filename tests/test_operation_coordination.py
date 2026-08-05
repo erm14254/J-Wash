@@ -913,7 +913,10 @@ def test_mark_frame_publication_failed_uses_exact_version_and_preserves_patch(tm
     assert ok is False
     current = s.get_message(mid)
     assert current["content"] == "E"
-    assert current["meta"] == {"edited": True}
+    meta = current["meta"]
+    if isinstance(meta, str):
+        meta = json.loads(meta)
+    assert meta == {"edited": True}
 
 
 def test_mark_frame_publication_failed_marks_pending_without_rewriting_content(tmp_path, monkeypatch):
