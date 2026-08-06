@@ -269,11 +269,18 @@ class OperationHandoff:
                         cancelled = True
             except BaseException:
                 logging.getLogger(__name__).exception("operation handoff cleanup failed")
+                if not self.closed and not self.transferred:
+                    try:
+                        await self.close()
+                    except asyncio.CancelledError:
+                        cancelled = True
+                    except BaseException:
+                        logging.getLogger(__name__).exception("operation handoff inline cleanup retry failed")
                 if not self.closed and not self.transferred and self.dispatch is None and self.token is not None:
-                    self.coordinator.release(self.token)
-                    self.token = None
-                    self.closed = True
-                    self.state = HandoffState.CLOSED
+                    if self.coordinator.release(self.token) or not self.coordinator.is_current(self.token):
+                        self.token = None
+                        self.closed = True
+                        self.state = HandoffState.CLOSED
         finally:
             close_coro = close_task = None
             if cancelled:
