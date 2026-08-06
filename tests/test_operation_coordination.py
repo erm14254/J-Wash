@@ -1333,16 +1333,15 @@ def test_operation_handoff_acquire_rolls_back_snapshot_registration_failure(monk
     assert handoff.state is app.HandoffState.CLOSED
 
 
-@pytest.mark.asyncio
-async def test_operation_handoff_close_before_dispatch_is_idempotent():
+def test_operation_handoff_close_before_dispatch_is_idempotent():
     from api import app
     from core.model_session import ModelSessionCoordinator, OperationType
 
     coordinator = ModelSessionCoordinator()
     handoff = app.OperationHandoff(coordinator, stop_event=threading.Event())
     handoff.acquire(OperationType.GENERATE)
-    await handoff.close()
-    await handoff.close()
+    asyncio.run(handoff.close())
+    asyncio.run(handoff.close())
     assert coordinator.status_snapshot().operation is None
     assert handoff.state is app.HandoffState.CLOSED
     handoff.clear_heavy()
