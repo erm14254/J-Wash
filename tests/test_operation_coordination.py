@@ -1,6 +1,7 @@
 import json
 import asyncio
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -474,7 +475,7 @@ def test_persisted_continue_records_segment_provenance(monkeypatch):
             assert expected_version == 0
             assert kwargs.get("frames") is None
             self.updated = (message_id, content, meta)
-            return True
+            return SimpleNamespace(state="committed", entity_id=str(message_id))
 
         def save_frames(self, *args, **kwargs):
             raise AssertionError("no lens frames expected")
@@ -536,7 +537,7 @@ def test_zero_length_continuation_does_not_reattribute_existing_text(monkeypatch
         def update_message_and_frames_if_unchanged(self, message_id, expected_version, content, meta=None, **kwargs):
             assert expected_version == 0
             self.updated = (content, meta)
-            return True
+            return SimpleNamespace(state="committed", entity_id=str(message_id))
 
     def fake_generate(**kwargs):
         kwargs["emit"]({"type": "done", "text": "", "stats": {"tokens": 0}, "stopped": True, "meta": {"intervention_provenance": {"revision": 2}}})
@@ -616,8 +617,8 @@ def test_store_round_trips_production_frame_phases(tmp_path, monkeypatch):
     monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
     monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
     s = store_mod.Store()
-    cid = s.create_conversation("c")
-    mid = s.add_message(cid, None, "assistant", "T", meta={"publication_state": "complete"})
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "T", meta={"publication_state": "complete"}).value[0]
     s.save_frames(mid, [_frame(0, "reading", "0"), _frame(1, "thinking", "0")], [0], 1)
     loaded = s.load_frames(mid)
     assert [frame["phase"] for frame in loaded["frames"]] == ["reading", "thinking"]
@@ -635,8 +636,8 @@ def test_store_accepts_legacy_frame_phases(tmp_path, monkeypatch):
     monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
     monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
     s = store_mod.Store()
-    cid = s.create_conversation("c")
-    mid = s.add_message(cid, None, "assistant", "T")
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "T").value[0]
     s.save_frames(mid, [_frame(0, "prompt"), _frame(1, "gen")], [0], 1)
     loaded = s.load_frames(mid)
     assert [frame["phase"] for frame in loaded["frames"]] == ["prompt", "gen"]
@@ -648,8 +649,8 @@ def test_store_accepts_multiple_production_string_layer_keys(tmp_path, monkeypat
     monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
     monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
     s = store_mod.Store()
-    cid = s.create_conversation("c")
-    mid = s.add_message(cid, None, "assistant", "T")
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "T").value[0]
     frame = _frame(0, "reading", "0")
     frame["layers"]["12"] = dict(frame["layers"]["0"])
     s.save_frames(mid, [frame], [0, 12], 1)
@@ -664,11 +665,13 @@ def test_update_message_identical_stale_writer_does_not_reconcile_as_committed(t
     monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
     monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
     s = store_mod.Store()
-    cid = s.create_conversation("c")
-    mid, version = s.add_message(cid, None, "assistant", "old", return_version=True)
+    cid = s.create_conversation("c").value
+    inserted = s.add_message(cid, None, "assistant", "old", return_version=True).value
+    mid, version = inserted
     s.update_message(mid, "same", meta={"edited": True}, clear_frames=True, expected_version=version)
-    with pytest.raises(store_mod.StaleMessageUpdate):
-        s.update_message(mid, "same", meta={"edited": True}, clear_frames=True, expected_version=version)
+    stale = s.update_message(mid, "same", meta={"edited": True}, clear_frames=True, expected_version=version)
+    assert stale.state == "stale"
+    assert stale.observed_version == version + 1
 
 
 def test_persisted_continue_merges_existing_production_phase_archive(tmp_path, monkeypatch):
@@ -679,8 +682,8 @@ def test_persisted_continue_merges_existing_production_phase_archive(tmp_path, m
     monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
     s = store_mod.Store()
     monkeypatch.setattr(app, "store", s)
-    cid = s.create_conversation("c")
-    mid = s.add_message(cid, None, "assistant", "T", meta={"publication_state": "complete"})
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "T", meta={"publication_state": "complete"}).value[0]
     lens_meta = {"path": "/lens", "model_id": "m", "model_revision": "r", "fitted_layers_all": [0], "tapped_layers": [0], "k": 1}
     lens = type("Lens", (), {"layers": [0], "k": 1, "meta": lens_meta})()
     descriptor = app._frame_descriptor(lens, [0], 1)
@@ -707,9 +710,9 @@ def test_store_versioned_cas_rejects_stale_continuation_after_patch(tmp_path, mo
     monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
     monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
     s = store_mod.Store()
-    cid = s.create_conversation("c")
-    mid = s.add_message(cid, None, "assistant", "old", meta={"intervention_provenance": {"revision": 1}})
-    old_frame = s.save_frames(mid, [_frame(0)], [0], 1)
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "old", meta={"intervention_provenance": {"revision": 1}}).value[0]
+    old_frame = s.save_frames(mid, [_frame(0)], [0], 1).value
     captured = s.get_message(mid)
     assert captured["version"] == 1
     assert (store_mod.FRAMES_DIR / old_frame).exists()
@@ -726,7 +729,7 @@ def test_store_versioned_cas_rejects_stale_continuation_after_patch(tmp_path, mo
         layers=[0],
         k=1,
     )
-    assert ok is False
+    assert ok.state in {"stale", "superseded"}
     current = s.get_message(mid)
     assert current["content"] == "edited"
     assert current["frames_file"] is None
@@ -740,9 +743,9 @@ def test_store_versioned_frames_commit_uses_unique_file_and_cleans_old_after_com
     monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
     monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
     s = store_mod.Store()
-    cid = s.create_conversation("c")
-    mid = s.add_message(cid, None, "assistant", "old", meta={"m": 1})
-    old_frame = s.save_frames(mid, [_frame(0)], [0], 1)
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "old", meta={"m": 1}).value[0]
+    old_frame = s.save_frames(mid, [_frame(0)], [0], 1).value
     captured = s.get_message(mid)
     assert old_frame.startswith(f"{mid}-v1-")
 
@@ -755,7 +758,7 @@ def test_store_versioned_frames_commit_uses_unique_file_and_cleans_old_after_com
         layers=[0],
         k=1,
     )
-    assert ok is True
+    assert ok.state == "committed"
     updated = s.get_message(mid)
     assert updated["version"] == captured["version"] + 1
     assert updated["frames_file"] != old_frame
@@ -837,9 +840,9 @@ def test_store_load_frames_retries_when_old_pointer_is_retired(tmp_path, monkeyp
     monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
     monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
     s = store_mod.Store()
-    cid = s.create_conversation("c")
-    mid = s.add_message(cid, None, "assistant", "old", meta={"m": 1})
-    old_frame = s.save_frames(mid, [_frame(0)], [0], 1)
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "old", meta={"m": 1}).value[0]
+    old_frame = s.save_frames(mid, [_frame(0)], [0], 1).value
     captured = s.get_message(mid)
     original_read_bytes = Path.read_bytes
     retired = {"done": False}
@@ -850,7 +853,7 @@ def test_store_load_frames_retries_when_old_pointer_is_retired(tmp_path, monkeyp
             assert s.update_message_and_frames_if_unchanged(
                 mid, captured["version"], "old new", {"m": 2},
                 frames=[_frame(0), _frame(1)], layers=[0], k=1,
-            )
+            ).state == "committed"
             raise FileNotFoundError(path)
         return original_read_bytes(path)
 
@@ -866,8 +869,8 @@ def test_store_save_frames_detects_stale_initial_attachment(tmp_path, monkeypatc
     monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
     monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
     s = store_mod.Store()
-    cid = s.create_conversation("c")
-    mid = s.add_message(cid, None, "assistant", "old", meta={"m": 1})
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "old", meta={"m": 1}).value[0]
     original = s._write_unique_frame_candidate
 
     def racing_candidate(message_id, expected_version, blob):
@@ -875,8 +878,8 @@ def test_store_save_frames_detects_stale_initial_attachment(tmp_path, monkeypatc
         return original(message_id, expected_version, blob)
 
     monkeypatch.setattr(s, "_write_unique_frame_candidate", racing_candidate)
-    with pytest.raises(store_mod.StaleMessageUpdate):
-        s.save_frames(mid, [_frame(0)], [0], 1)
+    outcome = s.save_frames(mid, [_frame(0)], [0], 1)
+    assert outcome.state == "stale"
     current = s.get_message(mid)
     assert current["content"] == "edited"
     assert current["frames_file"] is None
@@ -902,7 +905,7 @@ def test_persisted_continue_fails_closed_when_base_frames_cannot_load(monkeypatc
             raise app.FrameStorageError("base corrupt")
         def update_message_and_frames_if_unchanged(self, *args, **kwargs):
             unchanged["updated"] = True
-            return True
+            return SimpleNamespace(state="committed", entity_id="1")
 
     def generate(**kwargs):
         kwargs["emit"]({"type": "frame", **_frame(1)})
@@ -922,11 +925,12 @@ def test_initial_save_frames_uses_inserted_version_not_later_edit(tmp_path, monk
     monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
     monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
     s = store_mod.Store()
-    cid = s.create_conversation("c")
-    mid, version = s.add_message(cid, None, "assistant", "T", meta={"publication_state": "frames_pending"}, return_version=True)
+    cid = s.create_conversation("c").value
+    inserted = s.add_message(cid, None, "assistant", "T", meta={"publication_state": "frames_pending"}, return_version=True).value
+    mid, version = inserted
     s.update_message(mid, "E", meta={"edited": True}, clear_frames=True)
-    with pytest.raises(store_mod.StaleMessageUpdate):
-        s.save_frames(mid, [_frame(0)], [0], 1, expected_version=version, complete_meta={"publication_state": "complete"})
+    outcome = s.save_frames(mid, [_frame(0)], [0], 1, expected_version=version, complete_meta={"publication_state": "complete"})
+    assert outcome.state == "stale"
     current = s.get_message(mid)
     assert current["content"] == "E"
     assert current["frames_file"] is None
@@ -939,8 +943,10 @@ def test_store_save_frames_rolls_back_failed_commit_before_connection_reuse(tmp_
     monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
     monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
     s = store_mod.Store()
-    cid = s.create_conversation("c")
-    mid, version = s.add_message(cid, None, "assistant", "T", meta={"publication_state": "frames_pending"}, return_version=True)
+    cid = s.create_conversation("c").value
+    inserted = s.add_message(cid, None, "assistant", "T", meta={"publication_state": "frames_pending"}, return_version=True).value
+    mid, version = inserted
+    real_conn_method = s._conn
     conn = s._conn()
     fail_once = {"yes": True}
 
@@ -961,9 +967,9 @@ def test_store_save_frames_rolls_back_failed_commit_before_connection_reuse(tmp_
             return conn.commit()
 
     monkeypatch.setattr(s, "_conn", lambda: CommitFailProxy())
-    with pytest.raises(RuntimeError):
-        s.save_frames(mid, [_frame(0)], [0], 1, expected_version=version, complete_meta={"publication_state": "complete"})
-    assert not conn.in_transaction
+    outcome = s.save_frames(mid, [_frame(0)], [0], 1, expected_version=version, complete_meta={"publication_state": "complete"})
+    assert outcome.state == "not_committed"
+    monkeypatch.setattr(s, "_conn", real_conn_method)
     s.update_message(mid, "after", meta={"ok": True}, clear_frames=True)
     current = s.get_message(mid)
     assert current["content"] == "after"
@@ -978,15 +984,16 @@ def test_store_candidate_file_fsync_failure_is_actionable(tmp_path, monkeypatch)
     monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
     monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
     s = store_mod.Store()
-    cid = s.create_conversation("c")
-    mid, version = s.add_message(cid, None, "assistant", "T", return_version=True)
+    cid = s.create_conversation("c").value
+    inserted = s.add_message(cid, None, "assistant", "T", return_version=True).value
+    mid, version = inserted
 
     def fail_fsync(fd):
         raise OSError(errno.ENOSPC, "full")
 
     monkeypatch.setattr(os, "fsync", fail_fsync)
-    with pytest.raises(store_mod.FrameStorageError):
-        s.save_frames(mid, [_frame(0)], [0], 1, expected_version=version)
+    outcome = s.save_frames(mid, [_frame(0)], [0], 1, expected_version=version)
+    assert outcome.state == "not_committed"
     assert s.get_message(mid)["frames_file"] is None
     assert not list(store_mod.FRAMES_DIR.glob("*.tmp-*"))
     assert not list(store_mod.FRAMES_DIR.glob("*.msgpack"))
@@ -999,9 +1006,9 @@ def test_delete_conversation_treats_frame_unlink_as_garbage_cleanup(tmp_path, mo
     monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
     monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
     s = store_mod.Store()
-    cid = s.create_conversation("c")
-    mid = s.add_message(cid, None, "assistant", "T")
-    frame_file = s.save_frames(mid, [_frame(0)], [0], 1)
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "T").value[0]
+    frame_file = s.save_frames(mid, [_frame(0)], [0], 1).value
     original_unlink = Path.unlink
 
     def failing_unlink(path, *args, **kwargs):
@@ -1023,8 +1030,9 @@ def test_store_load_frames_corrupt_schema_maps_to_frame_storage_error(tmp_path, 
     monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
     monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
     s = store_mod.Store()
-    cid = s.create_conversation("c")
-    mid, version = s.add_message(cid, None, "assistant", "T", return_version=True)
+    cid = s.create_conversation("c").value
+    inserted = s.add_message(cid, None, "assistant", "T", return_version=True).value
+    mid, version = inserted
     filename, _ = s._write_unique_frame_candidate(mid, version, msgpack.packb({"version": 1, "frames": [{}]}))
     conn = s._conn()
     conn.execute("UPDATE messages SET frames_file = ?, version = version + 1 WHERE id = ?", (filename, mid))
@@ -1039,19 +1047,20 @@ def test_mark_frame_publication_failed_uses_exact_version_and_preserves_patch(tm
     monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
     monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
     s = store_mod.Store()
-    cid = s.create_conversation("c")
-    mid, version = s.add_message(
+    cid = s.create_conversation("c").value
+    inserted = s.add_message(
         cid, None, "assistant", "T",
         meta={"publication_state": "frames_pending", "frames_expected": True},
         return_version=True,
-    )
+    ).value
+    mid, version = inserted
     s.update_message(mid, "E", meta={"edited": True}, clear_frames=True)
     ok = s.mark_frame_publication_failed(
         mid,
         expected_version=version,
         failure_meta={"publication_state": "frames_publication_failed", "frames_expected": True},
     )
-    assert ok is False
+    assert ok.state == "superseded"
     current = s.get_message(mid)
     assert current["content"] == "E"
     meta = current["meta"]
@@ -1066,12 +1075,13 @@ def test_mark_frame_publication_failed_marks_pending_without_rewriting_content(t
     monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
     monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
     s = store_mod.Store()
-    cid = s.create_conversation("c")
-    mid, version = s.add_message(
+    cid = s.create_conversation("c").value
+    inserted = s.add_message(
         cid, None, "assistant", "T",
         meta={"publication_state": "frames_pending", "frames_expected": True},
         return_version=True,
-    )
+    ).value
+    mid, version = inserted
     ok = s.mark_frame_publication_failed(
         mid,
         expected_version=version,
@@ -1082,7 +1092,7 @@ def test_mark_frame_publication_failed_marks_pending_without_rewriting_content(t
             "frames_error": "full",
         },
     )
-    assert ok is True
+    assert ok.state == "committed"
     current = s.get_message(mid)
     assert current["content"] == "T"
     assert current["frames_file"] is None
@@ -1099,8 +1109,8 @@ def test_load_frames_state_taxonomy(tmp_path, monkeypatch):
     monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
     monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
     s = store_mod.Store()
-    cid = s.create_conversation("c")
-    mid = s.add_message(cid, None, "assistant", "T")
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "T").value[0]
     with pytest.raises(store_mod.FramesNotAttached):
         s.load_frames(mid)
     conn = s._conn()
@@ -1117,7 +1127,7 @@ def test_load_frames_rejects_semantic_archive_corruption(tmp_path, monkeypatch):
     monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
     monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
     s = store_mod.Store()
-    cid = s.create_conversation("c")
+    cid = s.create_conversation("c").value
 
     cases = [
         ("invalid-k", {"k": -1}),
@@ -1132,7 +1142,7 @@ def test_load_frames_rejects_semantic_archive_corruption(tmp_path, monkeypatch):
         ("duplicate-normalized-layer", {"frames": [{"layers": {0: {}, "0": {}}}]}),
     ]
     for name, patch in cases:
-        mid = s.add_message(cid, None, "assistant", name)
+        mid = s.add_message(cid, None, "assistant", name).value[0]
         blob = msgpack.unpackb(
             store_mod.Store._pack_frames_blob([_frame(0, "reading")], [0], 1),
             strict_map_key=False,
@@ -1160,8 +1170,8 @@ def test_schema_v3_requires_one_valid_homogeneous_run_id(tmp_path, monkeypatch, 
     monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
     monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
     s = store_mod.Store()
-    cid = s.create_conversation("c")
-    mid = s.add_message(cid, None, "assistant", "T")
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "T").value[0]
     frame = _frame(0, "reading", "0")
     frame["generation_run_id"] = "1" * 32
     blob = msgpack.unpackb(store_mod.Store._pack_frames_blob([frame], [0], 1), strict_map_key=False)
@@ -1187,14 +1197,14 @@ def test_persisted_continue_drops_overlapping_reread_frames_and_reloads(tmp_path
     monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
     s = store_mod.Store()
     monkeypatch.setattr(app, "store", s)
-    cid = s.create_conversation("c")
+    cid = s.create_conversation("c").value
     mid = s.add_message(
         cid,
         None,
         "assistant",
         "old",
         meta={"publication_state": "complete", "frames_lens_binding_id": 7, "frames_layers": [0], "frames_k": 1},
-    )
+    ).value[0]
     lens_meta = {"path": "/lens", "model_id": "m", "model_revision": "r", "fitted_layers_all": [0], "tapped_layers": [0], "k": 1}
     lens = type("Lens", (), {"layers": [0], "k": 1, "binding_id": 7, "meta": lens_meta})()
     descriptor = app._frame_descriptor(lens, [0], 1)
@@ -1248,8 +1258,8 @@ def test_persisted_continue_rejects_incompatible_frame_configuration(tmp_path, m
     monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
     s = store_mod.Store()
     monkeypatch.setattr(app, "store", s)
-    cid = s.create_conversation("c")
-    mid = s.add_message(cid, None, "assistant", "old", meta={"frames_lens_binding_id": 7})
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "old", meta={"frames_lens_binding_id": 7}).value[0]
     original_lens = type("Lens", (), {"layers": [0], "k": 1, "binding_id": 7, "meta": {"path": "/lens", "model_id": "m", "model_revision": "r", "fitted_layers_all": [0], "tapped_layers": [0], "k": 1}})()
     s.save_frames(mid, [_frame(0, "thinking", "0")], [0], 1, frame_descriptor=app._frame_descriptor(original_lens, [0], 1))
     before = s.get_message(mid)
@@ -1277,7 +1287,7 @@ def test_pointerless_framed_continuation_replaces_stale_frame_metadata(tmp_path,
     monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
     s = store_mod.Store()
     monkeypatch.setattr(app, "store", s)
-    cid = s.create_conversation("c")
+    cid = s.create_conversation("c").value
     mid = s.add_message(cid, None, "assistant", "old", meta={
         "publication_state": "frames_publication_failed",
         "frames_expected": False,
@@ -1285,7 +1295,7 @@ def test_pointerless_framed_continuation_replaces_stale_frame_metadata(tmp_path,
         "frames_invalidation_reason": "edited",
         "frames_error_kind": "write",
         "frames_error": "old failure",
-    })
+    }).value[0]
     lens_meta = {"path": "/lens", "model_id": "m", "model_revision": "r", "fitted_layers_all": [0], "tapped_layers": [0], "k": 1}
     lens = type("Lens", (), {"layers": [0], "k": 1, "binding_id": 9, "meta": lens_meta})()
     run_id = "4" * 32
@@ -1324,9 +1334,9 @@ def test_lens_disabled_continuation_invalidates_existing_frames(tmp_path, monkey
     monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
     s = store_mod.Store()
     monkeypatch.setattr(app, "store", s)
-    cid = s.create_conversation("c")
-    mid = s.add_message(cid, None, "assistant", "old", meta={"publication_state": "complete"})
-    old_file = s.save_frames(mid, [_frame(0, "thinking", "0")], [0], 1)
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "old", meta={"publication_state": "complete"}).value[0]
+    old_file = s.save_frames(mid, [_frame(0, "thinking", "0")], [0], 1).value
 
     def generate(**kwargs):
         kwargs["emit"]({"type": "done", "text": " plus", "meta": {}, "stats": {}, "stopped": False})
@@ -1351,8 +1361,8 @@ def test_lens_disabled_continuation_fails_closed_on_missing_frames(tmp_path, mon
     monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
     s = store_mod.Store()
     monkeypatch.setattr(app, "store", s)
-    cid = s.create_conversation("c")
-    mid = s.add_message(cid, None, "assistant", "old")
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "old").value[0]
     conn = s._conn()
     conn.execute("UPDATE messages SET frames_file = ?, version = version + 1 WHERE id = ?", ("missing.msgpack", mid))
     conn.commit()
@@ -1377,12 +1387,13 @@ def test_frame_candidate_validation_failure_leaves_old_row_unchanged(tmp_path, m
     monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
     monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
     s = store_mod.Store()
-    cid = s.create_conversation("c")
-    mid, version = s.add_message(cid, None, "assistant", "old", return_version=True)
+    cid = s.create_conversation("c").value
+    inserted = s.add_message(cid, None, "assistant", "old", return_version=True).value
+    mid, version = inserted
     old = s.get_message(mid)
     monkeypatch.setattr(s, "_validate_frame_candidate", lambda *args, **kwargs: (_ for _ in ()).throw(store_mod.FrameStorageError("bad candidate")))
-    with pytest.raises(store_mod.FrameStorageError):
-        s.update_message_and_frames_if_unchanged(mid, version, "new", {}, frames=[_frame(1)], layers=[0], k=1)
+    outcome = s.update_message_and_frames_if_unchanged(mid, version, "new", {}, frames=[_frame(1)], layers=[0], k=1)
+    assert outcome.state == "not_committed"
     assert s.get_message(mid)["content"] == old["content"]
     assert s.get_message(mid)["version"] == old["version"]
     assert not list(store_mod.FRAMES_DIR.glob("*.msgpack"))
@@ -1492,3 +1503,114 @@ def test_marker_tail_keeps_latest_eligible_token_boundary():
         pending, Tokenizer(), ("\nUser:", "\nAssistant:")
     ) == 1
     assert FALLBACK_MARKER_TOKEN_LIMIT == 32
+
+
+def _commit_then_raise_proxy(conn):
+    class Proxy:
+        def __getattr__(self, name):
+            return getattr(conn, name)
+
+        @property
+        def in_transaction(self):
+            return conn.in_transaction
+
+        def commit(self):
+            conn.commit()
+            raise RuntimeError("commit acknowledgement lost")
+
+    return Proxy()
+
+
+def _assert_primitive_outcome(outcome):
+    from pathlib import Path
+    import sqlite3
+    import types
+
+    assert outcome.state in {"committed", "not_committed", "stale", "superseded", "ambiguous"}
+    for value in vars(outcome).values():
+        assert not isinstance(value, (BaseException, Path, sqlite3.Connection, sqlite3.Cursor, types.TracebackType))
+    assert isinstance(outcome.value, (type(None), bool, int, float, str, tuple))
+
+
+def test_store_create_and_insert_reconcile_commit_acknowledgement_loss(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    store = store_mod.Store()
+    create_conn = store._conn()
+    monkeypatch.setattr(store, "_conn", lambda: _commit_then_raise_proxy(create_conn))
+    created = store.create_conversation("durable")
+    _assert_primitive_outcome(created)
+    assert created.state == "committed"
+    assert created.value == 1
+
+    # The reconciled operational connection was deliberately discarded.
+    monkeypatch.setattr(store, "_conn", store_mod.Store._conn.__get__(store))
+    insert_conn = store._conn()
+    monkeypatch.setattr(store, "_conn", lambda: _commit_then_raise_proxy(insert_conn))
+    inserted = store.add_message(created.value, None, "assistant", "answer")
+    _assert_primitive_outcome(inserted)
+    assert inserted.state == "committed"
+    assert inserted.value == (1, 0)
+
+
+def test_store_create_reports_definite_noncommit(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    store = store_mod.Store()
+    conn = store._conn()
+
+    class FailBeforeCommit:
+        def __getattr__(self, name):
+            return getattr(conn, name)
+
+        @property
+        def in_transaction(self):
+            return conn.in_transaction
+
+        def commit(self):
+            raise RuntimeError("commit rejected")
+
+    monkeypatch.setattr(store, "_conn", lambda: FailBeforeCommit())
+    outcome = store.create_conversation("not durable")
+    _assert_primitive_outcome(outcome)
+    assert outcome.state == "not_committed"
+    assert outcome.entity_id == "1"
+
+
+def test_frame_attachment_and_lens_clear_reconcile_lost_commit_ack(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    store = store_mod.Store()
+    cid = store.create_conversation("c").value
+    mid, version = store.add_message(
+        cid, None, "assistant", "answer", meta={"publication_state": "frames_pending"}
+    ).value
+
+    real_conn_method = store._conn
+    attach_conn = store._conn()
+    monkeypatch.setattr(store, "_conn", lambda: _commit_then_raise_proxy(attach_conn))
+    attached = store.save_frames(
+        mid, [_frame(0)], [0], 1, expected_version=version,
+        complete_meta={"publication_state": "complete"},
+    )
+    _assert_primitive_outcome(attached)
+    assert attached.state == "committed"
+    old_file = attached.value
+    assert (store_mod.FRAMES_DIR / old_file).exists()
+
+    monkeypatch.setattr(store, "_conn", real_conn_method)
+    clear_conn = store._conn()
+    monkeypatch.setattr(store, "_conn", lambda: _commit_then_raise_proxy(clear_conn))
+    cleared = store.update_message_and_frames_if_unchanged(
+        mid, attached.observed_version, "answer plus", {"frames_invalidated": True},
+        clear_frames=True,
+    )
+    _assert_primitive_outcome(cleared)
+    assert cleared.state == "committed"
+    assert not (store_mod.FRAMES_DIR / old_file).exists()

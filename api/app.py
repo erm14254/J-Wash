@@ -36,7 +36,7 @@ from core.model_manager import (
     resolve_local_dir,
     resolve_source,
 )
-from core.store import Store, FrameStorageError, StaleMessageUpdate, FramesNotAttached, FramePointerTurnover, FrameFileMissing, StorageCommitAmbiguous
+from core.store import Store, FrameStorageError, FramesNotAttached, FramePointerTurnover, FrameFileMissing
 
 manager = ModelManager()
 lens_manager = LensManager()
@@ -2393,22 +2393,25 @@ def api_conversation(cid: int):
 
 @app.patch("/api/conversations/{cid}")
 def api_conversation_patch(cid: int, req: ConversationPatch):
-    try:
-        outcome = store.update_conversation(cid, title=req.title, tags=req.tags)
-    except StorageCommitAmbiguous as exc:
-        raise HTTPException(500, str(exc)) from None
-    except ValueError as exc:
-        raise HTTPException(404, str(exc)) from None
-    if getattr(outcome, "state", "committed") == "superseded":
+    outcome = store.update_conversation(cid, title=req.title, tags=req.tags)
+    if outcome.state in {"stale", "superseded"}:
         raise HTTPException(409, "conversation changed before update completed")
-    if getattr(outcome, "state", "committed") != "committed":
+    if outcome.state == "ambiguous":
+        raise HTTPException(500, f"conversation {outcome.entity_id} update outcome is ambiguous")
+    if outcome.state != "committed":
         raise HTTPException(500, "conversation update did not commit")
     return {"ok": True}
 
 
 @app.delete("/api/conversations/{cid}")
 def api_conversation_delete(cid: int):
-    store.delete_conversation(cid)
+    outcome = store.delete_conversation(cid)
+    if outcome.state in {"stale", "superseded"}:
+        raise HTTPException(409, "conversation changed before deletion completed")
+    if outcome.state == "ambiguous":
+        raise HTTPException(500, f"conversation {outcome.entity_id} deletion outcome is ambiguous")
+    if outcome.state != "committed":
+        raise HTTPException(500, "conversation deletion did not commit")
     return {"ok": True}
 
 
@@ -2438,7 +2441,7 @@ def api_message_patch(mid: int, req: MessagePatch):
     are generated from the stored path, so the edit takes effect immediately."""
     try:
         current = store.get_message(mid)
-        store.update_message(
+        outcome = store.update_message(
             mid,
             req.content,
             meta={
@@ -2450,12 +2453,14 @@ def api_message_patch(mid: int, req: MessagePatch):
             clear_frames=True,
             expected_version=current.get("version", 0),
         )
-    except StaleMessageUpdate as exc:
-        raise HTTPException(409, str(exc)) from None
-    except StorageCommitAmbiguous as exc:
-        raise HTTPException(500, str(exc)) from None
     except ValueError as exc:
         raise HTTPException(404, str(exc))
+    if outcome.state in {"stale", "superseded"}:
+        raise HTTPException(409, f"message {mid} changed before edit completed")
+    if outcome.state == "ambiguous":
+        raise HTTPException(500, f"message {outcome.entity_id} edit outcome is ambiguous")
+    if outcome.state != "committed":
+        raise HTTPException(500, f"message {mid} edit did not commit")
     return {"ok": True, "id": mid}
 
 
@@ -2489,6 +2494,19 @@ def _generate_safely(messages, sampling, stop_event, emit, context):
         emit({"type": "error", "message": str(exc)})
 
 
+def _persisted_mutation_value(outcome, label, emit):
+    if outcome.state == "committed":
+        return outcome.value
+    if outcome.state in {"stale", "superseded"}:
+        message = f"{label} was superseded by newer durable state"
+    elif outcome.state == "ambiguous":
+        message = f"{label} outcome is ambiguous for ID {outcome.entity_id}; operator recovery is required"
+    else:
+        message = f"{label} did not commit; storage recovery is required"
+    emit({"type": "error", "message": message})
+    return None
+
+
 def _persisted_generate(req, stop_event, emit, gen_context):
     try:
         continue_id = req.get("continue_message_id")
@@ -2503,11 +2521,27 @@ def _persisted_generate(req, stop_event, emit, gen_context):
             emit({"type": "error", "message": "content required for a new conversation"})
             return
         if conversation_id is None:
-            conversation_id = store.create_conversation(content[:60])
+            conversation_id = _persisted_mutation_value(
+                store.create_conversation(content[:60]), "conversation creation", emit
+            )
+            if conversation_id is None:
+                return
             if system:
-                parent_id = store.add_message(conversation_id, None, "system", system)
+                inserted = _persisted_mutation_value(
+                    store.add_message(conversation_id, None, "system", system),
+                    "system message insertion", emit,
+                )
+                if inserted is None:
+                    return
+                parent_id = inserted[0]
         if content:
-            parent_id = store.add_message(conversation_id, parent_id, "user", content)
+            inserted = _persisted_mutation_value(
+                store.add_message(conversation_id, parent_id, "user", content),
+                "user message insertion", emit,
+            )
+            if inserted is None:
+                return
+            parent_id = inserted[0]
         if parent_id is None:
             emit({"type": "error", "message": "parent_id or content required"})
             return
@@ -2551,10 +2585,13 @@ def _persisted_generate(req, stop_event, emit, gen_context):
             insert_meta.update(publication_state="frames_pending", frames_expected=True)
         else:
             insert_meta.update(publication_state="complete", frames_expected=False)
-        message_id, inserted_version = store.add_message(
+        inserted = _persisted_mutation_value(store.add_message(
             conversation_id, parent_id, "assistant", done_holder.get("text", ""), meta=insert_meta,
             return_version=True,
-        )
+        ), "assistant message insertion", emit)
+        if inserted is None:
+            return
+        message_id, inserted_version = inserted
         if frames_acc:
             complete_meta = dict(
                 meta,
@@ -2562,31 +2599,42 @@ def _persisted_generate(req, stop_event, emit, gen_context):
                 frames_expected=True,
                 **_frames_lens_signature(lens, layers_used, k_used),
             )
-            try:
-                store.save_frames(
-                    message_id, frames_acc, layers_used, k_used,
-                    expected_version=inserted_version, complete_meta=complete_meta,
-                    frame_descriptor=_frame_descriptor(lens, layers_used, k_used),
-                )
-            except StaleMessageUpdate:
-                emit({"type": "error", "message": "message changed before frames were attached; retry"})
+            attached = store.save_frames(
+                message_id, frames_acc, layers_used, k_used,
+                expected_version=inserted_version, complete_meta=complete_meta,
+                frame_descriptor=_frame_descriptor(lens, layers_used, k_used),
+            )
+            if attached.state in {"stale", "superseded"}:
+                emit({"type": "error", "message": "message changed before frames were attached"})
                 return
-            except Exception as exc:
+            if attached.state == "ambiguous":
+                emit({
+                    "type": "error",
+                    "message": f"frame attachment outcome is ambiguous for message {attached.entity_id}; operator recovery is required",
+                })
+                return
+            if attached.state == "not_committed":
                 failure_meta = dict(
                     meta, publication_state="frames_publication_failed", frames_expected=True,
-                    frames_error_kind=exc.__class__.__name__, frames_error=str(exc)[:512],
+                    frames_error_kind=attached.error_kind,
+                    frames_error=(attached.error_message or "frame attachment did not commit")[:512],
                 )
-                try:
-                    marked = store.mark_frame_publication_failed(
-                        message_id, expected_version=inserted_version, failure_meta=failure_meta
-                    )
-                except Exception as mark_exc:
-                    emit({"type": "error", "message": f"frames could not be published; terminalization failed: {mark_exc}"})
+                marked = store.mark_frame_publication_failed(
+                    message_id, expected_version=inserted_version, failure_meta=failure_meta
+                )
+                if marked.state == "ambiguous":
+                    emit({"type": "error", "message": f"frame failure outcome is ambiguous for message {marked.entity_id}; operator recovery is required"})
                     return
-                if not marked:
-                    emit({"type": "error", "message": "message changed before frame failure could be recorded; retry"})
+                if marked.state in {"stale", "superseded"}:
+                    emit({"type": "error", "message": "message changed before frame failure could be recorded"})
                     return
-                emit({"type": "error", "message": "frames could not be published; retry", "message_id": message_id})
+                if marked.state == "not_committed":
+                    emit({"type": "error", "message": "frame failure did not commit; storage recovery is required"})
+                    return
+                emit({"type": "error", "message": "frames could not be published", "message_id": message_id})
+                return
+            if attached.state != "committed":
+                emit({"type": "error", "message": "invalid frame attachment outcome"})
                 return
         emit(dict(done_holder, conversation_id=conversation_id, message_id=message_id))
     except Exception as exc:
@@ -2778,12 +2826,22 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
             frames_invalidated=True,
             frames_invalidation_reason="lens_disabled_continuation",
         )
-    if not store.update_message_and_frames_if_unchanged(
+    outcome = store.update_message_and_frames_if_unchanged(
         message_id, expected_version, new_content, meta,
         frames=merged, layers=layers_used, k=k_used, clear_frames=clear_frames,
         frame_descriptor=_frame_descriptor(lens, layers_used, k_used) if merged is not None else None,
-    ):
-        emit({"type": "error", "message": "message changed during continuation; retry"})
+    )
+    if outcome.state in {"stale", "superseded"}:
+        emit({"type": "error", "message": "message changed during continuation"})
+        return
+    if outcome.state == "ambiguous":
+        emit({"type": "error", "message": f"continuation outcome is ambiguous for message {outcome.entity_id}; operator recovery is required"})
+        return
+    if outcome.state == "not_committed":
+        emit({"type": "error", "message": "continuation did not commit; storage recovery is required"})
+        return
+    if outcome.state != "committed":
+        emit({"type": "error", "message": "invalid continuation storage outcome"})
         return
     emit(dict(
         done_holder,

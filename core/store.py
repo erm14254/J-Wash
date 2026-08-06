@@ -20,10 +20,6 @@ FRAMES_DIR = config.DATA_DIR / "frames"
 log = logging.getLogger(__name__)
 
 
-class StaleMessageUpdate(RuntimeError):
-    """A versioned message update lost its durable CAS race."""
-
-
 class FrameStorageError(RuntimeError):
     """Frame archive publication or loading failed coherently."""
 
@@ -40,41 +36,36 @@ class FrameFileMissing(FrameStorageError):
     """The committed frame archive is missing from disk."""
 
 
-class StorageMutationError(RuntimeError):
-    """A durable store mutation could not be classified as successful."""
-
-
-class StorageCommitAmbiguous(StorageMutationError):
-    """A commit result could not be reconciled through an independent read."""
-
-
-class StorageMutationSuperseded(StorageMutationError):
-    """A versioned mutation was superseded by a newer durable row."""
-
-
 MAX_FRAME_ERROR_CHARS = 512
+MUTATION_STATES = frozenset({"committed", "not_committed", "stale", "superseded", "ambiguous"})
 
 
 @dataclass(frozen=True)
 class StorageMutationOutcome:
     state: str
     mutation: str
-    message_id: int | None = None
+    entity_id: str | None = None
     expected_version: int | None = None
     observed_version: int | None = None
     error_kind: str | None = None
     error_message: str | None = None
+    value: object | None = None
 
-    @property
-    def committed(self):
-        return self.state == "committed"
-
-    @property
-    def status(self):
-        return self.state
-
-    def __bool__(self):
-        return self.committed
+    def __post_init__(self):
+        if self.state not in MUTATION_STATES:
+            raise ValueError("invalid storage mutation state")
+        for value in (self.state, self.mutation, self.entity_id, self.error_kind, self.error_message):
+            if value is not None and (not isinstance(value, str) or len(value) > MAX_FRAME_ERROR_CHARS):
+                raise ValueError("storage mutation strings must be bounded")
+        def primitive(value):
+            return (
+                value is None
+                or isinstance(value, (bool, int, float))
+                or (isinstance(value, str) and len(value) <= MAX_FRAME_ERROR_CHARS)
+                or (isinstance(value, tuple) and all(primitive(item) for item in value))
+            )
+        if not primitive(self.value):
+            raise ValueError("storage mutation value must be immutable and primitive")
 
 
 SUPPORTED_FRAME_PHASES = frozenset({"reading", "thinking", "prompt", "gen"})
@@ -141,7 +132,7 @@ END;
 
 
 def _now():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 class Store:
@@ -202,9 +193,8 @@ class Store:
                 conn.close()
             except Exception:
                 pass
-        if getattr(self._local, "conn", None) is conn or conn is None:
-            if hasattr(self._local, "conn"):
-                del self._local.conn
+        if hasattr(self._local, "conn"):
+            del self._local.conn
 
     def _abort_transaction_or_discard(self, conn):
         try:
@@ -259,134 +249,205 @@ class Store:
     def _bounded_error(exc):
         return str(exc)[:MAX_FRAME_ERROR_CHARS]
 
-    def _mutation_outcome(self, state, mutation, *, message_id=None, expected_version=None,
-                          observed_version=None, exc=None, message=None):
+    @classmethod
+    def _primitive_value(cls, value):
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            return value[:MAX_FRAME_ERROR_CHARS]
+        if isinstance(value, (tuple, list)):
+            return tuple(cls._primitive_value(item) for item in value)
+        if isinstance(value, dict):
+            return tuple(
+                (str(key)[:MAX_FRAME_ERROR_CHARS], cls._primitive_value(item))
+                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            )
+        raise TypeError("storage mutation outcome values must be primitive")
+
+    def _mutation_outcome(self, state, mutation, *, entity_id=None, expected_version=None,
+                          observed_version=None, exc=None, message=None, value=None):
         return StorageMutationOutcome(
             state=state,
-            mutation=mutation,
-            message_id=message_id,
+            mutation=str(mutation)[:MAX_FRAME_ERROR_CHARS],
+            entity_id=(str(entity_id)[:MAX_FRAME_ERROR_CHARS] if entity_id is not None else None),
             expected_version=expected_version,
             observed_version=observed_version,
-            error_kind=exc.__class__.__name__ if exc is not None else None,
+            error_kind=(exc.__class__.__name__[:MAX_FRAME_ERROR_CHARS] if exc is not None else None),
             error_message=self._bounded_error(exc) if exc is not None else (
                 str(message)[:MAX_FRAME_ERROR_CHARS] if message is not None else None
             ),
+            value=self._primitive_value(value),
         )
 
+    def _reconcile_mutation(self, mutation, entity_id, query, params, classify, *,
+                            expected_version=None, operational_exc=None):
+        """Read durable state independently and convert every failure to data."""
+        try:
+            with self._independent_read_connection() as read:
+                row = read.execute(query, params).fetchone()
+            state, observed_version, value, message = classify(row)
+            return self._mutation_outcome(
+                state, mutation, entity_id=entity_id,
+                expected_version=expected_version,
+                observed_version=observed_version, value=value,
+                exc=operational_exc if state in {"not_committed", "ambiguous"} else None,
+                message=message,
+            )
+        except BaseException as exc:
+            log.warning("storage mutation reconciliation failed for %s %s", mutation, entity_id,
+                        exc_info=True)
+            return self._mutation_outcome(
+                "ambiguous", mutation, entity_id=entity_id,
+                expected_version=expected_version, exc=exc,
+            )
+
     def create_conversation(self, title, tags=None):
-        conn = self._conn()
-        now = _now()
-        tags_sql = json.dumps(tags or [])
-        conversation_id = None
+        try:
+            conn = self._conn()
+        except BaseException as exc:
+            return self._mutation_outcome("not_committed", "create_conversation", exc=exc)
+        try:
+            now = _now()
+            tags_sql = json.dumps(tags or [])
+        except BaseException as exc:
+            return self._mutation_outcome("not_committed", "create_conversation", exc=exc)
+        try:
+            conversation_id = int(conn.execute(
+                "SELECT COALESCE(MAX(id), 0) + 1 FROM conversations"
+            ).fetchone()[0])
+        except BaseException as exc:
+            return self._mutation_outcome("not_committed", "create_conversation", exc=exc)
+        intended = (conversation_id, title, tags_sql, now, now)
         try:
             conn.execute("BEGIN IMMEDIATE")
-            cur = conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM conversations")
-            conversation_id = int(cur.fetchone()[0])
             conn.execute(
                 "INSERT INTO conversations (id, title, tags, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (conversation_id, title, tags_sql, now, now),
+                intended,
             )
             conn.commit()
-            return conversation_id
-        except Exception as exc:
+            return self._mutation_outcome(
+                "committed", "create_conversation", entity_id=conversation_id,
+                value=conversation_id,
+            )
+        except BaseException as exc:
             self._abort_transaction_or_discard(conn)
-            try:
-                with self._independent_read_connection() as read:
-                    row = read.execute(
-                        "SELECT id, title, tags, created_at, updated_at FROM conversations WHERE id = ?",
-                        (conversation_id,),
-                    ).fetchone() if conversation_id is not None else None
-                if row is not None and (
-                    row["title"] == title
-                    and row["tags"] == tags_sql
-                    and row["created_at"] == now
-                    and row["updated_at"] == now
-                ):
-                    return conversation_id
-            except Exception as reconcile_exc:
-                raise StorageCommitAmbiguous(
-                    f"could not reconcile conversation create: {self._bounded_error(reconcile_exc)}"
-                ) from None
-            raise StorageCommitAmbiguous(
-                f"conversation create did not commit: {self._bounded_error(exc)}"
-            ) from None
+            self._discard_conn(conn)
+            def classify(row):
+                if row is None:
+                    return "not_committed", None, None, None
+                actual = tuple(row[key] for key in ("id", "title", "tags", "created_at", "updated_at"))
+                if actual == intended:
+                    return "committed", None, conversation_id, None
+                return "ambiguous", None, None, "conversation ID contains conflicting durable state"
+            return self._reconcile_mutation(
+                "create_conversation", conversation_id,
+                "SELECT id, title, tags, created_at, updated_at FROM conversations WHERE id = ?",
+                (conversation_id,), classify, operational_exc=exc,
+            )
 
     def update_conversation(self, conversation_id, title=None, tags=None):
-        conn = self._conn()
-        new_title = None
-        new_tags = None
-        now = _now()
+        try:
+            conn = self._conn()
+        except BaseException as exc:
+            return self._mutation_outcome(
+                "ambiguous", "update_conversation", entity_id=conversation_id, exc=exc
+            )
+        try:
+            now = _now()
+        except BaseException as exc:
+            return self._mutation_outcome(
+                "not_committed", "update_conversation", entity_id=conversation_id, exc=exc
+            )
+        original = intended = None
         try:
             conn.execute("BEGIN IMMEDIATE")
             current = conn.execute(
-                "SELECT title, tags FROM conversations WHERE id = ?", (conversation_id,)
+                "SELECT title, tags, created_at, updated_at FROM conversations WHERE id = ?", (conversation_id,)
             ).fetchone()
             if current is None:
                 self._abort_transaction_or_discard(conn)
-                raise ValueError(f"unknown conversation {conversation_id}")
+                return self._mutation_outcome("superseded", "update_conversation", entity_id=conversation_id)
+            original = tuple(current[key] for key in ("title", "tags", "created_at", "updated_at"))
             new_title = current["title"] if title is None else title
             new_tags = current["tags"] if tags is None else json.dumps(tags)
+            intended = (new_title, new_tags, current["created_at"], now)
             cur = conn.execute(
                 "UPDATE conversations SET title = ?, tags = ?, updated_at = ? WHERE id = ?",
                 (new_title, new_tags, now, conversation_id),
             )
             if cur.rowcount != 1:
                 self._abort_transaction_or_discard(conn)
-                raise ValueError(f"unknown conversation {conversation_id}")
+                return self._mutation_outcome("superseded", "update_conversation", entity_id=conversation_id)
             conn.commit()
-            return self._mutation_outcome("committed", "update_conversation", message_id=conversation_id)
-        except Exception as exc:
-            if isinstance(exc, StaleMessageUpdate):
-                raise
+            return self._mutation_outcome("committed", "update_conversation", entity_id=conversation_id)
+        except BaseException as exc:
             self._abort_transaction_or_discard(conn)
-            try:
-                with self._independent_read_connection() as read:
-                    row = read.execute(
-                        "SELECT title, tags, updated_at FROM conversations WHERE id = ?",
-                        (conversation_id,),
-                    ).fetchone()
-                if row is not None and row["title"] == new_title and row["tags"] == new_tags and row["updated_at"] == now:
-                    return self._mutation_outcome("committed", "update_conversation", message_id=conversation_id)
+            self._discard_conn(conn)
+            def classify(row):
                 if row is None:
-                    return self._mutation_outcome("superseded", "update_conversation", message_id=conversation_id, exc=exc)
-            except Exception as reconcile_exc:
-                raise StorageCommitAmbiguous(
-                    f"could not reconcile conversation update {conversation_id}: {self._bounded_error(reconcile_exc)}"
-                ) from None
-            raise
+                    return "superseded", None, None, None
+                actual = tuple(row[key] for key in ("title", "tags", "created_at", "updated_at"))
+                if original is None:
+                    return "ambiguous", None, None, "conversation pre-mutation state is unavailable"
+                if intended is not None and actual == intended:
+                    return "committed", None, None, None
+                if original is not None and actual == original:
+                    return "not_committed", None, None, None
+                return "superseded", None, None, "conversation contains different durable state"
+            return self._reconcile_mutation(
+                "update_conversation", conversation_id,
+                "SELECT title, tags, created_at, updated_at FROM conversations WHERE id = ?",
+                (conversation_id,), classify, operational_exc=exc,
+            )
 
     def delete_conversation(self, conversation_id):
-        conn = self._conn()
+        try:
+            conn = self._conn()
+        except BaseException as exc:
+            return self._mutation_outcome(
+                "ambiguous", "delete_conversation", entity_id=conversation_id, exc=exc
+            )
         rows = []
+        original = None
         try:
             conn.execute("BEGIN IMMEDIATE")
+            conversation = conn.execute(
+                "SELECT id, title, tags, created_at, updated_at FROM conversations WHERE id = ?",
+                (conversation_id,),
+            ).fetchone()
+            if conversation is not None:
+                original = tuple(conversation[key] for key in (
+                    "id", "title", "tags", "created_at", "updated_at"
+                ))
             rows = conn.execute(
                 "SELECT frames_file FROM messages WHERE conversation_id = ? AND frames_file IS NOT NULL",
                 (conversation_id,),
             ).fetchall()
             conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
             conn.commit()
-        except Exception as exc:
+        except BaseException as exc:
             self._abort_transaction_or_discard(conn)
-            try:
-                with self._independent_read_connection() as read:
-                    row = read.execute(
-                        "SELECT 1 FROM conversations WHERE id = ?", (conversation_id,)
-                    ).fetchone()
+            self._discard_conn(conn)
+            def classify(row):
                 if row is None:
                     for frame_row in rows:
                         self._unlink_best_effort(FRAMES_DIR / frame_row["frames_file"])
-                    return self._mutation_outcome("committed", "delete_conversation", message_id=conversation_id)
-            except Exception as reconcile_exc:
-                raise StorageCommitAmbiguous(
-                    f"could not reconcile conversation delete {conversation_id}: {self._bounded_error(reconcile_exc)}"
-                ) from None
-            raise StorageCommitAmbiguous(
-                f"conversation delete {conversation_id} outcome ambiguous: {self._bounded_error(exc)}"
-            ) from None
+                    return "committed", None, None, None
+                actual = tuple(row[key] for key in (
+                    "id", "title", "tags", "created_at", "updated_at"
+                ))
+                if original is not None and actual == original:
+                    return "not_committed", None, None, None
+                return "superseded", None, None, "conversation ID contains different durable state"
+            return self._reconcile_mutation(
+                "delete_conversation", conversation_id,
+                "SELECT id, title, tags, created_at, updated_at FROM conversations WHERE id = ?",
+                (conversation_id,),
+                classify, operational_exc=exc,
+            )
         for row in rows:
             self._unlink_best_effort(FRAMES_DIR / row["frames_file"])
-        return self._mutation_outcome("committed", "delete_conversation", message_id=conversation_id)
+        return self._mutation_outcome("committed", "delete_conversation", entity_id=conversation_id)
 
     def list_conversations(self, query=None, limit=200):
         conn = self._conn()
@@ -474,14 +535,25 @@ class Store:
         }
 
     def add_message(self, conversation_id, parent_id, role, content, meta=None, *, return_version=False):
-        conn = self._conn()
-        message_id = None
-        now = _now()
-        meta_sql = json.dumps(meta, ensure_ascii=False) if meta else None
+        try:
+            conn = self._conn()
+        except BaseException as exc:
+            return self._mutation_outcome("not_committed", "add_message", exc=exc)
+        try:
+            now = _now()
+            meta_sql = json.dumps(meta, ensure_ascii=False) if meta else None
+        except BaseException as exc:
+            return self._mutation_outcome("not_committed", "add_message", exc=exc)
+        try:
+            message_id = int(conn.execute(
+                "SELECT COALESCE(MAX(id), 0) + 1 FROM messages"
+            ).fetchone()[0])
+        except BaseException as exc:
+            return self._mutation_outcome("not_committed", "add_message", exc=exc)
+        intended = (message_id, conversation_id, parent_id, role, content, meta_sql, None, now, 0)
+        value = (message_id, 0)
         try:
             conn.execute("BEGIN IMMEDIATE")
-            cur = conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM messages")
-            message_id = int(cur.fetchone()[0])
             conn.execute(
                 "INSERT INTO messages (id, conversation_id, parent_id, role, content, meta, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -500,35 +572,28 @@ class Store:
                 (now, conversation_id),
             )
             conn.commit()
-        except Exception as exc:
+            return self._mutation_outcome(
+                "committed", "add_message", entity_id=message_id,
+                observed_version=0, value=value,
+            )
+        except BaseException as exc:
             self._abort_transaction_or_discard(conn)
-            try:
-                with self._independent_read_connection() as read:
-                    if message_id is None:
-                        raise
-                    row = read.execute(
-                        "SELECT id, conversation_id, parent_id, role, content, meta, frames_file, version "
-                        "FROM messages WHERE id = ?",
-                        (message_id,),
-                    ).fetchone()
-                    if row is not None and (
-                        row["conversation_id"] == conversation_id
-                        and row["parent_id"] == parent_id
-                        and row["role"] == role
-                        and row["content"] == content
-                        and row["meta"] == meta_sql
-                        and row["frames_file"] is None
-                        and row["version"] == 0
-                    ):
-                        return (row["id"], row["version"]) if return_version else row["id"]
-                    if row is not None:
-                        raise StorageCommitAmbiguous(f"message insert {message_id} committed with mismatched state")
-            except StorageCommitAmbiguous:
-                raise
-            except Exception:
-                raise
-            raise
-        return (message_id, 0) if return_version else message_id
+            self._discard_conn(conn)
+            keys = ("id", "conversation_id", "parent_id", "role", "content", "meta",
+                    "frames_file", "created_at", "version")
+            def classify(row):
+                if row is None:
+                    return "not_committed", None, None, None
+                observed = row["version"]
+                if tuple(row[key] for key in keys) == intended:
+                    return "committed", observed, value, None
+                return "ambiguous", observed, None, "message ID contains conflicting durable state"
+            return self._reconcile_mutation(
+                "add_message", message_id,
+                "SELECT id, conversation_id, parent_id, role, content, meta, frames_file, created_at, version "
+                "FROM messages WHERE id = ?", (message_id,), classify,
+                operational_exc=exc,
+            )
 
     def get_message(self, message_id):
         conn = self._conn()
@@ -548,15 +613,35 @@ class Store:
         stale continuations then fail their versioned CAS instead of overwriting
         an acknowledged edit.
         """
-        conn = self._conn()
-        row = conn.execute(
-            "SELECT conversation_id, frames_file, version FROM messages WHERE id = ?", (message_id,)
-        ).fetchone()
+        try:
+            conn = self._conn()
+        except BaseException as exc:
+            return self._mutation_outcome(
+                "ambiguous", "update_message", entity_id=message_id,
+                expected_version=expected_version, exc=exc,
+            )
+        try:
+            row = conn.execute(
+                "SELECT conversation_id, content, meta, frames_file, version FROM messages WHERE id = ?",
+                (message_id,),
+            ).fetchone()
+        except BaseException as exc:
+            return self._mutation_outcome("ambiguous", "update_message", entity_id=message_id,
+                                          expected_version=expected_version, exc=exc)
         if row is None:
-            raise ValueError(f"unknown message {message_id}")
-        meta_json = json.dumps(meta, ensure_ascii=False) if meta is not None else None
+            return self._mutation_outcome("superseded", "update_message", entity_id=message_id,
+                                          expected_version=expected_version)
+        try:
+            meta_json = json.dumps(meta, ensure_ascii=False) if meta is not None else None
+        except BaseException as exc:
+            return self._mutation_outcome(
+                "not_committed", "update_message", entity_id=message_id,
+                expected_version=expected_version, observed_version=row["version"], exc=exc,
+            )
         frames_file = None if clear_frames else row["frames_file"]
         baseline = row["version"] if expected_version is None else expected_version
+        original = (row["content"], row["meta"], row["frames_file"], row["version"])
+        intended = (content, meta_json, frames_file, baseline + 1)
         try:
             conn.execute("BEGIN IMMEDIATE")
             cur = conn.execute(
@@ -566,35 +651,53 @@ class Store:
             )
             if cur.rowcount != 1:
                 self._abort_transaction_or_discard(conn)
-                raise StaleMessageUpdate(f"message {message_id} changed before edit")
+                self._discard_conn(conn)
+                def classify_stale(current):
+                    if current is None:
+                        return "superseded", None, None, None
+                    observed = current["version"]
+                    actual = tuple(current[key] for key in ("content", "meta", "frames_file", "version"))
+                    if actual == intended:
+                        return "committed", observed, None, None
+                    return "stale", observed, None, "message changed before edit"
+                return self._reconcile_mutation(
+                    "update_message", message_id,
+                    "SELECT content, meta, frames_file, version FROM messages WHERE id = ?",
+                    (message_id,), classify_stale, expected_version=baseline,
+                )
             conn.execute(
                 "UPDATE conversations SET updated_at = ? WHERE id = ?",
                 (_now(), row["conversation_id"]),
             )
             conn.commit()
-        except StaleMessageUpdate:
-            raise
-        except Exception as exc:
+        except BaseException as exc:
             self._abort_transaction_or_discard(conn)
-            try:
-                with self._independent_read_connection() as read:
-                    current = read.execute(
-                        "SELECT content, meta, frames_file, version FROM messages WHERE id = ?",
-                        (message_id,),
-                    ).fetchone()
-                    if current is not None and (
-                        current["content"] == content
-                        and current["meta"] == meta_json
-                        and current["frames_file"] == frames_file
-                        and current["version"] == baseline + 1
-                    ):
-                        pass
-                    else:
-                        raise
-            except Exception:
-                raise
+            self._discard_conn(conn)
+            def classify(current):
+                if current is None:
+                    return "superseded", None, None, None
+                observed = current["version"]
+                actual = tuple(current[key] for key in ("content", "meta", "frames_file", "version"))
+                if actual == intended:
+                    return "committed", observed, None, None
+                if actual == original:
+                    return "not_committed", observed, None, None
+                if observed != baseline:
+                    return "stale", observed, None, "message contains a newer durable version"
+                return "ambiguous", observed, None, "message durable state is inconsistent"
+            outcome = self._reconcile_mutation(
+                "update_message", message_id,
+                "SELECT content, meta, frames_file, version FROM messages WHERE id = ?",
+                (message_id,), classify, expected_version=baseline, operational_exc=exc,
+            )
+            if outcome.state != "committed":
+                return outcome
         if clear_frames and row["frames_file"]:
             self._unlink_best_effort(FRAMES_DIR / row["frames_file"])
+        return self._mutation_outcome(
+            "committed", "update_message", entity_id=message_id,
+            expected_version=baseline, observed_version=baseline + 1,
+        )
 
     def update_message_if_unchanged(self, message_id, expected_version, content, meta=None):
         return self.update_message_and_frames_if_unchanged(
@@ -629,30 +732,59 @@ class Store:
             raise FrameStorageError(str(exc)) from exc
 
     def update_message_and_frames_if_unchanged(self, message_id, expected_version, content, meta=None, *, frames=None, layers=None, k=0, clear_frames=False, frame_descriptor=None):
+        mutation = "update_message_and_frames_if_unchanged"
         frame_file = None
         final_path = None
-        if frames:
-            frame_blob = self._pack_frames_blob(frames, layers or [], k, frame_descriptor)
-            frame_file, final_path = self._write_unique_frame_candidate(message_id, expected_version, frame_blob)
-            try:
+        try:
+            if frames:
+                frame_blob = self._pack_frames_blob(frames, layers or [], k, frame_descriptor)
+                frame_file, final_path = self._write_unique_frame_candidate(
+                    message_id, expected_version, frame_blob
+                )
                 self._validate_frame_candidate(final_path, message_id)
-            except Exception:
-                self._unlink_best_effort(final_path)
-                raise
-        conn = self._conn()
+        except BaseException as exc:
+            self._unlink_best_effort(final_path)
+            return self._mutation_outcome(
+                "not_committed", mutation, entity_id=message_id,
+                expected_version=expected_version, exc=exc,
+            )
+        try:
+            conn = self._conn()
+        except BaseException as exc:
+            return self._mutation_outcome(
+                "ambiguous", mutation, entity_id=message_id,
+                expected_version=expected_version, exc=exc, value=frame_file,
+            )
         old_file = None
+        original = intended = None
+        target_frame = None
+        try:
+            meta_json = json.dumps(meta, ensure_ascii=False) if meta is not None else None
+        except BaseException as exc:
+            self._unlink_candidate_if_unreferenced(frame_file, final_path)
+            return self._mutation_outcome(
+                "not_committed", mutation, entity_id=message_id,
+                expected_version=expected_version, exc=exc,
+            )
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT conversation_id, frames_file FROM messages WHERE id = ?",
-                (message_id,),
+                "SELECT conversation_id, content, meta, frames_file, version "
+                "FROM messages WHERE id = ?", (message_id,),
             ).fetchone()
             if row is None:
                 self._rollback_or_discard(conn)
-                raise ValueError(f"unknown message {message_id}")
+                self._unlink_candidate_if_unreferenced(frame_file, final_path)
+                return self._mutation_outcome(
+                    "superseded", mutation, entity_id=message_id,
+                    expected_version=expected_version,
+                )
             old_file = row["frames_file"]
-            target_frame = None if clear_frames else (frame_file if frame_file is not None else old_file)
-            meta_json = json.dumps(meta, ensure_ascii=False) if meta is not None else None
+            original = tuple(row[key] for key in ("content", "meta", "frames_file", "version"))
+            target_frame = None if clear_frames else (
+                frame_file if frame_file is not None else old_file
+            )
+            intended = (content, meta_json, target_frame, expected_version + 1)
             cur = conn.execute(
                 "UPDATE messages SET content = ?, meta = ?, frames_file = ?, version = version + 1 "
                 "WHERE id = ? AND version = ?",
@@ -660,48 +792,62 @@ class Store:
             )
             if cur.rowcount != 1:
                 self._rollback_or_discard(conn)
-                if final_path is not None:
-                    self._unlink_best_effort(final_path)
-                return False
+                self._discard_conn(conn)
+                def classify_miss(current):
+                    if current is None:
+                        return "superseded", None, None, None
+                    observed = current["version"]
+                    actual = tuple(current[key] for key in ("content", "meta", "frames_file", "version"))
+                    if actual == intended:
+                        return "committed", observed, None, None
+                    if actual == original:
+                        return "not_committed", observed, None, None
+                    return "superseded", observed, None, "message changed before continuation"
+                outcome = self._reconcile_mutation(
+                    mutation, message_id,
+                    "SELECT content, meta, frames_file, version FROM messages WHERE id = ?",
+                    (message_id,), classify_miss, expected_version=expected_version,
+                )
+                if outcome.state != "ambiguous":
+                    self._unlink_candidate_if_unreferenced(frame_file, final_path)
+                return outcome
             conn.execute(
                 "UPDATE conversations SET updated_at = ? WHERE id = ?",
                 (_now(), row["conversation_id"]),
             )
             conn.commit()
-        except Exception as exc:
+            outcome = self._mutation_outcome(
+                "committed", mutation, entity_id=message_id,
+                expected_version=expected_version, observed_version=expected_version + 1,
+                value=frame_file,
+            )
+        except BaseException as exc:
             self._abort_transaction_or_discard(conn)
-            intended_meta = json.dumps(meta, ensure_ascii=False) if meta is not None else None
-            try:
-                with self._independent_read_connection() as read:
-                    current = read.execute(
-                        "SELECT content, meta, frames_file, version FROM messages WHERE id = ?",
-                        (message_id,),
-                    ).fetchone()
-                    if current is not None and (
-                        current["content"] == content
-                        and current["meta"] == intended_meta
-                        and current["frames_file"] == target_frame
-                        and current["version"] == expected_version + 1
-                    ):
-                        if frame_file and old_file and old_file != frame_file:
-                            self._unlink_best_effort(FRAMES_DIR / old_file)
-                        return True
-                    if current is not None and current["version"] != expected_version:
-                        if final_path is not None:
-                            self._unlink_candidate_if_unreferenced(frame_file, final_path)
-                        return False
-            except Exception as reconcile_exc:
-                if final_path is not None and not self._candidate_referenced(frame_file):
-                    log.warning("frame mutation reconciliation failed; preserving candidate if referenced", exc_info=True)
-                raise StorageCommitAmbiguous(
-                    f"could not reconcile message {message_id} mutation: {self._bounded_error(reconcile_exc)}"
-                ) from reconcile_exc
-            if final_path is not None:
+            self._discard_conn(conn)
+            def classify(current):
+                if current is None:
+                    return "superseded", None, None, None
+                observed = current["version"]
+                actual = tuple(current[key] for key in ("content", "meta", "frames_file", "version"))
+                if intended is not None and actual == intended:
+                    return "committed", observed, frame_file, None
+                if original is not None and actual == original:
+                    return "not_committed", observed, None, None
+                if observed != expected_version:
+                    return "superseded", observed, None, "message contains a newer durable version"
+                return "ambiguous", observed, frame_file, "message durable state is inconsistent"
+            outcome = self._reconcile_mutation(
+                mutation, message_id,
+                "SELECT content, meta, frames_file, version FROM messages WHERE id = ?",
+                (message_id,), classify, expected_version=expected_version,
+                operational_exc=exc,
+            )
+            if outcome.state != "ambiguous":
                 self._unlink_candidate_if_unreferenced(frame_file, final_path)
-            raise
-        if (frame_file or clear_frames) and old_file and old_file != frame_file:
+
+        if outcome.state == "committed" and old_file and old_file != target_frame:
             self._unlink_best_effort(FRAMES_DIR / old_file)
-        return True
+        return outcome
 
     def path_to_root(self, message_id):
         conn = self._conn()
@@ -766,130 +912,186 @@ class Store:
         })
 
     def mark_frame_publication_failed(self, message_id, *, expected_version, failure_meta):
-        conn = self._conn()
-        meta_sql = json.dumps(failure_meta, ensure_ascii=False)
+        mutation = "mark_frame_publication_failed"
+        try:
+            meta_sql = json.dumps(failure_meta, ensure_ascii=False)
+        except BaseException as exc:
+            return self._mutation_outcome(
+                "not_committed", mutation, entity_id=message_id,
+                expected_version=expected_version, exc=exc,
+            )
         intended_version = expected_version + 1
+        try:
+            with self._independent_read_connection() as read:
+                initial = read.execute(
+                    "SELECT meta, frames_file, version FROM messages WHERE id = ?",
+                    (message_id,),
+                ).fetchone()
+        except BaseException as exc:
+            return self._mutation_outcome(
+                "ambiguous", mutation, entity_id=message_id,
+                expected_version=expected_version, exc=exc,
+            )
+        if initial is None:
+            return self._mutation_outcome(
+                "superseded", mutation, entity_id=message_id,
+                expected_version=expected_version,
+            )
+        original = tuple(initial[key] for key in ("meta", "frames_file", "version"))
+        intended = (meta_sql, None, intended_version)
+
+        def classify(row):
+            if row is None:
+                return "superseded", None, None, None
+            observed = row["version"]
+            actual = tuple(row[key] for key in ("meta", "frames_file", "version"))
+            if actual == intended:
+                return "committed", observed, None, None
+            if actual == original:
+                return "not_committed", observed, None, None
+            return "superseded", observed, None, "frame publication state was replaced"
+
+        last_outcome = None
+        for attempt in range(2):
+            conn = None
+            try:
+                conn = self._conn()
+                conn.execute("BEGIN IMMEDIATE")
+                cur = conn.execute(
+                    "UPDATE messages SET meta = ?, frames_file = NULL, version = version + 1 "
+                    "WHERE id = ? AND version = ?",
+                    (meta_sql, message_id, expected_version),
+                )
+                if cur.rowcount != 1:
+                    self._abort_transaction_or_discard(conn)
+                    self._discard_conn(conn)
+                    return self._reconcile_mutation(
+                        mutation, message_id,
+                        "SELECT meta, frames_file, version FROM messages WHERE id = ?",
+                        (message_id,), classify, expected_version=expected_version,
+                    )
+                conn.commit()
+                return self._mutation_outcome(
+                    "committed", mutation, entity_id=message_id,
+                    expected_version=expected_version, observed_version=intended_version,
+                )
+            except BaseException as exc:
+                if conn is not None:
+                    self._abort_transaction_or_discard(conn)
+                    self._discard_conn(conn)
+                last_outcome = self._reconcile_mutation(
+                    mutation, message_id,
+                    "SELECT meta, frames_file, version FROM messages WHERE id = ?",
+                    (message_id,), classify, expected_version=expected_version,
+                    operational_exc=exc,
+                )
+                if last_outcome.state != "not_committed" or attempt == 1:
+                    return last_outcome
+        return last_outcome
+
+    def save_frames(self, message_id, frames, layers, k, *, expected_version=None, complete_meta=None, frame_descriptor=None):
+        mutation = "save_frames"
+        try:
+            conn = self._conn()
+        except BaseException as exc:
+            return self._mutation_outcome(
+                "ambiguous", mutation, entity_id=message_id,
+                expected_version=expected_version, exc=exc,
+            )
+        try:
+            row = conn.execute(
+                "SELECT meta, version, frames_file FROM messages WHERE id = ?", (message_id,)
+            ).fetchone()
+        except BaseException as exc:
+            return self._mutation_outcome(
+                "ambiguous", mutation, entity_id=message_id,
+                expected_version=expected_version, exc=exc,
+            )
+        if row is None:
+            return self._mutation_outcome(
+                "superseded", mutation, entity_id=message_id,
+                expected_version=expected_version,
+            )
+        baseline = row["version"] if expected_version is None else expected_version
+        old_file = row["frames_file"]
+        original = (row["frames_file"], row["meta"], row["version"])
+        try:
+            filename, final_path = self._write_unique_frame_candidate(
+                message_id, baseline,
+                self._pack_frames_blob(frames, layers, k, frame_descriptor),
+            )
+            self._validate_frame_candidate(final_path, message_id)
+        except BaseException as exc:
+            if "final_path" in locals():
+                self._unlink_best_effort(final_path)
+            return self._mutation_outcome(
+                "not_committed", mutation, entity_id=message_id,
+                expected_version=baseline, observed_version=row["version"], exc=exc,
+            )
+        try:
+            meta_sql = (
+                json.dumps(complete_meta, ensure_ascii=False)
+                if complete_meta is not None else row["meta"]
+            )
+        except BaseException as exc:
+            self._unlink_candidate_if_unreferenced(filename, final_path)
+            return self._mutation_outcome(
+                "not_committed", mutation, entity_id=message_id,
+                expected_version=baseline, observed_version=row["version"], exc=exc,
+            )
+        intended = (filename, meta_sql, baseline + 1)
+
+        def classify(current):
+            if current is None:
+                return "superseded", None, None, None
+            observed = current["version"]
+            actual = tuple(current[key] for key in ("frames_file", "meta", "version"))
+            if actual == intended:
+                return "committed", observed, filename, None
+            if actual == original:
+                return "not_committed", observed, None, None
+            if observed != baseline:
+                return "stale", observed, None, "message changed before frames attached"
+            return "ambiguous", observed, filename, "frame pointer state is inconsistent"
+
         try:
             conn.execute("BEGIN IMMEDIATE")
             cur = conn.execute(
-                "UPDATE messages SET meta = ?, frames_file = NULL, version = version + 1 "
+                "UPDATE messages SET frames_file = ?, meta = ?, version = version + 1 "
                 "WHERE id = ? AND version = ?",
-                (meta_sql, message_id, expected_version),
+                (filename, meta_sql, message_id, baseline),
             )
             if cur.rowcount != 1:
-                self._rollback_or_discard(conn)
-                return False
-            conn.commit()
-            return True
-        except Exception:
-            self._abort_transaction_or_discard(conn)
-            try:
-                with self._independent_read_connection() as read:
-                    row = read.execute(
-                        "SELECT meta, frames_file, version FROM messages WHERE id = ?",
-                        (message_id,),
-                    ).fetchone()
-                    if row is not None and (
-                        row["meta"] == meta_sql
-                        and row["frames_file"] is None
-                        and row["version"] == intended_version
-                    ):
-                        return True
-                    if row is not None and row["version"] != expected_version:
-                        return False
-                    if row is not None and row["version"] == expected_version:
-                        retry_conn = self._conn()
-                        try:
-                            retry_conn.execute("BEGIN IMMEDIATE")
-                            cur = retry_conn.execute(
-                                "UPDATE messages SET meta = ?, frames_file = NULL, version = version + 1 "
-                                "WHERE id = ? AND version = ?",
-                                (meta_sql, message_id, expected_version),
-                            )
-                            if cur.rowcount == 1:
-                                retry_conn.commit()
-                                return True
-                            self._abort_transaction_or_discard(retry_conn)
-                            return False
-                        except Exception:
-                            self._abort_transaction_or_discard(retry_conn)
-                            raise
-            except Exception as reconcile_exc:
-                raise StorageCommitAmbiguous(
-                    f"could not reconcile frame-failure terminalization for message {message_id}: "
-                    f"{self._bounded_error(reconcile_exc)}"
-                ) from reconcile_exc
-            raise StorageCommitAmbiguous(f"message {message_id} frame-failure terminalization is ambiguous")
-
-    def save_frames(self, message_id, frames, layers, k, *, expected_version=None, complete_meta=None, frame_descriptor=None):
-        conn = self._conn()
-        row = conn.execute(
-            "SELECT version, frames_file FROM messages WHERE id = ?", (message_id,)
-        ).fetchone()
-        if row is None:
-            raise ValueError(f"unknown message {message_id}")
-        baseline = row["version"] if expected_version is None else expected_version
-        filename, final_path = self._write_unique_frame_candidate(
-            message_id, baseline, self._pack_frames_blob(frames, layers, k, frame_descriptor)
-        )
-        try:
-            self._validate_frame_candidate(final_path, message_id)
-        except Exception:
-            self._unlink_best_effort(final_path)
-            raise
-        old_file = row["frames_file"]
-        committed = False
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            meta_sql = json.dumps(complete_meta, ensure_ascii=False) if complete_meta is not None else None
-            if complete_meta is not None:
-                cur = conn.execute(
-                    "UPDATE messages SET frames_file = ?, meta = ?, version = version + 1 WHERE id = ? AND version = ?",
-                    (filename, meta_sql, message_id, baseline),
+                self._abort_transaction_or_discard(conn)
+                self._discard_conn(conn)
+                outcome = self._reconcile_mutation(
+                    mutation, message_id,
+                    "SELECT frames_file, meta, version FROM messages WHERE id = ?",
+                    (message_id,), classify, expected_version=baseline,
                 )
             else:
-                cur = conn.execute(
-                    "UPDATE messages SET frames_file = ?, version = version + 1 WHERE id = ? AND version = ?",
-                    (filename, message_id, baseline),
+                conn.commit()
+                outcome = self._mutation_outcome(
+                    "committed", mutation, entity_id=message_id,
+                    expected_version=baseline, observed_version=baseline + 1,
+                    value=filename,
                 )
-            if cur.rowcount != 1:
-                self._rollback_or_discard(conn)
-                self._unlink_best_effort(final_path)
-                raise StaleMessageUpdate(f"message {message_id} changed before frames attached")
-            conn.commit()
-            committed = True
-        except Exception as exc:
-            if isinstance(exc, StaleMessageUpdate):
-                self._abort_transaction_or_discard(conn)
-                self._unlink_candidate_if_unreferenced(filename, final_path)
-                raise
-            try:
-                self._abort_transaction_or_discard(conn)
-                with self._independent_read_connection() as read_conn:
-                    current = read_conn.execute(
-                        "SELECT frames_file, meta, version FROM messages WHERE id = ?",
-                        (message_id,),
-                    ).fetchone()
-                meta_matches = complete_meta is None or (
-                    current is not None and current["meta"] == json.dumps(complete_meta, ensure_ascii=False)
-                )
-                if current is not None and current["frames_file"] == filename and current["version"] == baseline + 1 and meta_matches:
-                    if old_file and old_file != filename:
-                        self._unlink_best_effort(FRAMES_DIR / old_file)
-                    return filename
-                self._unlink_candidate_if_unreferenced(filename, final_path)
-            except Exception as reconcile_exc:
-                if isinstance(reconcile_exc, StorageMutationError):
-                    raise
-                if not self._candidate_referenced(filename):
-                    self._unlink_best_effort(final_path)
-                raise StorageCommitAmbiguous(
-                    f"could not reconcile frame save for message {message_id}: {self._bounded_error(reconcile_exc)}"
-                ) from reconcile_exc
-            raise
-        if old_file and old_file != filename:
-            self._unlink_best_effort(FRAMES_DIR / old_file)
-        return filename
+        except BaseException as exc:
+            self._abort_transaction_or_discard(conn)
+            self._discard_conn(conn)
+            outcome = self._reconcile_mutation(
+                mutation, message_id,
+                "SELECT frames_file, meta, version FROM messages WHERE id = ?",
+                (message_id,), classify, expected_version=baseline,
+                operational_exc=exc,
+            )
+
+        if outcome.state == "committed":
+            if old_file and old_file != filename:
+                self._unlink_best_effort(FRAMES_DIR / old_file)
+        elif outcome.state != "ambiguous":
+            self._unlink_candidate_if_unreferenced(filename, final_path)
+        return outcome
 
     def _validate_frame_candidate(self, final_path, message_id):
         try:
