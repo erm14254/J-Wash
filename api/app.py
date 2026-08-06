@@ -185,20 +185,6 @@ def _coordinated_interventions(snap):
     return snap.interventions
 
 
-async def _retain_worker_task_or_cancel(task, dispatch):
-    try:
-        _retain_worker_task(task)
-    except Exception as exc:
-        dispatch.cancel_from_awaiter()
-        original = exc
-        try:
-            await _drain_worker_uninterruptibly(task)
-        except asyncio.CancelledError:
-            raise original from None
-        raise original from None
-    return task
-
-
 class HandoffState(Enum):
     NEW = "NEW"
     ACQUIRED = "ACQUIRED"
@@ -252,14 +238,18 @@ class OperationHandoff:
             self._set_state(HandoffState.ACQUIRED)
             self.token = token
             self.set_heavy(snap=snap)
-        except BaseException:
+        except BaseException as exc:
+            error_kind = type(exc).__name__
+            error_message = str(exc)[:512]
+            exc = None
             snap = None
             self.heavy.clear()
             self.token = None
             self.coordinator.release(token)
+            token = None
             self.closed = True
             self.state = HandoffState.CLOSED
-            raise
+            raise RuntimeError(f"{error_kind}: {error_message}") from None
         return token, snap
 
     def set_heavy(self, **refs):
@@ -292,14 +282,26 @@ class OperationHandoff:
         if self.closed or self.transferred:
             return
         self.clear_heavy()
-        if self.dispatch is not None:
-            self.dispatch.cancel_from_awaiter()
-            if self.task is not None:
-                await _drain_worker_uninterruptibly(self.task)
-        elif self.token is not None:
-            self.coordinator.release(self.token)
-        self.closed = True
-        self._set_state(HandoffState.CLOSED)
+        cancelled = False
+        try:
+            if self.dispatch is not None:
+                self.dispatch.cancel_from_awaiter()
+                if self.task is not None:
+                    try:
+                        await _drain_worker_uninterruptibly(self.task)
+                    except asyncio.CancelledError:
+                        cancelled = True
+            elif self.token is not None:
+                self.coordinator.release(self.token)
+        finally:
+            self.task = None
+            self.wrapper = None
+            self.dispatch = None
+            self.token = None
+            self.closed = True
+            self._set_state(HandoffState.CLOSED)
+        if cancelled:
+            raise asyncio.CancelledError()
 
     def set_wrapper(self, wrapper):
         self._set_state(HandoffState.WRAPPER_READY)
@@ -321,7 +323,7 @@ class OperationHandoff:
             task = asyncio.create_task(wrapper)
             self.wrapper = None
             self.set_task(task)
-            await _retain_worker_task_or_cancel(task, self.dispatch)
+            _retain_worker_task(task)
             self._set_state(HandoffState.TASK_RETAINED)
             self.transferred = True
             self._set_state(HandoffState.TRANSFERRED)
@@ -355,14 +357,6 @@ class OperationHandoff:
                 self.closed = True
                 self._set_state(HandoffState.CLOSED)
             raise
-
-
-async def _handoff_thread_worker(coordinator, token, stop_event, dispatch, worker_factory, **heavy):
-    handoff = OperationHandoff(coordinator, token, stop_event)
-    if heavy:
-        handoff.set_heavy(**heavy)
-    handoff.set_dispatch(dispatch)
-    return await handoff.create_thread_task(worker_factory)
 
 
 def _retain_worker_task(task):
@@ -689,27 +683,27 @@ async def api_load(req: LoadRequest):
 async def api_delete_model(req: DeleteModelRequest):
     from core.model_manager import delete_model
     stop_event = ThreadingEvent()
+    handoff = OperationHandoff(manager.coordinator, stop_event=stop_event)
     token = None
     try:
-        token, snap = manager.coordinator.acquire(OperationType.MODEL_DELETE, include_bundle=False)
+        token, snap = handoff.acquire(OperationType.MODEL_DELETE, include_bundle=False)
         status = manager.coordinator.status_snapshot()
         loaded_model_id = (status.model_meta or {}).get("model_id") if status.model_meta is not None else None
         snap = status = None
         if loaded_model_id == req.model_id:
-            manager.coordinator.release(token)
+            await handoff.close()
             token = None
             raise HTTPException(409, "unload this model before deleting it")
     except OperationConflict as exc:
         raise _conflict(exc)
     except Exception:
         if token is not None:
-            manager.coordinator.release(token)
+            await handoff.close()
         raise
     try:
-        dispatch = WorkerDispatch(manager.coordinator, token, stop_event)
+        dispatch = handoff.create_dispatch()
     except Exception:
-        if token is not None:
-            manager.coordinator.release(token)
+        await handoff.close()
         raise
 
     model_id = req.model_id
@@ -725,7 +719,7 @@ async def api_delete_model(req: DeleteModelRequest):
         finally:
             dispatch.release_from_worker()
 
-    task = await _handoff_thread_worker(manager.coordinator, token, stop_event, dispatch, lambda: worker)
+    task = await handoff.create_thread_task(lambda: worker)
     try:
         return _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -821,8 +815,9 @@ async def api_lens_load(req: LensLoadRequest):
         raise HTTPException(422, "repo_id or path required")
     token = None
     stop_event = ThreadingEvent()
+    handoff = OperationHandoff(manager.coordinator, stop_event=stop_event)
     try:
-        token, snap = manager.coordinator.acquire(OperationType.LENS_UPDATE, requires_loaded=True, include_bundle=False)
+        token, snap = handoff.acquire(OperationType.LENS_UPDATE, requires_loaded=True, include_bundle=False)
         snap = None
     except OperationConflict as exc:
         raise _conflict(exc)
@@ -837,10 +832,9 @@ async def api_lens_load(req: LensLoadRequest):
             "layers": req.layers,
             "k": req.k,
         }
-        dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+        dispatch = handoff.create_dispatch(payload)
     except Exception:
-        if token is not None:
-            manager.coordinator.release(token)
+        await handoff.close()
         raise
     payload = None
 
@@ -875,7 +869,7 @@ async def api_lens_load(req: LensLoadRequest):
             payload = old_state = result = None
             dispatch.release_from_worker()
 
-    task = await _handoff_thread_worker(manager.coordinator, token, stop_event, dispatch, lambda: worker)
+    task = await handoff.create_thread_task(lambda: worker)
     try:
         return _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -1354,8 +1348,9 @@ async def api_edit_export(req: ExportRequest):
         raise HTTPException(422, f"unknown format: {req.format}")
     token = snap = None
     stop_event = ThreadingEvent()
+    handoff = OperationHandoff(manager.coordinator, stop_event=stop_event)
     try:
-        token, snap = manager.coordinator.acquire(OperationType.EXPORT, requires_loaded=True)
+        token, snap = handoff.acquire(OperationType.EXPORT, requires_loaded=True)
         outcome = _export_preflight_resource(snap, req)
     except OperationConflict as exc:
         raise _conflict(exc)
@@ -1363,14 +1358,14 @@ async def api_edit_export(req: ExportRequest):
         raise HTTPException(422, str(exc))
     except Exception:
         if token is not None:
-            manager.coordinator.release(token)
+            await handoff.close()
         raise
     finally:
         snap = None
 
     if outcome.status is not None:
         if token is not None:
-            manager.coordinator.release(token)
+            await handoff.close()
             token = None
         return _raise_route_outcome(outcome)
     prepared = outcome.value
@@ -1384,11 +1379,11 @@ async def api_edit_export(req: ExportRequest):
         )
         payload = dict(payload_seed)
         payload.update(publication_gate=publication_gate, format=req.format, name=req.name)
-        dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+        dispatch = handoff.create_dispatch(payload)
     except Exception:
         payload_seed = payload = prepared = None
         if token is not None:
-            manager.coordinator.release(token)
+            await handoff.close()
         raise
     payload_seed = payload = prepared = None
 
@@ -1418,7 +1413,7 @@ async def api_edit_export(req: ExportRequest):
             finally:
                 dispatch.release_from_worker()
 
-    task = await _handoff_thread_worker(manager.coordinator, token, stop_event, dispatch, lambda: worker)
+    task = await handoff.create_thread_task(lambda: worker)
     try:
         return _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -1649,8 +1644,9 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
     if not (hf_dir / "config.json").exists():
         token = snap = None
         stop_event = ThreadingEvent()
+        handoff = OperationHandoff(manager.coordinator, stop_event=stop_event)
         try:
-            token, snap = manager.coordinator.acquire(OperationType.GGUF_BAKE, requires_loaded=True)
+            token, snap = handoff.acquire(OperationType.GGUF_BAKE, requires_loaded=True)
             outcome = _gguf_preflight_resource(snap)
         except OperationConflict as exc:
             raise _conflict(exc)
@@ -1658,13 +1654,13 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
             raise HTTPException(422, "no model loaded (and no cached checkpoint for this name)") from exc
         except Exception:
             if token is not None:
-                manager.coordinator.release(token)
+                await handoff.close()
             raise
         finally:
             snap = None
         if outcome.status is not None:
             if token is not None:
-                manager.coordinator.release(token)
+                await handoff.close()
                 token = None
             return _raise_route_outcome(outcome)
         prepared = outcome.value
@@ -1677,11 +1673,11 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
             )
             payload = dict(payload_seed)
             payload.update(name="/".join((*name_parts, "hf")), publication_gate=publication_gate)
-            dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+            dispatch = handoff.create_dispatch(payload)
         except Exception:
             payload_seed = payload = prepared = None
             if token is not None:
-                manager.coordinator.release(token)
+                await handoff.close()
             raise
         payload_seed = payload = prepared = None
 
@@ -1706,7 +1702,7 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
             finally:
                 payload = call_kwargs = result = None
                 dispatch.release_from_worker()
-        task = await _handoff_thread_worker(manager.coordinator, token, stop_event, dispatch, lambda: bake_worker)
+        task = await handoff.create_thread_task(lambda: bake_worker)
         try:
             _raise_worker_outcome(await asyncio.shield(task))
         except asyncio.CancelledError:
@@ -1783,8 +1779,9 @@ async def api_generate_sync(req: GenerateSyncRequest):
     global _generation_counter
     token = None
     stop_event = ThreadingEvent()
+    handoff = OperationHandoff(manager.coordinator, stop_event=stop_event)
     try:
-        token, snap = manager.coordinator.acquire(OperationType.GENERATE, requires_loaded=True)
+        token, snap = handoff.acquire(OperationType.GENERATE, requires_loaded=True)
         context = _captured_generation_context(token, snap, stop_event)
     except OperationConflict as exc:
         raise _conflict(exc)
@@ -1792,14 +1789,14 @@ async def api_generate_sync(req: GenerateSyncRequest):
         raise HTTPException(422, str(exc))
     except Exception:
         if token is not None:
-            manager.coordinator.release(token)
+            await handoff.close()
         raise
     try:
         payload = {"context": context, "messages": req.messages, "sampling": req.sampling}
-        dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+        dispatch = handoff.create_dispatch(payload)
     except Exception:
         if token is not None:
-            manager.coordinator.release(token)
+            await handoff.close()
         raise
     snap = context = payload = None
     done = {}
@@ -1842,7 +1839,7 @@ async def api_generate_sync(req: GenerateSyncRequest):
             payload = context = None
             dispatch.release_from_worker()
 
-    task = await _handoff_thread_worker(manager.coordinator, token, stop_event, dispatch, lambda: worker)
+    task = await handoff.create_thread_task(lambda: worker)
     try:
         outcome_value = _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -1893,11 +1890,9 @@ def _make_token_neighbors_worker(dispatch):
 async def api_token_neighbors(req: NeighborsRequest):
     token = None
     stop_event = ThreadingEvent()
-    handoff = None
+    handoff = OperationHandoff(manager.coordinator, stop_event=stop_event)
     try:
-        token, snap = manager.coordinator.acquire(OperationType.MODEL_READ, requires_loaded=True)
-        handoff = OperationHandoff(manager.coordinator, token, stop_event)
-        handoff.set_heavy(snap=snap)
+        token, snap = handoff.acquire(OperationType.MODEL_READ, requires_loaded=True)
         bundle = snap.bundle
         meta_copy = dict(bundle.meta)
         key = (snap.model_session_id, meta_copy.get("model_id"), meta_copy.get("revision"))
@@ -1910,20 +1905,19 @@ async def api_token_neighbors(req: NeighborsRequest):
         detail = str(exc)
         if handoff is not None:
             handoff.clear_heavy()
-            manager.coordinator.release(token)
+            await handoff.close()
         elif token is not None:
-            manager.coordinator.release(token)
+            await handoff.close()
         raise HTTPException(500, detail) from None
     try:
         payload = {"bundle": bundle, "key": key, "token_ids": req.token_ids[:64], "k": req.k}
-        dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
-        handoff.set_dispatch(dispatch)
+        dispatch = handoff.create_dispatch(payload)
     except Exception as exc:
         detail = str(exc)
         if handoff is not None:
             handoff.clear_heavy()
         if token is not None:
-            manager.coordinator.release(token)
+            await handoff.close()
         raise HTTPException(500, detail) from None
     snap = bundle = payload = None
 
@@ -2055,8 +2049,9 @@ def api_fit_stop():
 async def api_lens_pin(req: PinRequest):
     token = None
     stop_event = ThreadingEvent()
+    handoff = OperationHandoff(manager.coordinator, stop_event=stop_event)
     try:
-        token, snap = manager.coordinator.acquire(OperationType.MODEL_READ, requires_loaded=True)
+        token, snap = handoff.acquire(OperationType.MODEL_READ, requires_loaded=True)
         jl = snap.bundle.jl
     except OperationConflict as exc:
         raise _conflict(exc)
@@ -2066,10 +2061,10 @@ async def api_lens_pin(req: PinRequest):
         if req.generation_run_id is None:
             raise HTTPException(409, "generation run identity is required; residual capture may have expired")
         payload = {"jl": jl, "gen_id": req.gen_id, "generation_run_id": req.generation_run_id, "token_ids": req.token_ids}
-        dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+        dispatch = handoff.create_dispatch(payload)
     except Exception:
         if token is not None:
-            manager.coordinator.release(token)
+            await handoff.close()
         raise
     snap = jl = payload = None
 
@@ -2091,7 +2086,7 @@ async def api_lens_pin(req: PinRequest):
             payload = result = None
             dispatch.release_from_worker()
 
-    task = await _handoff_thread_worker(manager.coordinator, token, stop_event, dispatch, lambda: worker)
+    task = await handoff.create_thread_task(lambda: worker)
     try:
         return _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -2724,9 +2719,19 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
         messages=messages, sampling=req.get("sampling", {}), stop_event=stop_event, emit=emit_inner, lens=gen_context,
         ablator=interventions if gen_context.intervention_snapshot.get("rules") else None,
         continue_final=True,
+        capture_full_input_frames=lens is not None,
     )
     old_content = expected_content
     appended = done_holder.get("text", "")
+    if not appended:
+        emit(dict(
+            done_holder,
+            conversation_id=msg["conversation_id"],
+            message_id=message_id,
+            text=old_content,
+            continued=False,
+        ))
+        return
     new_content = old_content + appended
     previous_meta = json.loads(expected_meta) if expected_meta else {}
     meta = _continuation_metadata(
@@ -2790,12 +2795,14 @@ async def _run_chat(ws, req):
     loop = asyncio.get_running_loop()
     queue = asyncio.Queue()
     stop_event = ThreadingEvent()
+    handoff = OperationHandoff(manager.coordinator, stop_event=stop_event)
+    token = snap = context = dispatch = None
 
     def emit(frame):
         loop.call_soon_threadsafe(queue.put_nowait, frame)
 
     try:
-        token, snap = manager.coordinator.acquire(OperationType.GENERATE, requires_loaded=True)
+        token, snap = handoff.acquire(OperationType.GENERATE, requires_loaded=True)
         context = _captured_generation_context(token, snap, stop_event)
         if not req.get("lens"):
             context = GenerationContext(
@@ -2812,16 +2819,16 @@ async def _run_chat(ws, req):
         return
     except Exception as exc:
         if token is not None:
-            manager.coordinator.release(token)
+            await handoff.close()
         await _ws_send(ws, json.dumps({"type": "error", "message": str(exc)}))
         return
 
     try:
         payload = {"context": context, "request": dict(req)}
-        dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
+        dispatch = handoff.create_dispatch(payload)
     except Exception as exc:
         if token is not None:
-            manager.coordinator.release(token)
+            await handoff.close()
         await _ws_send(ws, json.dumps({"type": "error", "message": str(exc)}))
         return
     snap = context = payload = None
@@ -2846,7 +2853,7 @@ async def _run_chat(ws, req):
             payload = context = request = None
             dispatch.release_from_worker()
 
-    worker = await _handoff_thread_worker(manager.coordinator, token, stop_event, dispatch, lambda: worker_body)
+    worker = await handoff.create_thread_task(lambda: worker_body)
     try:
         receiver = asyncio.create_task(_watch_stop(ws, stop_event))
     except Exception as exc:

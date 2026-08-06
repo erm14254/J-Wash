@@ -723,6 +723,16 @@ class Store:
     def _pack_frames_blob(frames, layers, k, descriptor=None):
         vocab = {}
         packed = []
+        run_ids = {frame.get("generation_run_id") for frame in frames}
+        archive_version = 2 if not frames or run_ids == {None} else 3
+        if archive_version == 3 and (
+            len(run_ids) != 1
+            or next(iter(run_ids)) is None
+            or not isinstance(next(iter(run_ids)), str)
+            or len(next(iter(run_ids))) != 32
+            or any(ch not in "0123456789abcdef" for ch in next(iter(run_ids)))
+        ):
+            raise FrameStorageError("schema-v3 frames require one valid generation run id")
         for frame in frames:
             vocab[frame["token_id"]] = frame["tok"]
             entry = {
@@ -747,7 +757,7 @@ class Store:
                 }
             packed.append(entry)
         return msgpack.packb({
-            "version": 3,
+            "version": archive_version,
             "k": k,
             "descriptor": dict(descriptor) if descriptor is not None else None,
             "layers": [int(l) for l in layers],
@@ -914,6 +924,7 @@ class Store:
                 raise ValueError("invalid frame archive vocabulary")
             frames = []
             last_pos = -1
+            archive_run_id = None
             for entry in data["frames"]:
                 if not isinstance(entry, dict) or not isinstance(entry.get("layers"), dict):
                     raise ValueError("invalid frame entry")
@@ -943,12 +954,17 @@ class Store:
                 ):
                     raise ValueError("invalid frame generation index")
                 generation_run_id = entry.get("generation_run_id") if archive_version >= 3 else None
-                if generation_run_id is not None and (
+                if archive_version >= 3 and (
                     not isinstance(generation_run_id, str)
                     or len(generation_run_id) != 32
                     or any(ch not in "0123456789abcdef" for ch in generation_run_id)
                 ):
                     raise ValueError("invalid frame generation run id")
+                if archive_version >= 3:
+                    if archive_run_id is None:
+                        archive_run_id = generation_run_id
+                    elif generation_run_id != archive_run_id:
+                        raise ValueError("inconsistent frame generation run id")
                 frame = {
                     "type": "frame",
                     "phase": entry["phase"],

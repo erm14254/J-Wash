@@ -660,7 +660,7 @@ class ModelManager:
 
     @torch.no_grad()
     def generate(self, messages, sampling, stop_event, emit, lens=None, ablator=None,
-                 continue_final=False):
+                 continue_final=False, capture_full_input_frames=False):
         """``continue_final=True``: the last message is an assistant reply to
         EXTEND — the template leaves its turn open instead of starting a new
         one, and the model picks up where it stopped."""
@@ -729,7 +729,7 @@ class ModelManager:
             if lens is not None and lens.lens is not None:
                 reader = ActivationCatcher(jl.layers, lens.layers)
                 gen_id = lens.start_gen(generation_run_id=generation_run_id)
-                if len(messages) > 1 and any(m["role"] != "system" for m in messages[:-1]):
+                if not capture_full_input_frames and len(messages) > 1 and any(m["role"] != "system" for m in messages[:-1]):
                     prev = tokenizer.apply_chat_template(
                         messages[:-1],
                         add_generation_prompt=False,
@@ -757,11 +757,6 @@ class ModelManager:
                 if (meta or {}).get("chat_template_fallback")
                 else []
             )
-            stop_token_seqs = [
-                tuple(tokenizer.encode(stop, add_special_tokens=False))
-                for stop in stop_seqs
-            ]
-            stop_token_seqs = [seq for seq in stop_token_seqs if seq]
             hidden_special_ids = set(getattr(tokenizer, "all_special_ids", ()) or ())
 
             out = hf_model(input_ids=input_ids, use_cache=True)
@@ -826,25 +821,27 @@ class ModelManager:
                     stop_reason = "hidden_special_token"
                     break
                 reply_ids.append(next_id)
-                matched_stop = next((
-                    seq for seq in stop_token_seqs
-                    if len(reply_ids) >= len(seq) and tuple(reply_ids[-len(seq):]) == seq
-                ), None)
-                if matched_stop is not None:
-                    del reply_ids[-len(matched_stop):]
+                decoded_reply = tokenizer.decode(reply_ids, skip_special_tokens=True)
+                matched_marker = next((marker for marker in stop_seqs if decoded_reply.endswith(marker)), None)
+                if matched_marker is not None:
+                    marker_tokens = 1
+                    for suffix_len in range(1, len(reply_ids) + 1):
+                        suffix_text = tokenizer.decode(reply_ids[-suffix_len:], skip_special_tokens=True)
+                        if suffix_text.endswith(matched_marker):
+                            marker_tokens = suffix_len
+                            break
+                    del reply_ids[-marker_tokens:]
                     stop_reason = "fallback_stop_sequence"
                     break
                 if penalty_ids is not None:
                     penalty_ids = torch.cat(
                         [penalty_ids, torch.tensor([next_id], device=penalty_ids.device)]
                     )
-                held_stop_prefix = max((
-                    prefix_len
-                    for seq in stop_token_seqs
-                    for prefix_len in range(1, len(seq))
-                    if len(reply_ids) >= prefix_len
-                    and tuple(reply_ids[-prefix_len:]) == seq[:prefix_len]
-                ), default=0)
+                held_stop_prefix = 0
+                for suffix_len in range(1, len(reply_ids) + 1):
+                    suffix_text = tokenizer.decode(reply_ids[-suffix_len:], skip_special_tokens=True)
+                    if any(marker.startswith(suffix_text) and suffix_text != marker for marker in stop_seqs):
+                        held_stop_prefix = suffix_len
                 visible_ids = reply_ids[:-held_stop_prefix] if held_stop_prefix else reply_ids
                 text = tokenizer.decode(visible_ids, skip_special_tokens=True)
                 if not text.endswith("�") and len(text) > len(emitted):

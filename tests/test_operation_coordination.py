@@ -1153,6 +1153,33 @@ def test_load_frames_rejects_semantic_archive_corruption(tmp_path, monkeypatch):
             s.load_frames(mid)
 
 
+@pytest.mark.parametrize("run_id", ["__missing__", None, "", "A" * 32, "g" * 32, "1" * 31, 7])
+def test_schema_v3_requires_one_valid_homogeneous_run_id(tmp_path, monkeypatch, run_id):
+    import msgpack
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c")
+    mid = s.add_message(cid, None, "assistant", "T")
+    frame = _frame(0, "reading", "0")
+    frame["generation_run_id"] = "1" * 32
+    blob = msgpack.unpackb(store_mod.Store._pack_frames_blob([frame], [0], 1), strict_map_key=False)
+    if run_id == "__missing__":
+        del blob["frames"][0]["generation_run_id"]
+    else:
+        blob["frames"][0]["generation_run_id"] = run_id
+    store_mod.FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+    path = store_mod.FRAMES_DIR / "bad-run.msgpack"
+    path.write_bytes(msgpack.packb(blob, use_bin_type=True))
+    conn = s._conn()
+    conn.execute("UPDATE messages SET frames_file = ?, version = version + 1 WHERE id = ?", (path.name, mid))
+    conn.commit()
+    with pytest.raises(store_mod.FrameStorageError):
+        s.load_frames(mid)
+
+
 def test_persisted_continue_drops_overlapping_reread_frames_and_reloads(tmp_path, monkeypatch):
     from api import app
     from core import store as store_mod
@@ -1182,6 +1209,7 @@ def test_persisted_continue_drops_overlapping_reread_frames_and_reloads(tmp_path
     emitted = []
 
     def generate_first(**kwargs):
+        assert kwargs["capture_full_input_frames"] is True
         run_id = "2" * 32
         kwargs["emit"]({"type": "frame", **_frame(1, "reading", "0"), "generation_run_id": run_id})
         new_frame = _frame(2, "thinking", "0")
@@ -1228,6 +1256,7 @@ def test_persisted_continue_rejects_incompatible_frame_configuration(tmp_path, m
     before = s.get_message(mid)
 
     def generate(**kwargs):
+        assert kwargs["capture_full_input_frames"] is True
         kwargs["emit"]({"type": "frame", **_frame(1, "thinking", "0")})
         kwargs["emit"]({"type": "done", "text": " plus", "meta": {}, "stats": {}, "stopped": False, "continuation_suffix_start_pos": 1, "continuation_suffix_end_pos": 2})
 
@@ -1381,7 +1410,7 @@ def test_operation_handoff_acquire_rolls_back_snapshot_registration_failure(monk
     coordinator = ModelSessionCoordinator()
     handoff = app.OperationHandoff(coordinator, stop_event=threading.Event())
     monkeypatch.setattr(handoff, "set_heavy", lambda **_refs: (_ for _ in ()).throw(MemoryError("injected")))
-    with pytest.raises(MemoryError):
+    with pytest.raises(RuntimeError, match="MemoryError: injected"):
         handoff.acquire(OperationType.GENERATE)
     assert coordinator.status_snapshot().operation is None
     assert handoff.state is app.HandoffState.CLOSED
@@ -1398,3 +1427,34 @@ def test_operation_handoff_close_before_dispatch_is_idempotent():
     asyncio.run(handoff.close())
     assert coordinator.status_snapshot().operation is None
     assert handoff.state is app.HandoffState.CLOSED
+
+
+def test_first_party_pin_calls_propagate_generation_run_identity():
+    from pathlib import Path
+
+    root = Path(__file__).parents[1] / "ui" / "src"
+    lens_view = (root / "LensView.jsx").read_text(encoding="utf-8")
+    editor = (root / "Editor.jsx").read_text(encoding="utf-8")
+    app_source = (root / "App.jsx").read_text(encoding="utf-8")
+    assert "generation_run_id: generationRunId" in lens_view
+    assert "generation_run_id: generationRunId" in editor
+    assert "generationRunId={viewRunId" in app_source
+    assert "generationRunId={currentGenView().generationRunId}" in app_source
+
+
+def test_dispatched_routes_use_one_preacquisition_handoff():
+    import inspect
+    from api import app
+
+    routes = (
+        app.api_delete_model, app.api_lens_load, app.api_edit_export,
+        app.api_edit_export_gguf, app.api_generate_sync, app.api_token_neighbors,
+        app.api_lens_pin, app._run_chat,
+    )
+    for route in routes:
+        source = inspect.getsource(route)
+        assert "OperationHandoff(" in source, route.__name__
+        assert "handoff.acquire(" in source, route.__name__
+        assert "handoff.create_dispatch(" in source, route.__name__
+        assert "manager.coordinator.acquire(" not in source, route.__name__
+        assert "_handoff_thread_worker" not in source, route.__name__

@@ -472,7 +472,8 @@ export default function App() {
         setMessages((prev) => prev.map((m) => (m.id === frame.message_id
           ? {
               ...m, content: frame.text, stats: frame.stats,
-              gen_id: frame.gen_id, has_frames: m.has_frames || frames.length > 0,
+              gen_id: frame.gen_id, generation_run_id: frame.generation_run_id,
+              has_frames: m.has_frames || frames.length > 0,
               frames: undefined,
             }
           : m)))
@@ -493,6 +494,7 @@ export default function App() {
           meta: frame.meta,
           stats: frame.stats,
           gen_id: frame.gen_id,
+          generation_run_id: frame.generation_run_id,
           has_frames: frames.length > 0,
           frames,
         }])
@@ -849,7 +851,14 @@ export default function App() {
       ? messages[idx].gen_id ?? messages[idx].frames[messages[idx].frames.length - 1]?.gen ?? null
       : null
     const genId = live ? live[live.length - 1]?.gen ?? null : msgGen
-    return { live, idx, genId }
+    const msgRunId = idx >= 0
+      ? messages[idx].generation_run_id
+        ?? messages[idx].frames[messages[idx].frames.length - 1]?.generation_run_id ?? null
+      : null
+    const generationRunId = live
+      ? live[live.length - 1]?.generation_run_id ?? null
+      : msgRunId
+    return { live, idx, genId, generationRunId }
   }
 
   async function applyCapture() {
@@ -1708,7 +1717,7 @@ export default function App() {
             onClose={() => setDiffSel([])}
           />
         ) : lensMeta && lensOn || messages.some((m) => m.frames?.length) ? (() => {
-          const { live, idx, genId: viewGen } = currentGenView()
+          const { live, idx, genId: viewGen, generationRunId: viewRunId } = currentGenView()
           const viewFrames = live || (idx >= 0 ? messages[idx].frames : [])
           // keep LensView MOUNTED even with no frames (it renders an empty
           // shell): unmounting here would wipe the pinned tokens, e.g. while
@@ -1723,6 +1732,7 @@ export default function App() {
                 frames={viewFrames}
                 tick={`${framesCount}-${messages.length}-${idx}`}
                 genId={viewGen ?? null}
+                generationRunId={viewRunId ?? null}
                 lensMeta={lensMeta}
                 hidden={hidden}
                 onHideToken={hideToken}
@@ -1790,6 +1800,7 @@ export default function App() {
         lensMeta={lensMeta}
         nLayers={status?.loaded?.n_layers}
         genId={currentGenView().genId}
+        generationRunId={currentGenView().generationRunId}
         busy={busy}
         prefill={editorPrefill}
         onPrefillConsumed={() => setEditorPrefill(null)}
