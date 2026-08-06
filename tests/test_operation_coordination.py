@@ -7,7 +7,12 @@ import pytest
 
 from core.ablation import HookAttachment
 from core.editing import PublicationCancelled, PublicationGate
-from core.model_session import ModelSessionCoordinator, OperationConflict, OperationType
+from core.model_session import (
+    LoadedModelBundle,
+    ModelSessionCoordinator,
+    OperationConflict,
+    OperationType,
+)
 
 
 class Handle:
