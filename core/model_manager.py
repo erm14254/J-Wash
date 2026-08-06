@@ -3,6 +3,7 @@ import json
 import os
 import threading
 import time
+import uuid
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -724,9 +725,10 @@ class ModelManager:
 
             read_from = 0
             gen_id = None
+            generation_run_id = uuid.uuid4().hex
             if lens is not None and lens.lens is not None:
                 reader = ActivationCatcher(jl.layers, lens.layers)
-                gen_id = lens.start_gen()
+                gen_id = lens.start_gen(generation_run_id=generation_run_id)
                 if len(messages) > 1 and any(m["role"] != "system" for m in messages[:-1]):
                     prev = tokenizer.apply_chat_template(
                         messages[:-1],
@@ -755,6 +757,12 @@ class ModelManager:
                 if (meta or {}).get("chat_template_fallback")
                 else []
             )
+            stop_token_seqs = [
+                tuple(tokenizer.encode(stop, add_special_tokens=False))
+                for stop in stop_seqs
+            ]
+            stop_token_seqs = [seq for seq in stop_token_seqs if seq]
+            hidden_special_ids = set(getattr(tokenizer, "all_special_ids", ()) or ())
 
             out = hf_model(input_ids=input_ids, use_cache=True)
             cache = out.past_key_values
@@ -798,10 +806,12 @@ class ModelManager:
                     gen_id=gen_id,
                 )
                 for frame in reading_frames:
+                    frame["generation_run_id"] = generation_run_id
                     emit(frame)
 
             reply_ids = []
             emitted = ""
+            stop_reason = None
             started = time.perf_counter()
             penalty_ids = input_ids[0].to(logits.device) if repetition_penalty != 1.0 else None
             for _ in range(max_tokens):
@@ -810,21 +820,36 @@ class ModelManager:
                 next_id = _sample(logits[0].float(), temperature, top_p, top_k, generator,
                                   repetition_penalty, penalty_ids)
                 if next_id in eos_ids:
+                    stop_reason = "eos"
+                    break
+                if next_id in hidden_special_ids:
+                    stop_reason = "hidden_special_token"
                     break
                 reply_ids.append(next_id)
+                matched_stop = next((
+                    seq for seq in stop_token_seqs
+                    if len(reply_ids) >= len(seq) and tuple(reply_ids[-len(seq):]) == seq
+                ), None)
+                if matched_stop is not None:
+                    del reply_ids[-len(matched_stop):]
+                    stop_reason = "fallback_stop_sequence"
+                    break
                 if penalty_ids is not None:
                     penalty_ids = torch.cat(
                         [penalty_ids, torch.tensor([next_id], device=penalty_ids.device)]
                     )
-                text = tokenizer.decode(reply_ids, skip_special_tokens=True)
-                stop_hit = next((s for s in stop_seqs if s in text), None)
-                if stop_hit:
-                    text = text[: text.index(stop_hit)]
+                held_stop_prefix = max((
+                    prefix_len
+                    for seq in stop_token_seqs
+                    for prefix_len in range(1, len(seq))
+                    if len(reply_ids) >= prefix_len
+                    and tuple(reply_ids[-prefix_len:]) == seq[:prefix_len]
+                ), default=0)
+                visible_ids = reply_ids[:-held_stop_prefix] if held_stop_prefix else reply_ids
+                text = tokenizer.decode(visible_ids, skip_special_tokens=True)
                 if not text.endswith("�") and len(text) > len(emitted):
                     emit({"type": "token", "text": text[len(emitted):]})
                     emitted = text
-                if stop_hit:
-                    break
                 out = hf_model(
                     input_ids=torch.tensor([[next_id]], device=_input_device(hf_model)),
                     past_key_values=cache,
@@ -842,31 +867,26 @@ class ModelManager:
                         gen_id=gen_id,
                         abs_positions=[input_ids.shape[1] + len(reply_ids) - 1],
                     )[0]
+                    frame["generation_run_id"] = generation_run_id
                     emit(frame)
 
             elapsed = time.perf_counter() - started
-            text = tokenizer.decode(reply_ids, skip_special_tokens=True)
-            for s in stop_seqs:
-                if s in text:
-                    text = text[: text.index(s)]
-                    break
-            # The continuation boundary is derived from the exact template input
-            # used by this run.  Consumers must not reconstruct it from decoded
-            # text or from an older frame archive: fallback stop trimming can
-            # remove a multi-token tail after frames for its prefix were captured.
-            durable_reply_tokens = 0
-            for prefix_len in range(len(reply_ids) + 1):
-                decoded_prefix = tokenizer.decode(
-                    reply_ids[:prefix_len], skip_special_tokens=True
-                )
-                if text.startswith(decoded_prefix):
-                    durable_reply_tokens = prefix_len
+            durable_reply_ids = tuple(int(token_id) for token_id in reply_ids)
+            text = tokenizer.decode(durable_reply_ids, skip_special_tokens=True)
+            durable_reply_tokens = len(durable_reply_ids)
+            if not text.endswith("�") and len(text) > len(emitted):
+                emit({"type": "token", "text": text[len(emitted):]})
+                emitted = text
             suffix_start_pos = int(input_ids.shape[1])
             emit(
                 {
                     "type": "done",
                     "text": text,
                     "gen_id": gen_id,
+                    "generation_run_id": generation_run_id,
+                    "durable_reply_token_ids": list(durable_reply_ids),
+                    "durable_generated_token_count": durable_reply_tokens,
+                    "stop_reason": stop_reason or ("cancelled" if stop_event.is_set() else "max_tokens"),
                     "generated_token_start_pos": suffix_start_pos,
                     "generated_token_end_pos": suffix_start_pos + durable_reply_tokens,
                     "continuation_suffix_start_pos": suffix_start_pos if continue_final else None,
@@ -892,6 +912,7 @@ class ModelManager:
                         interventions_active_summary=intervention_provenance["active_summary"] if intervention_provenance is not None else None,
                         intervention_provenance=intervention_provenance,
                         model_session_id=context.model_session_id if context is not None else None,
+                        generation_run_id=generation_run_id,
                     ),
                 }
             )

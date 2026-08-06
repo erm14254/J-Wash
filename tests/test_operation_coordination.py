@@ -689,14 +689,16 @@ def test_persisted_continue_merges_existing_production_phase_archive(tmp_path, m
     emitted = []
 
     def generate(**kwargs):
-        kwargs["emit"]({"type": "frame", **_frame(2, "thinking", "0")})
-        kwargs["emit"]({"type": "done", "text": " plus", "meta": {"model_id": "m"}, "stats": {}, "stopped": False, "continuation_suffix_start_pos": 2, "continuation_suffix_end_pos": 3})
+        run_id = "1" * 32
+        kwargs["emit"]({"type": "frame", **_frame(0, "reading", "0"), "generation_run_id": run_id})
+        kwargs["emit"]({"type": "frame", **_frame(2, "thinking", "0"), "generation_run_id": run_id})
+        kwargs["emit"]({"type": "done", "text": " plus", "meta": {"model_id": "m"}, "stats": {}, "stopped": False, "generation_run_id": run_id, "continuation_suffix_start_pos": 2, "continuation_suffix_end_pos": 3})
 
     monkeypatch.setattr(app.manager, "generate", generate)
     context = type("Ctx", (), {"lens": lens, "intervention_snapshot": {"rules": []}})()
     app._persisted_continue({}, mid, threading.Event(), emitted.append, context)
     loaded = s.load_frames(mid)
-    assert [frame["phase"] for frame in loaded["frames"]] == ["reading", "thinking", "thinking"]
+    assert [frame["phase"] for frame in loaded["frames"]] == ["reading", "thinking"]
     assert emitted[-1]["type"] == "done"
 
 
@@ -1180,32 +1182,35 @@ def test_persisted_continue_drops_overlapping_reread_frames_and_reloads(tmp_path
     emitted = []
 
     def generate_first(**kwargs):
-        kwargs["emit"]({"type": "frame", **_frame(1, "reading", "0")})
+        run_id = "2" * 32
+        kwargs["emit"]({"type": "frame", **_frame(1, "reading", "0"), "generation_run_id": run_id})
         new_frame = _frame(2, "thinking", "0")
         new_frame["gen"] = 20
+        new_frame["generation_run_id"] = run_id
         kwargs["emit"]({"type": "frame", **new_frame})
-        kwargs["emit"]({"type": "done", "text": " plus", "meta": {"model_id": "m"}, "stats": {}, "stopped": False, "continuation_suffix_start_pos": 2, "continuation_suffix_end_pos": 3})
+        kwargs["emit"]({"type": "done", "text": " plus", "meta": {"model_id": "m"}, "stats": {}, "stopped": False, "generation_run_id": run_id, "continuation_suffix_start_pos": 2, "continuation_suffix_end_pos": 3})
 
     monkeypatch.setattr(app.manager, "generate", generate_first)
     context = type("Ctx", (), {"lens": lens, "intervention_snapshot": {"rules": []}})()
     app._persisted_continue({}, mid, threading.Event(), emitted.append, context)
     loaded = s.load_frames(mid)
-    assert [frame["pos"] for frame in loaded["frames"]] == [0, 1, 2]
-    assert [frame["phase"] for frame in loaded["frames"]] == ["reading", "thinking", "thinking"]
-    assert [frame["gen"] for frame in loaded["frames"]] == [10, 10, 20]
+    assert [frame["pos"] for frame in loaded["frames"]] == [1, 2]
+    assert [frame["phase"] for frame in loaded["frames"]] == ["reading", "thinking"]
+    assert [frame["gen"] for frame in loaded["frames"]] == [None, 20]
 
     def generate_second(**kwargs):
-        kwargs["emit"]({"type": "frame", **_frame(2, "reading", "0")})
-        kwargs["emit"]({"type": "frame", **_frame(3, "thinking", "0")})
-        kwargs["emit"]({"type": "done", "text": " again", "meta": {"model_id": "m"}, "stats": {}, "stopped": False, "continuation_suffix_start_pos": 3, "continuation_suffix_end_pos": 4})
+        run_id = "3" * 32
+        kwargs["emit"]({"type": "frame", **_frame(2, "reading", "0"), "generation_run_id": run_id})
+        kwargs["emit"]({"type": "frame", **_frame(3, "thinking", "0"), "generation_run_id": run_id})
+        kwargs["emit"]({"type": "done", "text": " again", "meta": {"model_id": "m"}, "stats": {}, "stopped": False, "generation_run_id": run_id, "continuation_suffix_start_pos": 3, "continuation_suffix_end_pos": 4})
 
     monkeypatch.setattr(app.manager, "generate", generate_second)
     lens.binding_id = 99  # process-local identity is not archive compatibility
     app._persisted_continue({}, mid, threading.Event(), emitted.append, context)
     loaded = s.load_frames(mid)
-    assert [frame["pos"] for frame in loaded["frames"]] == [0, 1, 2, 3]
+    assert [frame["pos"] for frame in loaded["frames"]] == [2, 3]
     body, _ = s.export(cid, fmt="md", include_frames=True)
-    assert "4 lens frames" in body
+    assert "2 lens frames" in body
 
 
 def test_persisted_continue_rejects_incompatible_frame_configuration(tmp_path, monkeypatch):
@@ -1234,6 +1239,53 @@ def test_persisted_continue_rejects_incompatible_frame_configuration(tmp_path, m
     assert after["content"] == before["content"]
     assert after["version"] == before["version"]
     assert emitted[-1]["type"] == "error"
+
+
+def test_pointerless_framed_continuation_replaces_stale_frame_metadata(tmp_path, monkeypatch):
+    from api import app
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    monkeypatch.setattr(app, "store", s)
+    cid = s.create_conversation("c")
+    mid = s.add_message(cid, None, "assistant", "old", meta={
+        "publication_state": "frames_publication_failed",
+        "frames_expected": False,
+        "frames_invalidated": True,
+        "frames_invalidation_reason": "edited",
+        "frames_error_kind": "write",
+        "frames_error": "old failure",
+    })
+    lens_meta = {"path": "/lens", "model_id": "m", "model_revision": "r", "fitted_layers_all": [0], "tapped_layers": [0], "k": 1}
+    lens = type("Lens", (), {"layers": [0], "k": 1, "binding_id": 9, "meta": lens_meta})()
+    run_id = "4" * 32
+
+    def generate(**kwargs):
+        kwargs["emit"]({"type": "frame", **_frame(0, "reading", "0"), "generation_run_id": run_id})
+        kwargs["emit"]({"type": "frame", **_frame(1, "thinking", "0"), "generation_run_id": run_id})
+        kwargs["emit"]({
+            "type": "done", "text": " plus", "meta": {}, "stats": {}, "stopped": False,
+            "generation_run_id": run_id,
+            "continuation_suffix_start_pos": 1, "continuation_suffix_end_pos": 2,
+        })
+
+    monkeypatch.setattr(app.manager, "generate", generate)
+    emitted = []
+    context = type("Ctx", (), {"lens": lens, "intervention_snapshot": {"rules": []}})()
+    app._persisted_continue({}, mid, threading.Event(), emitted.append, context)
+
+    current = s.get_message(mid)
+    assert current["frames_file"] is not None
+    meta = current["meta"] if isinstance(current["meta"], dict) else json.loads(current["meta"])
+    assert meta["publication_state"] == "complete"
+    assert meta["frames_expected"] is True
+    for stale in ("frames_invalidated", "frames_invalidation_reason", "frames_error_kind", "frames_error"):
+        assert stale not in meta
+    loaded = s.load_frames(mid)
+    assert loaded["version"] == 3
+    assert [frame["generation_run_id"] for frame in loaded["frames"]] == [run_id, run_id]
 
 
 def test_lens_disabled_continuation_invalidates_existing_frames(tmp_path, monkeypatch):

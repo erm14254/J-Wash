@@ -730,6 +730,7 @@ class Store:
                 "phase": frame["phase"],
                 "token_id": frame["token_id"],
                 "gen": frame.get("gen"),
+                "generation_run_id": frame.get("generation_run_id"),
                 "layers": {},
             }
             for layer, d in frame["layers"].items():
@@ -746,7 +747,7 @@ class Store:
                 }
             packed.append(entry)
         return msgpack.packb({
-            "version": 2,
+            "version": 3,
             "k": k,
             "descriptor": dict(descriptor) if descriptor is not None else None,
             "layers": [int(l) for l in layers],
@@ -891,7 +892,7 @@ class Store:
 
     def _decode_frames_data(self, data, message_id):
         try:
-            if not isinstance(data, dict) or data.get("version") not in (1, 2):
+            if not isinstance(data, dict) or data.get("version") not in (1, 2, 3):
                 raise ValueError("unsupported frame archive version")
             archive_version = data["version"]
             descriptor = data.get("descriptor") if archive_version >= 2 else None
@@ -941,6 +942,13 @@ class Store:
                     isinstance(frame_gen, bool) or not isinstance(frame_gen, int) or frame_gen < 0
                 ):
                     raise ValueError("invalid frame generation index")
+                generation_run_id = entry.get("generation_run_id") if archive_version >= 3 else None
+                if generation_run_id is not None and (
+                    not isinstance(generation_run_id, str)
+                    or len(generation_run_id) != 32
+                    or any(ch not in "0123456789abcdef" for ch in generation_run_id)
+                ):
+                    raise ValueError("invalid frame generation run id")
                 frame = {
                     "type": "frame",
                     "phase": entry["phase"],
@@ -948,6 +956,7 @@ class Store:
                     "token_id": entry["token_id"],
                     "tok": vocab.get(str(entry["token_id"]), ""),
                     "gen": frame_gen,
+                    "generation_run_id": generation_run_id,
                     "layers": {},
                 }
                 for layer, d in normalized_layers.items():

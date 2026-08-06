@@ -537,6 +537,7 @@ class LensLayersRequest(BaseModel):
 
 class PinRequest(BaseModel):
     gen_id: int
+    generation_run_id: str | None = None
     token_ids: list[int]
 
 
@@ -846,9 +847,10 @@ async def api_lens_load(req: LensLoadRequest):
     def worker():
         if not dispatch.claim():
             return _worker_success()
-        payload = dispatch.take_payload()
+        payload = None
         old_state = None
         try:
+            payload = dispatch.take_payload()
             try:
                 old_state = lens_manager.state_record()
                 result = lens_manager.load(
@@ -1393,8 +1395,9 @@ async def api_edit_export(req: ExportRequest):
     def worker():
         if not dispatch.claim():
             return _worker_success()
-        payload = dispatch.take_payload()
+        payload = None
         try:
+            payload = dispatch.take_payload()
             try:
                 call_kwargs = dict(payload["kwargs"])
                 if payload["export_fn"] is editing.export_rebase:
@@ -1685,8 +1688,9 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
         def bake_worker():
             if not dispatch.claim():
                 return _worker_success()
-            payload = dispatch.take_payload()
+            payload = None
             try:
+                payload = dispatch.take_payload()
                 try:
                     call_kwargs = dict(payload["kwargs"])
                     if payload["export_fn"] is editing.export_rebase:
@@ -1810,8 +1814,9 @@ async def api_generate_sync(req: GenerateSyncRequest):
         global _generation_counter
         if not dispatch.claim():
             return _worker_success()
-        payload = dispatch.take_payload()
+        payload = None
         try:
+            payload = dispatch.take_payload()
             try:
                 context = payload["context"]
                 manager.generate(
@@ -1867,8 +1872,9 @@ def _make_token_neighbors_worker(dispatch):
     def worker():
         if not dispatch.claim():
             return _worker_success()
-        payload = dispatch.take_payload()
+        payload = None
         try:
+            payload = dispatch.take_payload()
             try:
                 result = neighbors.lookup(
                     payload["bundle"].jl, payload["bundle"].tokenizer,
@@ -2057,7 +2063,9 @@ async def api_lens_pin(req: PinRequest):
     except ModelStateError as exc:
         raise HTTPException(422, str(exc))
     try:
-        payload = {"jl": jl, "gen_id": req.gen_id, "token_ids": req.token_ids}
+        if req.generation_run_id is None:
+            raise HTTPException(409, "generation run identity is required; residual capture may have expired")
+        payload = {"jl": jl, "gen_id": req.gen_id, "generation_run_id": req.generation_run_id, "token_ids": req.token_ids}
         dispatch = WorkerDispatch(manager.coordinator, token, stop_event, payload=payload)
     except Exception:
         if token is not None:
@@ -2068,10 +2076,14 @@ async def api_lens_pin(req: PinRequest):
     def worker():
         if not dispatch.claim():
             return _worker_success()
-        payload = dispatch.take_payload()
+        payload = None
         try:
+            payload = dispatch.take_payload()
             try:
-                result = lens_manager.pin_ranks(payload["gen_id"], payload["token_ids"], payload["jl"])
+                result = lens_manager.pin_ranks(
+                    payload["gen_id"], payload["token_ids"], payload["jl"],
+                    generation_run_id=payload["generation_run_id"],
+                )
                 return _worker_success(result)
             except Exception as exc:
                 return _worker_failure(exc)
@@ -2633,34 +2645,40 @@ def _frames_lens_signature(lens, layers, k):
     }
 
 
-def _merge_continuation_frames(existing_archive, new_frames, layers, k, previous_meta, lens, suffix_start, suffix_end):
+def _validate_frame_descriptor(existing_archive, lens, layers, k):
     if existing_archive["layers"] != [int(l) for l in layers] or existing_archive["k"] != int(k):
         raise ValueError("continuation lens frame configuration changed")
-    saved_descriptor = existing_archive.get("descriptor")
-    current_descriptor = _frame_descriptor(lens, layers, k)
-    if saved_descriptor is None:
+    saved = existing_archive.get("descriptor")
+    current = _frame_descriptor(lens, layers, k)
+    if saved is None:
         raise ValueError("existing frame archive has unknown lens/model provenance")
-    if _lens_descriptor_mismatch(saved_descriptor, current_descriptor) or saved_descriptor.get("archive_layers") != current_descriptor.get("archive_layers"):
+    if _lens_descriptor_mismatch(saved, current) or saved.get("archive_layers") != current.get("archive_layers"):
         raise ValueError("continuation lens/model frame provenance changed")
+
+
+def _finalize_continuation_frames(new_frames, suffix_start, suffix_end, generation_run_id):
     if isinstance(suffix_start, bool) or not isinstance(suffix_start, int) or suffix_start < 0:
         raise ValueError("continuation did not provide an exact suffix boundary")
     if isinstance(suffix_end, bool) or not isinstance(suffix_end, int) or suffix_end < suffix_start:
         raise ValueError("continuation provided an invalid suffix end boundary")
-    old_frames = list(existing_archive["frames"] or [])
     positions = [frame.get("pos") for frame in new_frames]
     if any(isinstance(pos, bool) or not isinstance(pos, int) or pos < 0 for pos in positions):
         raise ValueError("continuation emitted an invalid frame position")
     if any(left >= right for left, right in zip(positions, positions[1:])):
         raise ValueError("continuation emitted duplicate or decreasing frame positions")
-    retained_old = [frame for frame in old_frames if frame.get("pos", -1) < suffix_start]
-    retained_new = [
+    finalized = [
         frame for frame in new_frames
-        if frame.get("phase") in ("thinking", "gen") and suffix_start <= frame["pos"] < suffix_end
+        if (
+            frame.get("phase") in ("reading", "prompt") and frame["pos"] < suffix_start
+        ) or (
+            frame.get("phase") in ("thinking", "gen") and suffix_start <= frame["pos"] < suffix_end
+        )
     ]
-    merged = retained_old + retained_new
-    if any(merged[i].get("pos") >= merged[i + 1].get("pos") for i in range(len(merged) - 1)):
-        raise ValueError("continuation frames are not ordered after merge")
-    return merged
+    if any(frame.get("generation_run_id") != generation_run_id for frame in finalized):
+        raise ValueError("continuation frames do not belong to the current generation run")
+    if any(finalized[i].get("pos") >= finalized[i + 1].get("pos") for i in range(len(finalized) - 1)):
+        raise ValueError("continuation frames are not ordered after finalization")
+    return finalized
 
 
 def _persisted_continue(req, message_id, stop_event, emit, gen_context):
@@ -2680,6 +2698,19 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
     k_used = lens.k if lens is not None else 0
     frames_acc = []
     done_holder = {}
+    existing_archive = None
+
+    # Descriptor and storage compatibility are checked before generation emits
+    # any user-visible token or frame.  The final CAS still protects against a
+    # writer changing the row after this preflight.
+    if msg.get("frames_file"):
+        try:
+            existing_archive = store.load_frames(message_id)
+            if lens is not None:
+                _validate_frame_descriptor(existing_archive, lens, layers_used, k_used)
+        except Exception as exc:
+            emit({"type": "error", "message": f"could not preflight existing frames; continuation not started: {exc}"})
+            return
 
     def emit_inner(frame):
         if frame["type"] == "done":
@@ -2705,25 +2736,24 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
     merged = None
     clear_frames = False
     if frames_acc:
+        for stale_key in (
+            "frames_invalidated", "frames_invalidation_reason", "frames_error_kind",
+            "frames_error", "frames_pending",
+        ):
+            meta.pop(stale_key, None)
+        meta.update(publication_state="complete", frames_expected=True)
         meta.update(_frames_lens_signature(lens, layers_used, k_used))
-        merged = frames_acc
-        if msg.get("frames_file"):
-            try:
-                existing_archive = store.load_frames(message_id)
-                merged = _merge_continuation_frames(
-                    existing_archive, frames_acc, layers_used, k_used, previous_meta, lens,
-                    done_holder.get("continuation_suffix_start_pos"),
-                    done_holder.get("continuation_suffix_end_pos"),
-                )
-            except Exception as exc:
-                emit({"type": "error", "message": f"could not merge existing frames; continuation not persisted: {exc}"})
-                return
-    elif msg.get("frames_file") and lens is None:
         try:
-            store.load_frames(message_id)
+            merged = _finalize_continuation_frames(
+                frames_acc,
+                done_holder.get("continuation_suffix_start_pos"),
+                done_holder.get("continuation_suffix_end_pos"),
+                done_holder.get("generation_run_id"),
+            )
         except Exception as exc:
-            emit({"type": "error", "message": f"could not load existing frames; continuation not persisted: {exc}"})
+            emit({"type": "error", "message": f"could not finalize continuation frames; continuation not persisted: {exc}"})
             return
+    elif msg.get("frames_file") and lens is None:
         clear_frames = True
         meta.update(
             frames_expected=False,
@@ -2799,8 +2829,9 @@ async def _run_chat(ws, req):
     def worker_body():
         if not dispatch.claim():
             return _worker_success()
-        payload = dispatch.take_payload()
+        payload = None
         try:
+            payload = dispatch.take_payload()
             try:
                 request = payload["request"]
                 context = payload["context"]

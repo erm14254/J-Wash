@@ -120,8 +120,8 @@ class LensGenerationView:
         self.binding_id = manager.binding_id
         self.model_session_id = manager.model_session_id
 
-    def start_gen(self):
-        return self._manager.start_gen()
+    def start_gen(self, generation_run_id=None):
+        return self._manager.start_gen(generation_run_id=generation_run_id)
 
     def compute_frames(self, acts, positions, phase, jl, token_ids, gen_id=None, abs_positions=None, chunk=None):
         old_layers, old_k, old_mask, old_J = self._manager.layers, self._manager.k, self._manager.mask, self._manager._J
@@ -347,9 +347,10 @@ class LensManager:
                 first_error = exc
         return first_error
 
-    def start_gen(self):
+    def start_gen(self, generation_run_id=None):
         gen_id = next(self._gen_counter)
         self.gen_store[gen_id] = {
+            "generation_run_id": generation_run_id,
             "model_session_id": self.model_session_id,
             "lens_binding_id": self.binding_id,
             "layers": list(self.layers),
@@ -363,12 +364,14 @@ class LensManager:
         return gen_id
 
     @torch.no_grad()
-    def pin_ranks(self, gen_id, token_ids, jl, chunk=32):
+    def pin_ranks(self, gen_id, token_ids, jl, chunk=32, generation_run_id=None):
         store = self.gen_store.get(gen_id)
         if store is not None and (store.get("model_session_id") != self.model_session_id or store.get("lens_binding_id") != self.binding_id):
             store = None
         if store is None:
             raise ValueError("unknown generation (residual store expired)")
+        if generation_run_id is None or store.get("generation_run_id") != generation_run_id:
+            raise ValueError("generation run identity is missing or no longer current")
         layers = store["layers"]
         device = self._J.device
         tids = torch.tensor(token_ids, dtype=torch.long, device=device)
@@ -396,6 +399,7 @@ class LensManager:
                 pins[int(t)]["p"].append(layer_p[int(t)])
         return {
             "gen_id": gen_id,
+            "generation_run_id": store["generation_run_id"],
             "layers": [int(l) for l in layers],
             "positions": store["positions"],
             "phases": store["phases"],
