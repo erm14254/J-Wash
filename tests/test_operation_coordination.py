@@ -241,7 +241,10 @@ def test_dispatched_routes_use_handoff_scope_and_factory_descriptors():
     )
     for route in routes:
         source = inspect.getsource(route)
-        assert "async with handoff.awaiter_scope()" in source
+        assert (
+            "async with handoff.awaiter_scope()" in source
+            or "async with OperationHandoff.acquire_scope(" in source
+        )
         assert "create_thread_task(lambda" not in source
 
 
@@ -1573,8 +1576,8 @@ def test_dispatched_routes_use_one_preacquisition_handoff():
     )
     for route in routes:
         source = inspect.getsource(route)
-        assert "OperationHandoff(" in source, route.__name__
-        assert "handoff.acquire(" in source, route.__name__
+        assert ("OperationHandoff(" in source or "OperationHandoff.acquire_scope(" in source), route.__name__
+        assert ("handoff.acquire(" in source or "OperationHandoff.acquire_scope(" in source), route.__name__
         assert "handoff.create_dispatch(" in source, route.__name__
         assert "manager.coordinator.acquire(" not in source, route.__name__
         assert "_handoff_thread_worker" not in source, route.__name__
