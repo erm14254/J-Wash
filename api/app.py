@@ -248,9 +248,18 @@ class OperationHandoff:
         if self.closed or self.state is not HandoffState.NEW:
             raise RuntimeError("operation handoff acquire is not available")
         token, snap = self.coordinator.acquire(operation_type, **kwargs)
-        self._set_state(HandoffState.ACQUIRED)
-        self.token = token
-        self.set_heavy(snap=snap)
+        try:
+            self._set_state(HandoffState.ACQUIRED)
+            self.token = token
+            self.set_heavy(snap=snap)
+        except BaseException:
+            snap = None
+            self.heavy.clear()
+            self.token = None
+            self.coordinator.release(token)
+            self.closed = True
+            self.state = HandoffState.CLOSED
+            raise
         return token, snap
 
     def set_heavy(self, **refs):
@@ -270,6 +279,27 @@ class OperationHandoff:
             raise RuntimeError("operation handoff dispatch already set")
         self._set_state(HandoffState.DISPATCH_READY)
         self.dispatch = dispatch
+
+    def create_dispatch(self, payload=None):
+        if self.state not in (HandoffState.ACQUIRED, HandoffState.PREPARING):
+            raise RuntimeError("operation handoff dispatch is not available")
+        dispatch = WorkerDispatch(self.coordinator, self.token, self.stop_event, payload=payload)
+        self.set_dispatch(dispatch)
+        return dispatch
+
+    async def close(self):
+        """Resolve awaiter-side ownership; repeated closes are safe."""
+        if self.closed or self.transferred:
+            return
+        self.clear_heavy()
+        if self.dispatch is not None:
+            self.dispatch.cancel_from_awaiter()
+            if self.task is not None:
+                await _drain_worker_uninterruptibly(self.task)
+        elif self.token is not None:
+            self.coordinator.release(self.token)
+        self.closed = True
+        self._set_state(HandoffState.CLOSED)
 
     def set_wrapper(self, wrapper):
         self._set_state(HandoffState.WRAPPER_READY)
@@ -2487,6 +2517,12 @@ def _persisted_generate(req, stop_event, emit, gen_context):
             messages=messages, sampling=req.get("sampling", {}), stop_event=stop_event, emit=emit_inner, lens=gen_context,
             ablator=interventions if gen_context.intervention_snapshot.get("rules") else None,
         )
+        durable_end = done_holder.get("generated_token_end_pos")
+        if isinstance(durable_end, int) and not isinstance(durable_end, bool):
+            frames_acc[:] = [
+                frame for frame in frames_acc
+                if frame.get("phase") in ("reading", "prompt") or frame.get("pos", durable_end) < durable_end
+            ]
         meta = dict(
             done_holder.get("meta") or {},
             stats=done_holder.get("stats"),
@@ -2512,6 +2548,7 @@ def _persisted_generate(req, stop_event, emit, gen_context):
                 store.save_frames(
                     message_id, frames_acc, layers_used, k_used,
                     expected_version=inserted_version, complete_meta=complete_meta,
+                    frame_descriptor=_frame_descriptor(lens, layers_used, k_used),
                 )
             except StaleMessageUpdate:
                 emit({"type": "error", "message": "message changed before frames were attached; retry"})
@@ -2574,29 +2611,54 @@ def _continuation_metadata(previous_meta, start_offset, end_offset, done_meta, s
     return merged
 
 
+def _frame_descriptor(lens, layers, k):
+    if lens is None or not getattr(lens, "meta", None):
+        return None
+    descriptor = _stable_lens_descriptor(lens.meta)
+    return {
+        key: value for key, value in descriptor.items()
+        if not key.startswith("runtime_")
+    } | {"archive_layers": [int(layer) for layer in layers], "k": int(k)}
+
+
 def _frames_lens_signature(lens, layers, k):
+    descriptor = _frame_descriptor(lens, layers, k)
     if lens is None:
-        return {"frames_lens_binding_id": None, "frames_layers": [], "frames_k": 0}
+        return {"frames_lens_binding_id": None, "frames_layers": [], "frames_k": 0, "frame_descriptor": None}
     return {
         "frames_lens_binding_id": getattr(lens, "binding_id", None),
         "frames_layers": [int(l) for l in layers],
         "frames_k": int(k),
+        "frame_descriptor": descriptor,
     }
 
 
-def _merge_continuation_frames(existing_archive, new_frames, layers, k, previous_meta, lens):
+def _merge_continuation_frames(existing_archive, new_frames, layers, k, previous_meta, lens, suffix_start, suffix_end):
     if existing_archive["layers"] != [int(l) for l in layers] or existing_archive["k"] != int(k):
         raise ValueError("continuation lens frame configuration changed")
-    previous_binding = (previous_meta or {}).get("frames_lens_binding_id")
-    current_binding = getattr(lens, "binding_id", None)
-    if previous_binding is not None and current_binding is not None and previous_binding != current_binding:
-        raise ValueError("continuation lens binding changed")
+    saved_descriptor = existing_archive.get("descriptor")
+    current_descriptor = _frame_descriptor(lens, layers, k)
+    if saved_descriptor is None:
+        raise ValueError("existing frame archive has unknown lens/model provenance")
+    if _lens_descriptor_mismatch(saved_descriptor, current_descriptor) or saved_descriptor.get("archive_layers") != current_descriptor.get("archive_layers"):
+        raise ValueError("continuation lens/model frame provenance changed")
+    if isinstance(suffix_start, bool) or not isinstance(suffix_start, int) or suffix_start < 0:
+        raise ValueError("continuation did not provide an exact suffix boundary")
+    if isinstance(suffix_end, bool) or not isinstance(suffix_end, int) or suffix_end < suffix_start:
+        raise ValueError("continuation provided an invalid suffix end boundary")
     old_frames = list(existing_archive["frames"] or [])
-    old_positions = {frame.get("pos") for frame in old_frames}
-    max_old_pos = max(old_positions) if old_positions else -1
-    append = [frame for frame in new_frames if frame.get("pos") not in old_positions and frame.get("pos", -1) > max_old_pos]
-    merged = old_frames + append
-    if any(merged[i].get("pos") > merged[i + 1].get("pos") for i in range(len(merged) - 1)):
+    positions = [frame.get("pos") for frame in new_frames]
+    if any(isinstance(pos, bool) or not isinstance(pos, int) or pos < 0 for pos in positions):
+        raise ValueError("continuation emitted an invalid frame position")
+    if any(left >= right for left, right in zip(positions, positions[1:])):
+        raise ValueError("continuation emitted duplicate or decreasing frame positions")
+    retained_old = [frame for frame in old_frames if frame.get("pos", -1) < suffix_start]
+    retained_new = [
+        frame for frame in new_frames
+        if frame.get("phase") in ("thinking", "gen") and suffix_start <= frame["pos"] < suffix_end
+    ]
+    merged = retained_old + retained_new
+    if any(merged[i].get("pos") >= merged[i + 1].get("pos") for i in range(len(merged) - 1)):
         raise ValueError("continuation frames are not ordered after merge")
     return merged
 
@@ -2648,7 +2710,11 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
         if msg.get("frames_file"):
             try:
                 existing_archive = store.load_frames(message_id)
-                merged = _merge_continuation_frames(existing_archive, frames_acc, layers_used, k_used, previous_meta, lens)
+                merged = _merge_continuation_frames(
+                    existing_archive, frames_acc, layers_used, k_used, previous_meta, lens,
+                    done_holder.get("continuation_suffix_start_pos"),
+                    done_holder.get("continuation_suffix_end_pos"),
+                )
             except Exception as exc:
                 emit({"type": "error", "message": f"could not merge existing frames; continuation not persisted: {exc}"})
                 return
@@ -2667,6 +2733,7 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
     if not store.update_message_and_frames_if_unchanged(
         message_id, expected_version, new_content, meta,
         frames=merged, layers=layers_used, k=k_used, clear_frames=clear_frames,
+        frame_descriptor=_frame_descriptor(lens, layers_used, k_used) if merged is not None else None,
     ):
         emit({"type": "error", "message": "message changed during continuation; retry"})
         return

@@ -682,15 +682,18 @@ def test_persisted_continue_merges_existing_production_phase_archive(tmp_path, m
     monkeypatch.setattr(app, "store", s)
     cid = s.create_conversation("c")
     mid = s.add_message(cid, None, "assistant", "T", meta={"publication_state": "complete"})
-    s.save_frames(mid, [_frame(0, "reading", "0"), _frame(1, "thinking", "0")], [0], 1)
+    lens_meta = {"path": "/lens", "model_id": "m", "model_revision": "r", "fitted_layers_all": [0], "tapped_layers": [0], "k": 1}
+    lens = type("Lens", (), {"layers": [0], "k": 1, "meta": lens_meta})()
+    descriptor = app._frame_descriptor(lens, [0], 1)
+    s.save_frames(mid, [_frame(0, "reading", "0"), _frame(1, "thinking", "0")], [0], 1, frame_descriptor=descriptor)
     emitted = []
 
     def generate(**kwargs):
         kwargs["emit"]({"type": "frame", **_frame(2, "thinking", "0")})
-        kwargs["emit"]({"type": "done", "text": " plus", "meta": {"model_id": "m"}, "stats": {}, "stopped": False})
+        kwargs["emit"]({"type": "done", "text": " plus", "meta": {"model_id": "m"}, "stats": {}, "stopped": False, "continuation_suffix_start_pos": 2, "continuation_suffix_end_pos": 3})
 
     monkeypatch.setattr(app.manager, "generate", generate)
-    context = type("Ctx", (), {"lens": type("Lens", (), {"layers": [0], "k": 1})(), "intervention_snapshot": {"rules": []}})()
+    context = type("Ctx", (), {"lens": lens, "intervention_snapshot": {"rules": []}})()
     app._persisted_continue({}, mid, threading.Event(), emitted.append, context)
     loaded = s.load_frames(mid)
     assert [frame["phase"] for frame in loaded["frames"]] == ["reading", "thinking", "thinking"]
@@ -1164,27 +1167,40 @@ def test_persisted_continue_drops_overlapping_reread_frames_and_reloads(tmp_path
         "old",
         meta={"publication_state": "complete", "frames_lens_binding_id": 7, "frames_layers": [0], "frames_k": 1},
     )
-    s.save_frames(mid, [_frame(0, "reading", "0"), _frame(1, "thinking", "0")], [0], 1)
+    lens_meta = {"path": "/lens", "model_id": "m", "model_revision": "r", "fitted_layers_all": [0], "tapped_layers": [0], "k": 1}
+    lens = type("Lens", (), {"layers": [0], "k": 1, "binding_id": 7, "meta": lens_meta})()
+    descriptor = app._frame_descriptor(lens, [0], 1)
+    old_reading = _frame(0, "reading", "0")
+    old_reading["gen"] = 10
+    old_thinking = _frame(1, "thinking", "0")
+    old_thinking["gen"] = 10
+    stale_tail = _frame(4, "thinking", "0")
+    stale_tail["gen"] = 40
+    s.save_frames(mid, [old_reading, old_thinking, stale_tail], [0], 1, frame_descriptor=descriptor)
     emitted = []
 
     def generate_first(**kwargs):
         kwargs["emit"]({"type": "frame", **_frame(1, "reading", "0")})
-        kwargs["emit"]({"type": "frame", **_frame(2, "thinking", "0")})
-        kwargs["emit"]({"type": "done", "text": " plus", "meta": {"model_id": "m"}, "stats": {}, "stopped": False})
+        new_frame = _frame(2, "thinking", "0")
+        new_frame["gen"] = 20
+        kwargs["emit"]({"type": "frame", **new_frame})
+        kwargs["emit"]({"type": "done", "text": " plus", "meta": {"model_id": "m"}, "stats": {}, "stopped": False, "continuation_suffix_start_pos": 2, "continuation_suffix_end_pos": 3})
 
     monkeypatch.setattr(app.manager, "generate", generate_first)
-    context = type("Ctx", (), {"lens": type("Lens", (), {"layers": [0], "k": 1, "binding_id": 7})(), "intervention_snapshot": {"rules": []}})()
+    context = type("Ctx", (), {"lens": lens, "intervention_snapshot": {"rules": []}})()
     app._persisted_continue({}, mid, threading.Event(), emitted.append, context)
     loaded = s.load_frames(mid)
     assert [frame["pos"] for frame in loaded["frames"]] == [0, 1, 2]
     assert [frame["phase"] for frame in loaded["frames"]] == ["reading", "thinking", "thinking"]
+    assert [frame["gen"] for frame in loaded["frames"]] == [10, 10, 20]
 
     def generate_second(**kwargs):
         kwargs["emit"]({"type": "frame", **_frame(2, "reading", "0")})
         kwargs["emit"]({"type": "frame", **_frame(3, "thinking", "0")})
-        kwargs["emit"]({"type": "done", "text": " again", "meta": {"model_id": "m"}, "stats": {}, "stopped": False})
+        kwargs["emit"]({"type": "done", "text": " again", "meta": {"model_id": "m"}, "stats": {}, "stopped": False, "continuation_suffix_start_pos": 3, "continuation_suffix_end_pos": 4})
 
     monkeypatch.setattr(app.manager, "generate", generate_second)
+    lens.binding_id = 99  # process-local identity is not archive compatibility
     app._persisted_continue({}, mid, threading.Event(), emitted.append, context)
     loaded = s.load_frames(mid)
     assert [frame["pos"] for frame in loaded["frames"]] == [0, 1, 2, 3]
@@ -1202,16 +1218,17 @@ def test_persisted_continue_rejects_incompatible_frame_configuration(tmp_path, m
     monkeypatch.setattr(app, "store", s)
     cid = s.create_conversation("c")
     mid = s.add_message(cid, None, "assistant", "old", meta={"frames_lens_binding_id": 7})
-    s.save_frames(mid, [_frame(0, "thinking", "0")], [0], 1)
+    original_lens = type("Lens", (), {"layers": [0], "k": 1, "binding_id": 7, "meta": {"path": "/lens", "model_id": "m", "model_revision": "r", "fitted_layers_all": [0], "tapped_layers": [0], "k": 1}})()
+    s.save_frames(mid, [_frame(0, "thinking", "0")], [0], 1, frame_descriptor=app._frame_descriptor(original_lens, [0], 1))
     before = s.get_message(mid)
 
     def generate(**kwargs):
         kwargs["emit"]({"type": "frame", **_frame(1, "thinking", "0")})
-        kwargs["emit"]({"type": "done", "text": " plus", "meta": {}, "stats": {}, "stopped": False})
+        kwargs["emit"]({"type": "done", "text": " plus", "meta": {}, "stats": {}, "stopped": False, "continuation_suffix_start_pos": 1, "continuation_suffix_end_pos": 2})
 
     monkeypatch.setattr(app.manager, "generate", generate)
     emitted = []
-    changed_layers = type("Ctx", (), {"lens": type("Lens", (), {"layers": [1], "k": 1, "binding_id": 7})(), "intervention_snapshot": {"rules": []}})()
+    changed_layers = type("Ctx", (), {"lens": type("Lens", (), {"layers": [1], "k": 1, "binding_id": 7, "meta": dict(original_lens.meta, tapped_layers=[1])})(), "intervention_snapshot": {"rules": []}})()
     app._persisted_continue({}, mid, threading.Event(), emitted.append, changed_layers)
     after = s.get_message(mid)
     assert after["content"] == before["content"]
@@ -1301,5 +1318,32 @@ def test_operation_handoff_can_own_acquisition_before_setup():
     assert token is handoff.token
     assert handoff.state is app.HandoffState.PREPARING
     assert handoff.heavy["snap"] is snap
+
+
+def test_operation_handoff_acquire_rolls_back_snapshot_registration_failure(monkeypatch):
+    from api import app
+    from core.model_session import ModelSessionCoordinator, OperationType
+
+    coordinator = ModelSessionCoordinator()
+    handoff = app.OperationHandoff(coordinator, stop_event=threading.Event())
+    monkeypatch.setattr(handoff, "set_heavy", lambda **_refs: (_ for _ in ()).throw(MemoryError("injected")))
+    with pytest.raises(MemoryError):
+        handoff.acquire(OperationType.GENERATE)
+    assert coordinator.status_snapshot().operation is None
+    assert handoff.state is app.HandoffState.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_operation_handoff_close_before_dispatch_is_idempotent():
+    from api import app
+    from core.model_session import ModelSessionCoordinator, OperationType
+
+    coordinator = ModelSessionCoordinator()
+    handoff = app.OperationHandoff(coordinator, stop_event=threading.Event())
+    handoff.acquire(OperationType.GENERATE)
+    await handoff.close()
+    await handoff.close()
+    assert coordinator.status_snapshot().operation is None
+    assert handoff.state is app.HandoffState.CLOSED
     handoff.clear_heavy()
     c.release(token)

@@ -850,16 +850,34 @@ class ModelManager:
                 if s in text:
                     text = text[: text.index(s)]
                     break
+            # The continuation boundary is derived from the exact template input
+            # used by this run.  Consumers must not reconstruct it from decoded
+            # text or from an older frame archive: fallback stop trimming can
+            # remove a multi-token tail after frames for its prefix were captured.
+            durable_reply_tokens = 0
+            for prefix_len in range(len(reply_ids) + 1):
+                decoded_prefix = tokenizer.decode(
+                    reply_ids[:prefix_len], skip_special_tokens=True
+                )
+                if text.startswith(decoded_prefix):
+                    durable_reply_tokens = prefix_len
+            suffix_start_pos = int(input_ids.shape[1])
             emit(
                 {
                     "type": "done",
                     "text": text,
                     "gen_id": gen_id,
+                    "generated_token_start_pos": suffix_start_pos,
+                    "generated_token_end_pos": suffix_start_pos + durable_reply_tokens,
+                    "continuation_suffix_start_pos": suffix_start_pos if continue_final else None,
+                    "continuation_suffix_end_pos": (
+                        suffix_start_pos + durable_reply_tokens if continue_final else None
+                    ),
                     "stopped": stop_event.is_set(),
                     "stats": {
-                        "tokens": len(reply_ids),
+                        "tokens": durable_reply_tokens,
                         "seconds": round(elapsed, 2),
-                        "tok_per_s": round(len(reply_ids) / elapsed, 2) if reply_ids and elapsed > 0 else 0.0,
+                        "tok_per_s": round(durable_reply_tokens / elapsed, 2) if durable_reply_tokens and elapsed > 0 else 0.0,
                     },
                     "meta": dict(
                         meta or {},

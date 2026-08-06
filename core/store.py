@@ -628,11 +628,11 @@ class Store:
                 log.warning("failed to clean frame candidate %s", final, exc_info=True)
             raise FrameStorageError(str(exc)) from exc
 
-    def update_message_and_frames_if_unchanged(self, message_id, expected_version, content, meta=None, *, frames=None, layers=None, k=0, clear_frames=False):
+    def update_message_and_frames_if_unchanged(self, message_id, expected_version, content, meta=None, *, frames=None, layers=None, k=0, clear_frames=False, frame_descriptor=None):
         frame_file = None
         final_path = None
         if frames:
-            frame_blob = self._pack_frames_blob(frames, layers or [], k)
+            frame_blob = self._pack_frames_blob(frames, layers or [], k, frame_descriptor)
             frame_file, final_path = self._write_unique_frame_candidate(message_id, expected_version, frame_blob)
             try:
                 self._validate_frame_candidate(final_path, message_id)
@@ -720,7 +720,7 @@ class Store:
         return path
 
     @staticmethod
-    def _pack_frames_blob(frames, layers, k):
+    def _pack_frames_blob(frames, layers, k, descriptor=None):
         vocab = {}
         packed = []
         for frame in frames:
@@ -729,6 +729,7 @@ class Store:
                 "pos": frame["pos"],
                 "phase": frame["phase"],
                 "token_id": frame["token_id"],
+                "gen": frame.get("gen"),
                 "layers": {},
             }
             for layer, d in frame["layers"].items():
@@ -745,9 +746,9 @@ class Store:
                 }
             packed.append(entry)
         return msgpack.packb({
-            "version": 1,
+            "version": 2,
             "k": k,
-            "gen": frames[-1].get("gen") if frames else None,
+            "descriptor": dict(descriptor) if descriptor is not None else None,
             "layers": [int(l) for l in layers],
             "frames": packed,
             "vocab": {str(t): s for t, s in vocab.items()},
@@ -809,7 +810,7 @@ class Store:
                 ) from reconcile_exc
             raise StorageCommitAmbiguous(f"message {message_id} frame-failure terminalization is ambiguous")
 
-    def save_frames(self, message_id, frames, layers, k, *, expected_version=None, complete_meta=None):
+    def save_frames(self, message_id, frames, layers, k, *, expected_version=None, complete_meta=None, frame_descriptor=None):
         conn = self._conn()
         row = conn.execute(
             "SELECT version, frames_file FROM messages WHERE id = ?", (message_id,)
@@ -818,7 +819,7 @@ class Store:
             raise ValueError(f"unknown message {message_id}")
         baseline = row["version"] if expected_version is None else expected_version
         filename, final_path = self._write_unique_frame_candidate(
-            message_id, baseline, self._pack_frames_blob(frames, layers, k)
+            message_id, baseline, self._pack_frames_blob(frames, layers, k, frame_descriptor)
         )
         try:
             self._validate_frame_candidate(final_path, message_id)
@@ -890,8 +891,12 @@ class Store:
 
     def _decode_frames_data(self, data, message_id):
         try:
-            if not isinstance(data, dict) or data.get("version") != 1:
+            if not isinstance(data, dict) or data.get("version") not in (1, 2):
                 raise ValueError("unsupported frame archive version")
+            archive_version = data["version"]
+            descriptor = data.get("descriptor") if archive_version >= 2 else None
+            if descriptor is not None and not isinstance(descriptor, dict):
+                raise ValueError("invalid frame archive descriptor")
             if isinstance(data.get("k"), bool) or not isinstance(data.get("k"), int) or data["k"] < 0:
                 raise ValueError("invalid frame archive k")
             if (
@@ -931,8 +936,9 @@ class Store:
                     normalized_layers[layer_id] = layer_data
                 if set(normalized_layers) != set(data["layers"]):
                     raise ValueError("frame layers do not match archive layers")
-                if data.get("gen") is not None and (
-                    isinstance(data.get("gen"), bool) or not isinstance(data.get("gen"), int) or data.get("gen") < 0
+                frame_gen = entry.get("gen") if archive_version >= 2 else data.get("gen")
+                if frame_gen is not None and (
+                    isinstance(frame_gen, bool) or not isinstance(frame_gen, int) or frame_gen < 0
                 ):
                     raise ValueError("invalid frame generation index")
                 frame = {
@@ -941,7 +947,7 @@ class Store:
                     "pos": entry["pos"],
                     "token_id": entry["token_id"],
                     "tok": vocab.get(str(entry["token_id"]), ""),
-                    "gen": data.get("gen"),
+                    "gen": frame_gen,
                     "layers": {},
                 }
                 for layer, d in normalized_layers.items():
@@ -970,7 +976,13 @@ class Store:
                         "m_strs": [vocab.get(str(t), "") for t in m_ids],
                     }
                 frames.append(frame)
-            return {"k": data["k"], "layers": [int(l) for l in data["layers"]], "frames": frames}
+            return {
+                "version": archive_version,
+                "k": data["k"],
+                "layers": [int(l) for l in data["layers"]],
+                "descriptor": dict(descriptor) if descriptor is not None else None,
+                "frames": frames,
+            }
         except Exception as exc:
             raise FrameStorageError(f"corrupt frame archive for message {message_id}: {exc}") from exc
 
