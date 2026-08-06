@@ -235,6 +235,34 @@ def test_handoff_cleanup_task_creation_failure_falls_back_inline(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_ws_setup_conflict_before_scope_target_assignment_is_model_free(monkeypatch):
+    from contextlib import asynccontextmanager
+    from api import app
+
+    @asynccontextmanager
+    async def fail_before_yield(*_args, **_kwargs):
+        raise OperationConflict("busy")
+        yield
+
+    monkeypatch.setattr(app.OperationHandoff, "acquire_scope", fail_before_yield)
+    result = asyncio.run(app._setup_ws_worker({"messages": []}))
+    assert result == ("error", 409, "OperationConflict", "busy")
+
+
+def test_ws_setup_cancellation_before_scope_target_assignment_is_reraised(monkeypatch):
+    from contextlib import asynccontextmanager
+    from api import app
+
+    @asynccontextmanager
+    async def cancel_before_yield(*_args, **_kwargs):
+        raise asyncio.CancelledError()
+        yield
+
+    monkeypatch.setattr(app.OperationHandoff, "acquire_scope", cancel_before_yield)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(app._setup_ws_worker({"messages": []}))
+
+
 def test_dispatched_routes_use_handoff_scope_and_factory_descriptors():
     import inspect
     from api import app
@@ -246,10 +274,11 @@ def test_dispatched_routes_use_handoff_scope_and_factory_descriptors():
     )
     for route in routes:
         source = inspect.getsource(route)
-        assert (
-            "async with handoff.awaiter_scope()" in source
-            or "async with OperationHandoff.acquire_scope(" in source
-        )
+        assert "OperationHandoff.acquire_scope(" in source
+        assert "handoff.acquire(" not in source
+        assert "async with handoff.awaiter_scope()" not in source
+        assert "manager.coordinator.acquire(" not in source
+        assert "manager.coordinator.release(" not in source
         assert "create_thread_task(lambda" not in source
 
 
@@ -1645,10 +1674,12 @@ def test_dispatched_routes_use_one_preacquisition_handoff():
     )
     for route in routes:
         source = inspect.getsource(route)
-        assert ("OperationHandoff(" in source or "OperationHandoff.acquire_scope(" in source), route.__name__
-        assert ("handoff.acquire(" in source or "OperationHandoff.acquire_scope(" in source), route.__name__
-        assert "handoff.create_dispatch(" in source, route.__name__
+        assert "OperationHandoff.acquire_scope(" in source, route.__name__
+        assert "handoff.acquire(" not in source, route.__name__
+        assert "async with handoff.awaiter_scope()" not in source, route.__name__
+        assert ".create_dispatch(" in source, route.__name__
         assert "manager.coordinator.acquire(" not in source, route.__name__
+        assert "manager.coordinator.release(" not in source, route.__name__
         assert "_handoff_thread_worker" not in source, route.__name__
 
 

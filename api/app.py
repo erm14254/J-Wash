@@ -155,18 +155,22 @@ def _worker_success(value=None):
 
 
 def _worker_failure(exc, *, default_status=500, value_status=422):
+    kind = exc.__class__.__name__
+    message = str(exc)[:512]
     if isinstance(exc, HTTPException):
-        return WorkerOutcome(
+        outcome = WorkerOutcome(
             failure_kind="http",
             failure_message=str(exc.detail),
             http_status=exc.status_code,
         )
-    status = value_status if isinstance(exc, ValueError) else default_status
-    return WorkerOutcome(
-        failure_kind=exc.__class__.__name__,
-        failure_message=str(exc),
-        http_status=status,
-    )
+    else:
+        status = value_status if isinstance(exc, ValueError) else default_status
+        outcome = WorkerOutcome(failure_kind=kind, failure_message=message, http_status=status)
+    try:
+        exc.__traceback__ = exc.__context__ = exc.__cause__ = None
+    except BaseException:
+        pass
+    return outcome
 
 
 def _raise_worker_outcome(outcome: WorkerOutcome):
@@ -221,6 +225,7 @@ class OperationHandoff:
         """Install cleanup ownership before acquiring a coordinator lease."""
         handoff = cls(coordinator, stop_event=stop_event)
         cancelled = False
+        snapshot = None
         try:
             token, snapshot = handoff.acquire(operation_type, **acquire_kwargs)
             handoff.snapshot = snapshot
@@ -231,6 +236,7 @@ class OperationHandoff:
             if current is not None and hasattr(current, "uncancel"):
                 current.uncancel()
         finally:
+            snapshot = None
             handoff.snapshot = None
             if not handoff.transferred and not handoff.closed:
                 cancelled |= await handoff._close_uninterruptibly()
@@ -388,25 +394,44 @@ class OperationHandoff:
             return
         self.clear_heavy()
         cancelled = False
+        resolved = self.dispatch is None and self.token is None
         try:
             if self.dispatch is not None:
-                self.dispatch.cancel_from_awaiter()
+                try:
+                    resolved = bool(self.dispatch.cancel_from_awaiter())
+                except BaseException:
+                    logging.getLogger(__name__).exception("operation dispatch cancellation failed")
+                    try:
+                        if not self.dispatch.claimed:
+                            self.dispatch.clear_payload()
+                            resolved = bool(self.coordinator.release(self.token))
+                    except BaseException:
+                        logging.getLogger(__name__).exception("operation dispatch emergency release failed")
                 if self.task is not None:
                     try:
                         await _drain_worker_uninterruptibly(self.task)
                     except asyncio.CancelledError:
                         cancelled = True
+                    except BaseException:
+                        logging.getLogger(__name__).exception("operation worker drain failed")
+                try:
+                    resolved = resolved or not self.coordinator.is_current(self.token)
+                except BaseException:
+                    pass
             elif self.token is not None:
-                self.coordinator.release(self.token)
+                resolved = bool(self.coordinator.release(self.token))
         finally:
-            self.task = None
-            self.wrapper = None
-            self.dispatch = None
-            self.token = None
-            self.closed = True
-            self._set_state(HandoffState.CLOSED)
+            if resolved:
+                self.task = None
+                self.wrapper = None
+                self.dispatch = None
+                self.token = None
+                self.closed = True
+                self._set_state(HandoffState.CLOSED)
         if cancelled:
             raise asyncio.CancelledError()
+        if not resolved:
+            raise RuntimeError("operation handoff ownership could not be resolved")
 
     def set_wrapper(self, wrapper):
         self._set_state(HandoffState.WRAPPER_READY)
@@ -432,9 +457,10 @@ class OperationHandoff:
             wrapper = asyncio.to_thread(worker)
             self.set_wrapper(wrapper)
             task = asyncio.create_task(wrapper)
+            wrapper = None
+            self.wrapper = None
             _deferred_worker_tasks.add(task)
             retained = True
-            self.wrapper = None
             self.set_task(task)
             _retain_worker_task(task)
             self._set_state(HandoffState.TASK_RETAINED)
@@ -445,9 +471,8 @@ class OperationHandoff:
             return task
         except BaseException as exc:
             primary_error = exc
-            registered_wrapper = self.wrapper
             self.wrapper = None
-            wrapper_to_close = wrapper if task is None else registered_wrapper
+            wrapper_to_close = wrapper if task is None else None
             if wrapper_to_close is not None and hasattr(wrapper_to_close, "close"):
                 try:
                     wrapper_to_close.close()
@@ -457,21 +482,32 @@ class OperationHandoff:
             if retained or task is not None:
                 _deferred_worker_tasks.discard(task)
             if self.dispatch is not None:
-                self.dispatch.cancel_from_awaiter()
+                try:
+                    self.dispatch.cancel_from_awaiter()
+                except BaseException:
+                    logging.getLogger(__name__).exception("dispatch cancellation failed during task setup")
                 task_to_drain = task or self.task
                 if task_to_drain is not None:
-                    if not task_to_drain.done():
-                        task_to_drain.cancel()
+                    try:
+                        if not task_to_drain.done():
+                            task_to_drain.cancel()
+                    except BaseException:
+                        logging.getLogger(__name__).exception("worker cancellation failed during task setup")
                     try:
                         await _drain_worker_uninterruptibly(task_to_drain)
                     except asyncio.CancelledError:
                         if isinstance(primary_error, asyncio.CancelledError):
                             raise
-                    except Exception:
+                    except BaseException:
                         logging.getLogger(__name__).exception("worker drain failed during operation handoff cleanup")
                 if not self.transferred:
-                    self.closed = True
-                    self._set_state(HandoffState.CLOSED)
+                    try:
+                        resolved = not self.coordinator.is_current(self.token)
+                    except BaseException:
+                        resolved = False
+                    if resolved:
+                        self.closed = True
+                        self._set_state(HandoffState.CLOSED)
             elif self.token is not None and not self.closed:
                 self.coordinator.release(self.token)
                 self.closed = True
@@ -509,12 +545,22 @@ def _retain_worker_task(task):
 async def _drain_worker_uninterruptibly(task):
     async def _drain():
         return await asyncio.gather(asyncio.shield(task), return_exceptions=True)
-    drain = None
+    drain_coro = drain = None
     cancelled = False
     try:
         try:
-            drain = asyncio.create_task(_drain())
-        except Exception:
+            drain_coro = _drain()
+            drain = asyncio.create_task(drain_coro)
+            drain_coro = None
+        except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                cancelled = True
+                current = asyncio.current_task()
+                if current is not None and hasattr(current, "uncancel"):
+                    current.uncancel()
+            if drain_coro is not None and hasattr(drain_coro, "close"):
+                drain_coro.close()
+            drain_coro = None
             while not task.done():
                 try:
                     await asyncio.shield(task)
@@ -523,6 +569,9 @@ async def _drain_worker_uninterruptibly(task):
                     current = asyncio.current_task()
                     if current is not None and hasattr(current, "uncancel"):
                         current.uncancel()
+                except BaseException:
+                    if task.done():
+                        break
             result = await asyncio.gather(task, return_exceptions=True)
             if cancelled:
                 raise asyncio.CancelledError()
@@ -537,6 +586,8 @@ async def _drain_worker_uninterruptibly(task):
                     current.uncancel()
         result = drain.result()
     finally:
+        if drain_coro is not None and hasattr(drain_coro, "close"):
+            drain_coro.close()
         if drain is not None and not drain.done():
             drain.cancel()
             await asyncio.gather(drain, return_exceptions=True)
@@ -812,7 +863,7 @@ def _make_delete_model_worker(dispatch, model_id, delete_fn):
         try:
             try:
                 return _worker_success(delete_fn(model_id))
-            except Exception as exc:
+            except BaseException as exc:
                 return _worker_failure(exc, default_status=500, value_status=400)
         finally:
             dispatch.release_from_worker()
@@ -823,22 +874,24 @@ def _make_delete_model_worker(dispatch, model_id, delete_fn):
 async def api_delete_model(req: DeleteModelRequest):
     from core.model_manager import delete_model
     stop_event = ThreadingEvent()
-    handoff = OperationHandoff(manager.coordinator, stop_event=stop_event)
     try:
-        token, snap = handoff.acquire(OperationType.MODEL_DELETE, include_bundle=False)
+        async with OperationHandoff.acquire_scope(
+            manager.coordinator, OperationType.MODEL_DELETE,
+            stop_event=stop_event, include_bundle=False,
+        ) as handoff:
+            snap = handoff.snapshot
+            status = manager.coordinator.status_snapshot()
+            loaded_model_id = (status.model_meta or {}).get("model_id") if status.model_meta is not None else None
+            snap = status = None
+            if loaded_model_id == req.model_id:
+                raise HTTPException(409, "unload this model before deleting it")
+            dispatch = handoff.create_dispatch()
+            task = await handoff.create_thread_task(
+                _make_delete_model_worker,
+                factory_args=(dispatch, str(req.model_id), delete_model),
+            )
     except OperationConflict as exc:
         raise _conflict(exc)
-    async with handoff.awaiter_scope():
-        status = manager.coordinator.status_snapshot()
-        loaded_model_id = (status.model_meta or {}).get("model_id") if status.model_meta is not None else None
-        snap = status = None
-        if loaded_model_id == req.model_id:
-            raise HTTPException(409, "unload this model before deleting it")
-        dispatch = handoff.create_dispatch()
-        task = await handoff.create_thread_task(
-            _make_delete_model_worker,
-            factory_args=(dispatch, str(req.model_id), delete_model),
-        )
     try:
         return _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -943,7 +996,7 @@ def _make_lens_load_worker(dispatch, token):
                 )
                 manager.coordinator.update_lens_binding(token, result)
                 return _worker_success(result)
-            except Exception as exc:
+            except BaseException as exc:
                 if old_state is not None:
                     try:
                         lens_manager.restore_state_record(old_state)
@@ -961,24 +1014,26 @@ async def api_lens_load(req: LensLoadRequest):
     if not req.repo_id and not req.path:
         raise HTTPException(422, "repo_id or path required")
     stop_event = ThreadingEvent()
-    handoff = OperationHandoff(manager.coordinator, stop_event=stop_event)
     try:
-        token, snap = handoff.acquire(OperationType.LENS_UPDATE, requires_loaded=True, include_bundle=False)
+        async with OperationHandoff.acquire_scope(
+            manager.coordinator, OperationType.LENS_UPDATE, stop_event=stop_event,
+            requires_loaded=True, include_bundle=False,
+        ) as handoff:
+            token, snap = handoff.token, handoff.snapshot
+            snap = None
+            payload = {
+                "repo_id": req.repo_id, "filename": req.filename, "revision": req.revision,
+                "path": req.path, "layers": req.layers, "k": req.k,
+            }
+            dispatch = handoff.create_dispatch(payload)
+            payload = None
+            task = await handoff.create_thread_task(
+                _make_lens_load_worker, factory_args=(dispatch, token),
+            )
     except OperationConflict as exc:
         raise _conflict(exc)
     except ModelStateError as exc:
         raise HTTPException(422, str(exc))
-    async with handoff.awaiter_scope():
-        snap = None
-        payload = {
-            "repo_id": req.repo_id, "filename": req.filename, "revision": req.revision,
-            "path": req.path, "layers": req.layers, "k": req.k,
-        }
-        dispatch = handoff.create_dispatch(payload)
-        payload = None
-        task = await handoff.create_thread_task(
-            _make_lens_load_worker, factory_args=(dispatch, token),
-        )
     try:
         return _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -1466,7 +1521,7 @@ def _make_export_worker(dispatch):
                     source_dir=payload["source_dir"], scale=payload["scale"], **call_kwargs,
                 )
                 return _worker_success(result)
-            except Exception as exc:
+            except BaseException as exc:
                 return _worker_failure(exc)
         finally:
             try:
@@ -1484,30 +1539,32 @@ async def api_edit_export(req: ExportRequest):
     if req.format not in ("layers", "lora", "full"):
         raise HTTPException(422, f"unknown format: {req.format}")
     stop_event = ThreadingEvent()
-    handoff = OperationHandoff(manager.coordinator, stop_event=stop_event)
     try:
-        token, snap = handoff.acquire(OperationType.EXPORT, requires_loaded=True)
+        async with OperationHandoff.acquire_scope(
+            manager.coordinator, OperationType.EXPORT,
+            stop_event=stop_event, requires_loaded=True,
+        ) as handoff:
+            token, snap = handoff.token, handoff.snapshot
+            outcome = _export_preflight_resource(snap, req)
+            snap = None
+            if outcome.status is not None:
+                return _raise_route_outcome(outcome)
+            prepared = outcome.value
+            outcome = None
+            payload_seed = prepared.take()
+            prepared = None
+            publication_gate = editing.PublicationGate(
+                lambda: not manager.coordinator.is_cancelled(token) and manager.coordinator.is_current(token)
+            )
+            payload = dict(payload_seed)
+            payload.update(publication_gate=publication_gate, format=req.format, name=req.name)
+            dispatch = handoff.create_dispatch(payload)
+            payload_seed = payload = None
+            task = await handoff.create_thread_task(_make_export_worker, factory_args=(dispatch,))
     except OperationConflict as exc:
         raise _conflict(exc)
     except ModelStateError as exc:
         raise HTTPException(422, str(exc))
-    async with handoff.awaiter_scope():
-        outcome = _export_preflight_resource(snap, req)
-        snap = None
-        if outcome.status is not None:
-            return _raise_route_outcome(outcome)
-        prepared = outcome.value
-        outcome = None
-        payload_seed = prepared.take()
-        prepared = None
-        publication_gate = editing.PublicationGate(
-            lambda: not manager.coordinator.is_cancelled(token) and manager.coordinator.is_current(token)
-        )
-        payload = dict(payload_seed)
-        payload.update(publication_gate=publication_gate, format=req.format, name=req.name)
-        dispatch = handoff.create_dispatch(payload)
-        payload_seed = payload = None
-        task = await handoff.create_thread_task(_make_export_worker, factory_args=(dispatch,))
     try:
         return _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -1729,7 +1786,7 @@ def _make_gguf_bake_worker(dispatch):
                     scale=payload["scale"], **call_kwargs,
                 )
                 return _worker_success(result)
-            except Exception as exc:
+            except BaseException as exc:
                 return _worker_failure(exc)
         finally:
             payload = call_kwargs = result = None
@@ -1761,31 +1818,33 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
     baked = "reused"
     if not (hf_dir / "config.json").exists():
         stop_event = ThreadingEvent()
-        handoff = OperationHandoff(manager.coordinator, stop_event=stop_event)
         try:
-            token, snap = handoff.acquire(OperationType.GGUF_BAKE, requires_loaded=True)
+            async with OperationHandoff.acquire_scope(
+                manager.coordinator, OperationType.GGUF_BAKE,
+                stop_event=stop_event, requires_loaded=True,
+            ) as handoff:
+                token, snap = handoff.token, handoff.snapshot
+                outcome = _gguf_preflight_resource(snap)
+                snap = None
+                if outcome.status is not None:
+                    return _raise_route_outcome(outcome)
+                prepared = outcome.value
+                payload_seed = prepared.take()
+                prepared = outcome = None
+                publication_gate = editing.PublicationGate(
+                    lambda: not manager.coordinator.is_cancelled(token) and manager.coordinator.is_current(token)
+                )
+                payload = dict(payload_seed)
+                payload.update(name="/".join((*name_parts, "hf")), publication_gate=publication_gate)
+                dispatch = handoff.create_dispatch(payload)
+                payload_seed = payload = None
+                task = await handoff.create_thread_task(
+                    _make_gguf_bake_worker, factory_args=(dispatch,),
+                )
         except OperationConflict as exc:
             raise _conflict(exc)
         except ModelStateError as exc:
             raise HTTPException(422, "no model loaded (and no cached checkpoint for this name)") from None
-        async with handoff.awaiter_scope():
-            outcome = _gguf_preflight_resource(snap)
-            snap = None
-            if outcome.status is not None:
-                return _raise_route_outcome(outcome)
-            prepared = outcome.value
-            payload_seed = prepared.take()
-            prepared = outcome = None
-            publication_gate = editing.PublicationGate(
-                lambda: not manager.coordinator.is_cancelled(token) and manager.coordinator.is_current(token)
-            )
-            payload = dict(payload_seed)
-            payload.update(name="/".join((*name_parts, "hf")), publication_gate=publication_gate)
-            dispatch = handoff.create_dispatch(payload)
-            payload_seed = payload = None
-            task = await handoff.create_thread_task(
-                _make_gguf_bake_worker, factory_args=(dispatch,),
-            )
         try:
             _raise_worker_outcome(await asyncio.shield(task))
         except asyncio.CancelledError:
@@ -1886,7 +1945,7 @@ def _make_http_generation_worker(dispatch, stop_event, done, token):
                 manager.coordinator.publish_last_generation(token, context.model_session_id, last)
                 done["last_generation"] = last
                 return _worker_success({"text": done.get("text", ""), "stats": done.get("stats"), "meta": done.get("meta"), "last_generation": last})
-            except Exception as exc:
+            except BaseException as exc:
                 return _worker_failure(exc)
         finally:
             payload = context = last = None
@@ -1897,23 +1956,25 @@ def _make_http_generation_worker(dispatch, stop_event, done, token):
 @app.post("/api/generate")
 async def api_generate_sync(req: GenerateSyncRequest):
     stop_event = ThreadingEvent()
-    handoff = OperationHandoff(manager.coordinator, stop_event=stop_event)
     try:
-        token, snap = handoff.acquire(OperationType.GENERATE, requires_loaded=True)
+        async with OperationHandoff.acquire_scope(
+            manager.coordinator, OperationType.GENERATE,
+            stop_event=stop_event, requires_loaded=True,
+        ) as handoff:
+            token, snap = handoff.token, handoff.snapshot
+            context = _captured_generation_context(token, snap, stop_event)
+            payload = {"context": context, "messages": list(req.messages), "sampling": dict(req.sampling)}
+            dispatch = handoff.create_dispatch(payload)
+            snap = context = payload = None
+            done = {}
+            task = await handoff.create_thread_task(
+                _make_http_generation_worker,
+                factory_args=(dispatch, stop_event, done, token),
+            )
     except OperationConflict as exc:
         raise _conflict(exc)
     except ModelStateError as exc:
         raise HTTPException(422, str(exc))
-    async with handoff.awaiter_scope():
-        context = _captured_generation_context(token, snap, stop_event)
-        payload = {"context": context, "messages": list(req.messages), "sampling": dict(req.sampling)}
-        dispatch = handoff.create_dispatch(payload)
-        snap = context = payload = None
-        done = {}
-        task = await handoff.create_thread_task(
-            _make_http_generation_worker,
-            factory_args=(dispatch, stop_event, done, token),
-        )
     try:
         outcome_value = _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -1951,7 +2012,7 @@ def _make_token_neighbors_worker(dispatch):
                     payload["key"], payload["token_ids"], payload["k"],
                 )
                 return _worker_success(result)
-            except Exception as exc:
+            except BaseException as exc:
                 return _worker_failure(exc)
         finally:
             payload = result = None
@@ -1962,15 +2023,12 @@ def _make_token_neighbors_worker(dispatch):
 @app.post("/api/token-neighbors")
 async def api_token_neighbors(req: NeighborsRequest):
     stop_event = ThreadingEvent()
-    handoff = OperationHandoff(manager.coordinator, stop_event=stop_event)
     try:
-        token, snap = handoff.acquire(OperationType.MODEL_READ, requires_loaded=True)
-    except OperationConflict as exc:
-        raise _conflict(exc)
-    except ModelStateError as exc:
-        raise HTTPException(422, str(exc))
-    try:
-        async with handoff.awaiter_scope():
+        async with OperationHandoff.acquire_scope(
+            manager.coordinator, OperationType.MODEL_READ,
+            stop_event=stop_event, requires_loaded=True,
+        ) as handoff:
+            snap = handoff.snapshot
             bundle = snap.bundle
             meta_copy = dict(bundle.meta)
             key = (snap.model_session_id, meta_copy.get("model_id"), meta_copy.get("revision"))
@@ -1981,6 +2039,12 @@ async def api_token_neighbors(req: NeighborsRequest):
             task = await handoff.create_thread_task(
                 _make_token_neighbors_worker, factory_args=(dispatch,),
             )
+    except OperationConflict as exc:
+        raise _conflict(exc)
+    except ModelStateError as exc:
+        raise HTTPException(422, str(exc))
+    except asyncio.CancelledError:
+        raise
     except HTTPException:
         raise
     except BaseException as exc:
@@ -2119,7 +2183,7 @@ def _make_lens_pin_worker(dispatch):
                     generation_run_id=payload["generation_run_id"],
                 )
                 return _worker_success(result)
-            except Exception as exc:
+            except BaseException as exc:
                 return _worker_failure(exc)
         finally:
             payload = result = None
@@ -2137,19 +2201,21 @@ async def api_lens_pin(req: PinRequest):
     ):
         raise HTTPException(409, "generation run identity is required; residual capture may have expired")
     stop_event = ThreadingEvent()
-    handoff = OperationHandoff(manager.coordinator, stop_event=stop_event)
     try:
-        token, snap = handoff.acquire(OperationType.MODEL_READ, requires_loaded=True)
+        async with OperationHandoff.acquire_scope(
+            manager.coordinator, OperationType.MODEL_READ,
+            stop_event=stop_event, requires_loaded=True,
+        ) as handoff:
+            snap = handoff.snapshot
+            jl = snap.bundle.jl
+            payload = {"jl": jl, "gen_id": req.gen_id, "generation_run_id": req.generation_run_id, "token_ids": list(req.token_ids)}
+            dispatch = handoff.create_dispatch(payload)
+            snap = jl = payload = None
+            task = await handoff.create_thread_task(_make_lens_pin_worker, factory_args=(dispatch,))
     except OperationConflict as exc:
         raise _conflict(exc)
     except ModelStateError as exc:
         raise HTTPException(422, str(exc))
-    async with handoff.awaiter_scope():
-        jl = snap.bundle.jl
-        payload = {"jl": jl, "gen_id": req.gen_id, "generation_run_id": req.generation_run_id, "token_ids": list(req.token_ids)}
-        dispatch = handoff.create_dispatch(payload)
-        snap = jl = payload = None
-        task = await handoff.create_thread_task(_make_lens_pin_worker, factory_args=(dispatch,))
     try:
         return _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -2937,7 +3003,7 @@ def _make_ws_generation_worker(dispatch, stop_event, loop, queue):
                 else:
                     _persisted_generate(request, stop_event, emit, context)
                 return _worker_success()
-            except Exception as exc:
+            except BaseException as exc:
                 return _worker_failure(exc)
         finally:
             payload = context = request = None
@@ -2949,13 +3015,12 @@ async def _setup_ws_worker(req):
     loop = asyncio.get_running_loop()
     queue = asyncio.Queue()
     stop_event = ThreadingEvent()
-    handoff = None
     token = snap = context = payload = dispatch = task = None
     try:
         async with OperationHandoff.acquire_scope(
             manager.coordinator, OperationType.GENERATE, stop_event=stop_event, requires_loaded=True,
-        ) as handoff:
-            token, snap = handoff.token, handoff.snapshot
+        ) as active_handoff:
+            token, snap = active_handoff.token, active_handoff.snapshot
             context = _captured_generation_context(token, snap, stop_event)
             if not req.get("lens"):
                 context = GenerationContext(
@@ -2965,18 +3030,16 @@ async def _setup_ws_worker(req):
                     intervention_snapshot=context.intervention_snapshot, stop_event=context.stop_event,
                 )
             payload = {"context": context, "request": dict(req)}
-            dispatch = handoff.create_dispatch(payload)
+            dispatch = active_handoff.create_dispatch(payload)
             snap = context = payload = None
-            task = await handoff.create_thread_task(
+            task = await active_handoff.create_thread_task(
                 _make_ws_generation_worker,
                 factory_args=(dispatch, stop_event, loop, queue),
             )
         return ("ok", task, queue, stop_event, dispatch)
     except asyncio.CancelledError:
         snap = context = payload = task = None
-        if not handoff.transferred and not handoff.closed:
-            await handoff._close_uninterruptibly()
-        dispatch = handoff = None
+        dispatch = None
         raise
     except BaseException as exc:
         status = 409 if isinstance(exc, OperationConflict) else 422 if isinstance(exc, ModelStateError) else 500
@@ -2985,34 +3048,51 @@ async def _setup_ws_worker(req):
         exc.__traceback__ = exc.__context__ = exc.__cause__ = None
         exc = None
         snap = context = payload = task = None
-        if not handoff.transferred and not handoff.closed:
-            await handoff._close_uninterruptibly()
-        dispatch = handoff = None
+        dispatch = None
         return ("error", status, kind, message)
 
 
 async def _cancel_task_uninterruptibly(task):
     if task is None:
         return False
-    task.cancel()
+    cancelled = False
     try:
-        await _drain_worker_uninterruptibly(task)
-        return False
+        task.cancel()
+    except BaseException:
+        logging.getLogger(__name__).exception("task cancellation failed during websocket cleanup")
+    try:
+        if not task.done():
+            await _drain_worker_uninterruptibly(task)
     except asyncio.CancelledError:
+        cancelled = True
         current = asyncio.current_task()
         if current is not None and hasattr(current, "uncancel"):
             current.uncancel()
-        return True
+    except BaseException:
+        logging.getLogger(__name__).exception("task drain failed during websocket cleanup")
+    return cancelled
 
 
 async def _finalize_ws_runtime(ws, worker, receiver, waiter, stop_event, dispatch, terminal_seen):
     cancelled = False
     outcome = None
     failure_message = None
-    stop_event.set()
-    cancelled |= await _cancel_task_uninterruptibly(waiter)
-    cancelled |= await _cancel_task_uninterruptibly(receiver)
-    dispatch.cancel_from_awaiter()
+    try:
+        stop_event.set()
+    except BaseException:
+        logging.getLogger(__name__).exception("failed to set websocket generation stop event")
+    try:
+        cancelled |= await _cancel_task_uninterruptibly(waiter)
+    except BaseException:
+        logging.getLogger(__name__).exception("websocket waiter cleanup failed")
+    try:
+        cancelled |= await _cancel_task_uninterruptibly(receiver)
+    except BaseException:
+        logging.getLogger(__name__).exception("websocket receiver cleanup failed")
+    try:
+        dispatch.cancel_from_awaiter()
+    except BaseException:
+        logging.getLogger(__name__).exception("websocket dispatch cancellation failed")
     try:
         await _drain_worker_uninterruptibly(worker)
     except asyncio.CancelledError:
@@ -3087,13 +3167,21 @@ async def _run_chat(ws, req):
                 break
     finally:
         if waiter_coro is not None and hasattr(waiter_coro, "close"):
-            waiter_coro.close()
+            try:
+                waiter_coro.close()
+            except BaseException:
+                logging.getLogger(__name__).exception("failed to close unsubmitted websocket waiter")
         if receiver_coro is not None and hasattr(receiver_coro, "close"):
-            receiver_coro.close()
-        await _finalize_ws_runtime(
-            ws, worker, receiver, waiter, stop_event, dispatch, terminal_seen,
-        )
-        worker = receiver_coro = receiver = waiter_coro = waiter = queue = dispatch = None
+            try:
+                receiver_coro.close()
+            except BaseException:
+                logging.getLogger(__name__).exception("failed to close unsubmitted websocket receiver")
+        try:
+            await _finalize_ws_runtime(
+                ws, worker, receiver, waiter, stop_event, dispatch, terminal_seen,
+            )
+        finally:
+            worker = receiver_coro = receiver = waiter_coro = waiter = queue = dispatch = None
 
 
 
