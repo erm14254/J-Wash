@@ -544,12 +544,11 @@ def test_zero_length_continuation_does_not_reattribute_existing_text(monkeypatch
     fake_store = FakeStore()
     monkeypatch.setattr(app, "store", fake_store)
     monkeypatch.setattr(app.manager, "generate", fake_generate)
-    app._persisted_continue({}, 1, threading.Event(), lambda frame: None, SimpleNamespace(lens=None, intervention_snapshot={"rules": []}))
-    assert fake_store.updated[0] == "old"
-    meta = fake_store.updated[1]
-    assert meta["intervention_provenance"]["revision"] == 1
-    assert meta["continuations"][0]["meta"]["intervention_provenance"]["revision"] == 1
-    assert meta["continuation_attempts"][-1]["meta"]["intervention_provenance"]["revision"] == 2
+    emitted = []
+    app._persisted_continue({}, 1, threading.Event(), emitted.append, SimpleNamespace(lens=None, intervention_snapshot={"rules": []}))
+    assert fake_store.updated is None
+    assert emitted[-1]["text"] == "old"
+    assert emitted[-1]["continued"] is False
 
 
 def test_preset_save_persists_coordinated_provenance(monkeypatch):
