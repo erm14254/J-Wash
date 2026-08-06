@@ -192,6 +192,44 @@ def test_handoff_awaiter_scope_closes_on_base_exception():
     asyncio.run(scenario())
 
 
+def test_handoff_acquire_scope_owns_cleanup_before_snapshot_publication():
+    from api import app
+
+    async def scenario():
+        coordinator = ModelSessionCoordinator()
+        with pytest.raises(RuntimeError):
+            async with app.OperationHandoff.acquire_scope(
+                coordinator, OperationType.MODEL_DELETE, include_bundle=False,
+            ) as lease:
+                assert lease.snapshot is not None
+                raise RuntimeError("setup")
+        assert coordinator.snapshot().operation is None
+
+    asyncio.run(scenario())
+
+
+def test_handoff_cleanup_task_creation_failure_falls_back_inline(monkeypatch):
+    from api import app
+
+    async def scenario():
+        coordinator = ModelSessionCoordinator()
+        real_create_task = app.asyncio.create_task
+
+        def fail_once(coro):
+            monkeypatch.setattr(app.asyncio, "create_task", real_create_task)
+            raise RuntimeError("task allocation")
+
+        with pytest.raises(RuntimeError):
+            async with app.OperationHandoff.acquire_scope(
+                coordinator, OperationType.MODEL_DELETE, include_bundle=False,
+            ):
+                monkeypatch.setattr(app.asyncio, "create_task", fail_once)
+                raise RuntimeError("primary")
+        assert coordinator.snapshot().operation is None
+
+    asyncio.run(scenario())
+
+
 def test_dispatched_routes_use_handoff_scope_and_factory_descriptors():
     import inspect
     from api import app
@@ -219,6 +257,25 @@ def test_pin_missing_run_identity_is_rejected_before_handoff(monkeypatch):
 
     monkeypatch.setattr(app.manager.coordinator, "acquire", forbidden)
     req = app.PinRequest(gen_id=1, token_ids=[1], generation_run_id=None)
+    with pytest.raises(app.HTTPException) as raised:
+        asyncio.run(app.api_lens_pin(req))
+    assert raised.value.status_code == 409
+    assert not called
+
+
+@pytest.mark.parametrize("run_id", [None, "", "A" * 32, "0" * 31, "g" * 32, 123])
+def test_pin_malformed_run_identity_is_rejected_before_handoff(monkeypatch, run_id):
+    from api import app
+
+    called = False
+
+    def forbidden(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("coordinator acquisition must not occur")
+
+    monkeypatch.setattr(app.manager.coordinator, "acquire", forbidden)
+    req = app.PinRequest.model_construct(gen_id=1, token_ids=[1], generation_run_id=run_id)
     with pytest.raises(app.HTTPException) as raised:
         asyncio.run(app.api_lens_pin(req))
     assert raised.value.status_code == 409

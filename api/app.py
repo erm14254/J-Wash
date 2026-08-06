@@ -213,6 +213,68 @@ class OperationHandoff:
         self.transferred = False
         self.closed = False
         self.state = HandoffState.ACQUIRED if token is not None else HandoffState.NEW
+        self.snapshot = None
+
+    @classmethod
+    @asynccontextmanager
+    async def acquire_scope(cls, coordinator, operation_type, *, stop_event=None, **acquire_kwargs):
+        """Install cleanup ownership before acquiring a coordinator lease."""
+        handoff = cls(coordinator, stop_event=stop_event)
+        cancelled = False
+        try:
+            token, snapshot = handoff.acquire(operation_type, **acquire_kwargs)
+            handoff.snapshot = snapshot
+            yield handoff
+        except asyncio.CancelledError:
+            cancelled = True
+            current = asyncio.current_task()
+            if current is not None and hasattr(current, "uncancel"):
+                current.uncancel()
+        finally:
+            handoff.snapshot = None
+            if not handoff.transferred and not handoff.closed:
+                cancelled |= await handoff._close_uninterruptibly()
+        if cancelled:
+            raise asyncio.CancelledError()
+
+    async def _close_uninterruptibly(self):
+        """Run close with a strongly retained task and an inline fallback."""
+        close_coro = close_task = None
+        cancelled = False
+        try:
+            try:
+                close_coro = self.close()
+                try:
+                    close_task = asyncio.create_task(close_coro)
+                    close_coro = None
+                except BaseException:
+                    if close_coro is not None and hasattr(close_coro, "close"):
+                        close_coro.close()
+                    close_coro = None
+                    try:
+                        await self.close()
+                    except asyncio.CancelledError:
+                        cancelled = True
+                else:
+                    try:
+                        await _drain_worker_uninterruptibly(close_task)
+                        close_task.result()
+                    except asyncio.CancelledError:
+                        cancelled = True
+            except BaseException:
+                logging.getLogger(__name__).exception("operation handoff cleanup failed")
+                if not self.closed and not self.transferred and self.dispatch is None and self.token is not None:
+                    self.coordinator.release(self.token)
+                    self.token = None
+                    self.closed = True
+                    self.state = HandoffState.CLOSED
+        finally:
+            close_coro = close_task = None
+            if cancelled:
+                current = asyncio.current_task()
+                if current is not None and hasattr(current, "uncancel"):
+                    current.uncancel()
+        return cancelled
 
     def _set_state(self, state):
         allowed = {
@@ -282,9 +344,23 @@ class OperationHandoff:
     def create_dispatch(self, payload=None):
         if self.state not in (HandoffState.ACQUIRED, HandoffState.PREPARING):
             raise RuntimeError("operation handoff dispatch is not available")
-        dispatch = WorkerDispatch(self.coordinator, self.token, self.stop_event, payload=payload)
-        self.set_dispatch(dispatch)
-        return dispatch
+        dispatch = None
+        self.set_heavy(dispatch_payload=payload)
+        try:
+            dispatch = WorkerDispatch(self.coordinator, self.token, self.stop_event, payload=payload)
+            self.set_dispatch(dispatch)
+            self.heavy.pop("dispatch_payload", None)
+            return dispatch
+        except BaseException as exc:
+            if dispatch is not None:
+                try:
+                    dispatch.clear_payload()
+                except BaseException:
+                    pass
+            self.heavy.pop("dispatch_payload", None)
+            kind, message = type(exc).__name__, str(exc)[:512]
+            exc.__traceback__ = exc.__context__ = exc.__cause__ = None
+            raise RuntimeError(f"{kind}: {message}") from None
 
     @asynccontextmanager
     async def awaiter_scope(self):
@@ -302,19 +378,7 @@ class OperationHandoff:
             raise
         finally:
             if not self.transferred and not self.closed:
-                close_task = None
-                try:
-                    close_task = asyncio.create_task(self.close())
-                    try:
-                        await _drain_worker_uninterruptibly(close_task)
-                        close_task.result()
-                    except asyncio.CancelledError:
-                        cancelled = True
-                        current = asyncio.current_task()
-                        if current is not None and hasattr(current, "uncancel"):
-                            current.uncancel()
-                finally:
-                    close_task = None
+                cancelled |= await self._close_uninterruptibly()
             if cancelled:
                 raise asyncio.CancelledError()
 
@@ -357,6 +421,7 @@ class OperationHandoff:
     async def create_thread_task(self, worker_factory, *, factory_args=(), factory_kwargs=None):
         primary_error = None
         worker = wrapper = task = None
+        retained = False
         try:
             factory = worker_factory
             args = tuple(factory_args)
@@ -367,31 +432,38 @@ class OperationHandoff:
             wrapper = asyncio.to_thread(worker)
             self.set_wrapper(wrapper)
             task = asyncio.create_task(wrapper)
+            _deferred_worker_tasks.add(task)
+            retained = True
             self.wrapper = None
             self.set_task(task)
             _retain_worker_task(task)
             self._set_state(HandoffState.TASK_RETAINED)
-            self.transferred = True
             self._set_state(HandoffState.TRANSFERRED)
+            self.transferred = True
             self.clear_heavy()
             factory = args = kwargs = worker = wrapper = None
             return task
         except BaseException as exc:
             primary_error = exc
-            wrapper = self.wrapper
+            registered_wrapper = self.wrapper
             self.wrapper = None
-            if wrapper is not None and hasattr(wrapper, "close"):
+            wrapper_to_close = wrapper if task is None else registered_wrapper
+            if wrapper_to_close is not None and hasattr(wrapper_to_close, "close"):
                 try:
-                    wrapper.close()
-                except Exception:
+                    wrapper_to_close.close()
+                except BaseException:
                     logging.getLogger(__name__).exception("failed to close unsubmitted worker wrapper")
             self.clear_heavy()
-            _deferred_worker_tasks.discard(self.task)
+            if retained or task is not None:
+                _deferred_worker_tasks.discard(task)
             if self.dispatch is not None:
                 self.dispatch.cancel_from_awaiter()
-                if self.task is not None:
+                task_to_drain = task or self.task
+                if task_to_drain is not None:
+                    if not task_to_drain.done():
+                        task_to_drain.cancel()
                     try:
-                        await _drain_worker_uninterruptibly(self.task)
+                        await _drain_worker_uninterruptibly(task_to_drain)
                     except asyncio.CancelledError:
                         if isinstance(primary_error, asyncio.CancelledError):
                             raise
@@ -2057,7 +2129,12 @@ def _make_lens_pin_worker(dispatch):
 
 @app.post("/api/lens/pin")
 async def api_lens_pin(req: PinRequest):
-    if req.generation_run_id is None:
+    run_id = req.generation_run_id
+    if (
+        not isinstance(run_id, str)
+        or len(run_id) != 32
+        or any(ch not in "0123456789abcdef" for ch in run_id)
+    ):
         raise HTTPException(409, "generation run identity is required; residual capture may have expired")
     stop_event = ThreadingEvent()
     handoff = OperationHandoff(manager.coordinator, stop_event=stop_event)
@@ -2870,11 +2947,13 @@ async def _setup_ws_worker(req):
     loop = asyncio.get_running_loop()
     queue = asyncio.Queue()
     stop_event = ThreadingEvent()
-    handoff = OperationHandoff(manager.coordinator, stop_event=stop_event)
+    handoff = None
     token = snap = context = payload = dispatch = task = None
     try:
-        token, snap = handoff.acquire(OperationType.GENERATE, requires_loaded=True)
-        async with handoff.awaiter_scope():
+        async with OperationHandoff.acquire_scope(
+            manager.coordinator, OperationType.GENERATE, stop_event=stop_event, requires_loaded=True,
+        ) as handoff:
+            token, snap = handoff.token, handoff.snapshot
             context = _captured_generation_context(token, snap, stop_event)
             if not req.get("lens"):
                 context = GenerationContext(
@@ -2891,6 +2970,12 @@ async def _setup_ws_worker(req):
                 factory_args=(dispatch, stop_event, loop, queue),
             )
         return ("ok", task, queue, stop_event, dispatch)
+    except asyncio.CancelledError:
+        snap = context = payload = task = None
+        if not handoff.transferred and not handoff.closed:
+            await handoff._close_uninterruptibly()
+        dispatch = handoff = None
+        raise
     except BaseException as exc:
         status = 409 if isinstance(exc, OperationConflict) else 422 if isinstance(exc, ModelStateError) else 500
         kind = type(exc).__name__[:128]
@@ -2899,7 +2984,7 @@ async def _setup_ws_worker(req):
         exc = None
         snap = context = payload = task = None
         if not handoff.transferred and not handoff.closed:
-            await handoff.close()
+            await handoff._close_uninterruptibly()
         dispatch = handoff = None
         return ("error", status, kind, message)
 
@@ -2933,16 +3018,24 @@ async def _finalize_ws_runtime(ws, worker, receiver, waiter, stop_event, dispatc
         current = asyncio.current_task()
         if current is not None and hasattr(current, "uncancel"):
             current.uncancel()
-    if worker.done() and not worker.cancelled():
+    raw_failure = None
+    if worker.cancelled():
+        raw_failure = "generation worker was cancelled without a terminal frame"
+    elif worker.done():
         try:
             outcome = worker.result()
-        except BaseException:
-            outcome = None
+        except BaseException as exc:
+            raw_failure = f"{type(exc).__name__}: {str(exc)[:384]}"
+            exc.__traceback__ = exc.__context__ = exc.__cause__ = None
     if not terminal_seen:
         if isinstance(outcome, WorkerOutcome) and not outcome.ok:
             failure_message = outcome.failure_message or "generation worker failed"
         elif isinstance(outcome, WorkerOutcome) and outcome.ok:
             failure_message = "generation worker completed without a terminal frame"
+        elif raw_failure is not None:
+            failure_message = raw_failure
+        else:
+            failure_message = "generation worker returned an invalid result without a terminal frame"
     worker = receiver = waiter = dispatch = outcome = None
     if failure_message is not None:
         try:
@@ -2966,12 +3059,16 @@ async def _run_chat(ws, req):
         return
     _, worker, queue, stop_event, dispatch = setup
     setup = None
-    receiver = waiter = None
+    receiver_coro = receiver = waiter_coro = waiter = None
     terminal_seen = False
     try:
-        receiver = asyncio.create_task(_watch_stop(ws, stop_event))
+        receiver_coro = _watch_stop(ws, stop_event)
+        receiver = asyncio.create_task(receiver_coro)
+        receiver_coro = None
         while True:
-            waiter = asyncio.create_task(queue.get())
+            waiter_coro = queue.get()
+            waiter = asyncio.create_task(waiter_coro)
+            waiter_coro = None
             done, _pending = await asyncio.wait(
                 {waiter, receiver, worker}, return_when=asyncio.FIRST_COMPLETED,
             )
@@ -2987,10 +3084,14 @@ async def _run_chat(ws, req):
             elif worker in done:
                 break
     finally:
+        if waiter_coro is not None and hasattr(waiter_coro, "close"):
+            waiter_coro.close()
+        if receiver_coro is not None and hasattr(receiver_coro, "close"):
+            receiver_coro.close()
         await _finalize_ws_runtime(
             ws, worker, receiver, waiter, stop_event, dispatch, terminal_seen,
         )
-        worker = receiver = waiter = queue = dispatch = None
+        worker = receiver_coro = receiver = waiter_coro = waiter = queue = dispatch = None
 
 
 
