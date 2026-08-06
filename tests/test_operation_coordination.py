@@ -1512,7 +1512,7 @@ def test_dispatched_routes_use_one_preacquisition_handoff():
     routes = (
         app.api_delete_model, app.api_lens_load, app.api_edit_export,
         app.api_edit_export_gguf, app.api_generate_sync, app.api_token_neighbors,
-        app.api_lens_pin, app._run_chat,
+        app.api_lens_pin, app._setup_ws_worker,
     )
     for route in routes:
         source = inspect.getsource(route)
