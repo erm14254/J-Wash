@@ -234,23 +234,32 @@ class OperationHandoff:
         if self.closed or self.state is not HandoffState.NEW:
             raise RuntimeError("operation handoff acquire is not available")
         token, snap = self.coordinator.acquire(operation_type, **kwargs)
+        failure = self._register_acquired(token, snap)
+        if failure is not None:
+            snap = None
+            self.coordinator.release(token)
+            token = None
+            self.closed = True
+            self.state = HandoffState.CLOSED
+            raise RuntimeError(f"{failure[0]}: {failure[1]}") from None
+        return token, snap
+
+    def _register_acquired(self, token, snap):
         try:
             self._set_state(HandoffState.ACQUIRED)
             self.token = token
             self.set_heavy(snap=snap)
         except BaseException as exc:
-            error_kind = type(exc).__name__
-            error_message = str(exc)[:512]
+            failure = (type(exc).__name__, str(exc)[:512])
+            exc.__traceback__ = None
+            exc.__context__ = None
+            exc.__cause__ = None
             exc = None
             snap = None
             self.heavy.clear()
             self.token = None
-            self.coordinator.release(token)
-            token = None
-            self.closed = True
-            self.state = HandoffState.CLOSED
-            raise RuntimeError(f"{error_kind}: {error_message}") from None
-        return token, snap
+            return failure
+        return None
 
     def set_heavy(self, **refs):
         if self.closed or self.transferred:
@@ -360,8 +369,6 @@ class OperationHandoff:
 
 
 def _retain_worker_task(task):
-    _deferred_worker_tasks.add(task)
-
     def _done(done_task):
         try:
             if not done_task.cancelled():
@@ -371,10 +378,14 @@ def _retain_worker_task(task):
         finally:
             _deferred_worker_tasks.discard(done_task)
 
+    added = False
     try:
+        _deferred_worker_tasks.add(task)
+        added = True
         task.add_done_callback(_done)
-    except Exception:
-        _deferred_worker_tasks.discard(task)
+    except BaseException:
+        if added:
+            _deferred_worker_tasks.discard(task)
         raise
 
 
@@ -2729,7 +2740,9 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
             conversation_id=msg["conversation_id"],
             message_id=message_id,
             text=old_content,
+            content=old_content,
             continued=False,
+            continuation_noop=True,
         ))
         return
     new_content = old_content + appended

@@ -470,6 +470,16 @@ def _rebase_capability_meta(jl):
     return capabilities.legacy(profile, loaded=True)
 
 
+def _marker_prefix_suffix(text, markers):
+    """Longest non-empty decoded suffix that can still become a marker."""
+    limit = min(len(text), max((len(marker) for marker in markers), default=0))
+    for size in range(limit, 0, -1):
+        suffix = text[-size:]
+        if any(marker.startswith(suffix) and marker != suffix for marker in markers):
+            return suffix
+    return ""
+
+
 class ModelManager:
     def __init__(self):
         self._lock = threading.Lock()
@@ -805,6 +815,7 @@ class ModelManager:
                     emit(frame)
 
             reply_ids = []
+            pending = []
             emitted = ""
             stop_reason = None
             started = time.perf_counter()
@@ -820,33 +831,35 @@ class ModelManager:
                 if next_id in hidden_special_ids:
                     stop_reason = "hidden_special_token"
                     break
-                reply_ids.append(next_id)
-                decoded_reply = tokenizer.decode(reply_ids, skip_special_tokens=True)
-                matched_marker = next((marker for marker in stop_seqs if decoded_reply.endswith(marker)), None)
+                absolute_pos = input_ids.shape[1] + len(reply_ids) + len(pending)
+                pending.append({"token_id": next_id, "pos": absolute_pos, "frame": None})
+                pending_text = tokenizer.decode(
+                    [item["token_id"] for item in pending], skip_special_tokens=True
+                )
+                matched_marker = next((marker for marker in stop_seqs if pending_text.endswith(marker)), None)
                 if matched_marker is not None:
-                    marker_tokens = 1
-                    for suffix_len in range(1, len(reply_ids) + 1):
-                        suffix_text = tokenizer.decode(reply_ids[-suffix_len:], skip_special_tokens=True)
+                    marker_tokens = len(pending)
+                    for suffix_len in range(1, len(pending) + 1):
+                        suffix_text = tokenizer.decode(
+                            [item["token_id"] for item in pending[-suffix_len:]],
+                            skip_special_tokens=True,
+                        )
                         if suffix_text.endswith(matched_marker):
                             marker_tokens = suffix_len
                             break
-                    del reply_ids[-marker_tokens:]
+                    del pending[-marker_tokens:]
+                    # Any earlier pending entries are confirmed ordinary text.
+                    for item in pending:
+                        reply_ids.append(item["token_id"])
+                        if item["frame"] is not None:
+                            emit(item["frame"])
+                    pending.clear()
                     stop_reason = "fallback_stop_sequence"
                     break
                 if penalty_ids is not None:
                     penalty_ids = torch.cat(
                         [penalty_ids, torch.tensor([next_id], device=penalty_ids.device)]
                     )
-                held_stop_prefix = 0
-                for suffix_len in range(1, len(reply_ids) + 1):
-                    suffix_text = tokenizer.decode(reply_ids[-suffix_len:], skip_special_tokens=True)
-                    if any(marker.startswith(suffix_text) and suffix_text != marker for marker in stop_seqs):
-                        held_stop_prefix = suffix_len
-                visible_ids = reply_ids[:-held_stop_prefix] if held_stop_prefix else reply_ids
-                text = tokenizer.decode(visible_ids, skip_special_tokens=True)
-                if not text.endswith("�") and len(text) > len(emitted):
-                    emit({"type": "token", "text": text[len(emitted):]})
-                    emitted = text
                 out = hf_model(
                     input_ids=torch.tensor([[next_id]], device=_input_device(hf_model)),
                     past_key_values=cache,
@@ -862,12 +875,45 @@ class ModelManager:
                         jl,
                         [next_id],
                         gen_id=gen_id,
-                        abs_positions=[input_ids.shape[1] + len(reply_ids) - 1],
+                        abs_positions=[absolute_pos],
                     )[0]
                     frame["generation_run_id"] = generation_run_id
-                    emit(frame)
+                    pending[-1]["frame"] = frame
+
+                # Keep only the smallest whole-token suffix whose decoded tail
+                # can still become a marker.  A token containing visible text
+                # plus a marker prefix remains wholly undecided.
+                keep_from = len(pending)
+                for index in range(len(pending)):
+                    suffix_text = tokenizer.decode(
+                        [item["token_id"] for item in pending[index:]],
+                        skip_special_tokens=True,
+                    )
+                    if _marker_prefix_suffix(suffix_text, stop_seqs):
+                        keep_from = index
+                        break
+                confirmed, pending = pending[:keep_from], pending[keep_from:]
+                for item in confirmed:
+                    reply_ids.append(item["token_id"])
+                    if item["frame"] is not None:
+                        emit(item["frame"])
+                text = tokenizer.decode(reply_ids, skip_special_tokens=True)
+                if not text.endswith("�") and len(text) > len(emitted):
+                    emit({"type": "token", "text": text[len(emitted):]})
+                    emitted = text
 
             elapsed = time.perf_counter() - started
+            # A possible marker prefix is never promoted at cancellation or the
+            # token limit.  Otherwise the bounded tail is confirmed wholesale.
+            pending_text = tokenizer.decode(
+                [item["token_id"] for item in pending], skip_special_tokens=True
+            ) if pending else ""
+            if pending and not _marker_prefix_suffix(pending_text, stop_seqs):
+                for item in pending:
+                    reply_ids.append(item["token_id"])
+                    if item["frame"] is not None:
+                        emit(item["frame"])
+            pending.clear()
             durable_reply_ids = tuple(int(token_id) for token_id in reply_ids)
             text = tokenizer.decode(durable_reply_ids, skip_special_tokens=True)
             durable_reply_tokens = len(durable_reply_ids)

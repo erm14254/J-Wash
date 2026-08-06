@@ -4,6 +4,7 @@ import DOMPurify from 'dompurify'
 import LensView from './LensView.jsx'
 import LensDiff from './Diff.jsx'
 import Editor from './Editor.jsx'
+import { applyGenerationTerminal } from './continuationState.js'
 import { fmtTok } from './tok'
 
 const GB = 2 ** 30
@@ -464,19 +465,16 @@ export default function App() {
       framesRef.current = []
       setFramesCount(0)
       setSelectedIdx(null)
-      if (frame.continued && frame.message_id != null) {
+      if (frame.continuation_noop) {
+        continuingIdRef.current = null
+        setContinuingId(null)
+        setMessages((prev) => applyGenerationTerminal(prev, frame, frames).messages)
+      } else if (frame.continued && frame.message_id != null) {
         // continuation: update the extended reply in place (frame.text is the
         // FULL new content) and reload its merged frames blob
         continuingIdRef.current = null
         setContinuingId(null)
-        setMessages((prev) => prev.map((m) => (m.id === frame.message_id
-          ? {
-              ...m, content: frame.text, stats: frame.stats,
-              gen_id: frame.gen_id, generation_run_id: frame.generation_run_id,
-              has_frames: m.has_frames || frames.length > 0,
-              frames: undefined,
-            }
-          : m)))
+        setMessages((prev) => applyGenerationTerminal(prev, frame, frames).messages)
         framesTriedRef.current.delete(frame.message_id)
         jsonFetch(`/api/messages/${frame.message_id}/frames`)
           .then((body) => {
@@ -487,17 +485,7 @@ export default function App() {
           })
           .catch(() => {})
       } else {
-        setMessages((prev) => [...prev, {
-          id: frame.message_id ?? null,
-          role: 'assistant',
-          content: frame.text,
-          meta: frame.meta,
-          stats: frame.stats,
-          gen_id: frame.gen_id,
-          generation_run_id: frame.generation_run_id,
-          has_frames: frames.length > 0,
-          frames,
-        }])
+        setMessages((prev) => applyGenerationTerminal(prev, frame, frames).messages)
       }
       draftRef.current = ''
       setDraft(null)

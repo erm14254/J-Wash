@@ -1409,8 +1409,10 @@ def test_operation_handoff_acquire_rolls_back_snapshot_registration_failure(monk
     coordinator = ModelSessionCoordinator()
     handoff = app.OperationHandoff(coordinator, stop_event=threading.Event())
     monkeypatch.setattr(handoff, "set_heavy", lambda **_refs: (_ for _ in ()).throw(MemoryError("injected")))
-    with pytest.raises(RuntimeError, match="MemoryError: injected"):
+    with pytest.raises(RuntimeError, match="MemoryError: injected") as raised:
         handoff.acquire(OperationType.GENERATE)
+    assert raised.value.__context__ is None
+    assert raised.value.__cause__ is None
     assert coordinator.status_snapshot().operation is None
     assert handoff.state is app.HandoffState.CLOSED
 
@@ -1457,3 +1459,14 @@ def test_dispatched_routes_use_one_preacquisition_handoff():
         assert "handoff.create_dispatch(" in source, route.__name__
         assert "manager.coordinator.acquire(" not in source, route.__name__
         assert "_handoff_thread_worker" not in source, route.__name__
+
+
+def test_marker_tail_recognizes_alternate_decoded_prefixes_without_full_history():
+    from core.model_manager import _marker_prefix_suffix
+
+    markers = ("\nUser:", "\nAssistant:")
+    assert _marker_prefix_suffix("\nUs", markers) == "\nUs"
+    assert _marker_prefix_suffix("ordinary text\nAss", markers) == "\nAss"
+    assert _marker_prefix_suffix("ordinary text", markers) == ""
+    long_text = "x" * 10000 + "\nUser"
+    assert _marker_prefix_suffix(long_text, markers) == "\nUser"
