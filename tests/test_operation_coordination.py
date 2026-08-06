@@ -263,6 +263,56 @@ def test_ws_setup_cancellation_before_scope_target_assignment_is_reraised(monkey
         asyncio.run(app._setup_ws_worker({"messages": []}))
 
 
+def test_worker_drain_closes_unsubmitted_drain_coroutine(monkeypatch):
+    from api import app
+
+    async def scenario():
+        worker = asyncio.create_task(asyncio.sleep(0))
+        captured = {}
+
+        def fail_create_task(coro):
+            captured["coro"] = coro
+            raise MemoryError("drain task allocation failed")
+
+        monkeypatch.setattr(app.asyncio, "create_task", fail_create_task)
+        result = await app._drain_worker_uninterruptibly(worker)
+        assert result == [None]
+        assert captured["coro"].cr_frame is None
+
+    asyncio.run(scenario())
+
+
+def test_ws_finalizer_continues_after_early_cleanup_base_exception(monkeypatch):
+    from api import app
+
+    async def scenario():
+        worker = asyncio.create_task(asyncio.sleep(0, result=app.WorkerOutcome()))
+        await worker
+        phases = []
+
+        async def fail_task_cleanup(_task):
+            phases.append("task_cleanup")
+            raise KeyboardInterrupt("cleanup injection")
+
+        async def record_drain(task):
+            phases.append("worker_drain")
+            return await asyncio.gather(task, return_exceptions=True)
+
+        class Dispatch:
+            def cancel_from_awaiter(self):
+                phases.append("dispatch_cancel")
+
+        monkeypatch.setattr(app, "_cancel_task_uninterruptibly", fail_task_cleanup)
+        monkeypatch.setattr(app, "_drain_worker_uninterruptibly", record_drain)
+        await app._finalize_ws_runtime(
+            object(), worker, object(), object(), threading.Event(), Dispatch(), True,
+        )
+        assert phases.count("task_cleanup") == 2
+        assert phases[-2:] == ["dispatch_cancel", "worker_drain"]
+
+    asyncio.run(scenario())
+
+
 def test_dispatched_routes_use_handoff_scope_and_factory_descriptors():
     import inspect
     from api import app
