@@ -1470,3 +1470,25 @@ def test_marker_tail_recognizes_alternate_decoded_prefixes_without_full_history(
     assert _marker_prefix_suffix("ordinary text", markers) == ""
     long_text = "x" * 10000 + "\nUser"
     assert _marker_prefix_suffix(long_text, markers) == "\nUser"
+
+
+def test_marker_tail_keeps_latest_eligible_token_boundary():
+    from core.model_manager import (
+        FALLBACK_MARKER_TOKEN_LIMIT,
+        _smallest_marker_tail_start,
+    )
+
+    class Tokenizer:
+        pieces = {1: "v\nU", 2: "v\nU"}
+
+        def decode(self, ids, **_kwargs):
+            return "".join(self.pieces[token_id] for token_id in ids)
+
+    pending = [
+        {"token_id": 1, "pos": 10, "frame": {"pos": 10}},
+        {"token_id": 2, "pos": 11, "frame": {"pos": 11}},
+    ]
+    assert _smallest_marker_tail_start(
+        pending, Tokenizer(), ("\nUser:", "\nAssistant:")
+    ) == 1
+    assert FALLBACK_MARKER_TOKEN_LIMIT == 32

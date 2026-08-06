@@ -480,6 +480,32 @@ def _marker_prefix_suffix(text, markers):
     return ""
 
 
+# Marker buffering is deliberately independent of the requested generation
+# length.  The character allowance covers a tokenizer boundary that includes
+# ordinary text alongside the beginning of a fallback marker.
+FALLBACK_MARKER_TOKEN_LIMIT = 32
+FALLBACK_MARKER_BOUNDARY_CHARS = 16
+
+
+def _smallest_marker_tail_start(pending, tokenizer, markers):
+    """Return the latest whole-token boundary that may finish a marker."""
+    if not pending:
+        return 0
+    lower = max(0, len(pending) - FALLBACK_MARKER_TOKEN_LIMIT)
+    max_chars = max((len(marker) for marker in markers), default=0)
+    max_chars += FALLBACK_MARKER_BOUNDARY_CHARS
+    for index in range(len(pending) - 1, lower - 1, -1):
+        suffix_text = tokenizer.decode(
+            [item["token_id"] for item in pending[index:]],
+            skip_special_tokens=True,
+        )
+        if len(suffix_text) > max_chars:
+            break
+        if _marker_prefix_suffix(suffix_text, markers):
+            return index
+    return len(pending)
+
+
 class ModelManager:
     def __init__(self):
         self._lock = threading.Lock()
@@ -833,6 +859,8 @@ class ModelManager:
                     break
                 absolute_pos = input_ids.shape[1] + len(reply_ids) + len(pending)
                 pending.append({"token_id": next_id, "pos": absolute_pos, "frame": None})
+                # ``pending`` is kept at a fixed size below; decoding it can
+                # therefore never grow with max_tokens.
                 pending_text = tokenizer.decode(
                     [item["token_id"] for item in pending], skip_special_tokens=True
                 )
@@ -883,24 +911,27 @@ class ModelManager:
                 # Keep only the smallest whole-token suffix whose decoded tail
                 # can still become a marker.  A token containing visible text
                 # plus a marker prefix remains wholly undecided.
-                keep_from = len(pending)
-                for index in range(len(pending)):
-                    suffix_text = tokenizer.decode(
-                        [item["token_id"] for item in pending[index:]],
-                        skip_special_tokens=True,
-                    )
-                    if _marker_prefix_suffix(suffix_text, stop_seqs):
-                        keep_from = index
-                        break
+                keep_from = _smallest_marker_tail_start(
+                    pending, tokenizer, stop_seqs
+                )
+                # This is a hard safety bound, not a truncation policy: entries
+                # outside it are confirmed and flushed with their frames.
+                keep_from = max(
+                    keep_from, len(pending) - FALLBACK_MARKER_TOKEN_LIMIT
+                )
                 confirmed, pending = pending[:keep_from], pending[keep_from:]
                 for item in confirmed:
                     reply_ids.append(item["token_id"])
                     if item["frame"] is not None:
                         emit(item["frame"])
-                text = tokenizer.decode(reply_ids, skip_special_tokens=True)
-                if not text.endswith("�") and len(text) > len(emitted):
-                    emit({"type": "token", "text": text[len(emitted):]})
-                    emitted = text
+                if confirmed:
+                    delta = tokenizer.decode(
+                        [item["token_id"] for item in confirmed],
+                        skip_special_tokens=True,
+                    )
+                    if delta and not delta.endswith("�"):
+                        emit({"type": "token", "text": delta})
+                        emitted += delta
 
             elapsed = time.perf_counter() - started
             # A possible marker prefix is never promoted at cancellation or the
