@@ -1318,6 +1318,8 @@ def test_operation_handoff_can_own_acquisition_before_setup():
     assert token is handoff.token
     assert handoff.state is app.HandoffState.PREPARING
     assert handoff.heavy["snap"] is snap
+    handoff.clear_heavy()
+    c.release(token)
 
 
 def test_operation_handoff_acquire_rolls_back_snapshot_registration_failure(monkeypatch):
@@ -1344,5 +1346,3 @@ def test_operation_handoff_close_before_dispatch_is_idempotent():
     asyncio.run(handoff.close())
     assert coordinator.status_snapshot().operation is None
     assert handoff.state is app.HandoffState.CLOSED
-    handoff.clear_heavy()
-    c.release(token)
