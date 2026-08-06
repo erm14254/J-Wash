@@ -404,7 +404,6 @@ def test_http_generation_with_coordinated_mappingproxy_intervention(monkeypatch)
     import asyncio
     from types import MappingProxyType, SimpleNamespace
     from api import app
-    from core.model_session import LoadedModelBundle, ModelSessionCoordinator, OperationType
 
     class Layer:
         def __init__(self):
@@ -551,6 +550,65 @@ def test_http_generation_metadata_preserves_captured_intervention_provenance(mon
     assert result["last_generation"]["meta"]["intervention_provenance"] == provenance
 
 
+def test_fallback_generation_emits_authoritative_replacement_character(monkeypatch):
+    import threading
+    import torch
+    from types import SimpleNamespace
+    from api import app
+
+    class Tokenizer:
+        chat_template = ""
+        unk_token_id = -1
+        all_special_ids = ()
+
+        def apply_chat_template(self, *_args, **_kwargs):
+            return torch.tensor([[1]])
+
+        def decode(self, ids, **_kwargs):
+            return "\ufffd" if list(ids) else ""
+
+        def encode(self, *_args, **_kwargs):
+            return [1]
+
+        def convert_tokens_to_ids(self, _token):
+            return -1
+
+    class Model:
+        generation_config = SimpleNamespace(eos_token_id=2)
+
+        def __init__(self):
+            self.config = SimpleNamespace(get_text_config=lambda: SimpleNamespace(num_hidden_layers=1, hidden_size=4))
+            self.emb = SimpleNamespace(weight=torch.zeros(4, 4))
+
+        def get_input_embeddings(self):
+            return self.emb
+
+        def __call__(self, **_kwargs):
+            logits = torch.zeros(1, 1, 5)
+            logits[0, 0, 3] = 10
+            return SimpleNamespace(logits=logits, past_key_values=None)
+
+    monkeypatch.setattr(app.manager, "hf_model", Model())
+    monkeypatch.setattr(app.manager, "tokenizer", Tokenizer())
+    monkeypatch.setattr(app.manager, "jl", SimpleNamespace(layers=[]))
+    monkeypatch.setattr(
+        app.manager, "meta", {"model_id": "fallback", "chat_template_fallback": True}
+    )
+    emitted = []
+    app.manager.generate(
+        [{"role": "user", "content": "hi"}],
+        {"max_tokens": 1, "temperature": 0, "top_p": 1, "top_k": 0, "seed": 1},
+        threading.Event(), emitted.append,
+    )
+
+    tokens = [event["text"] for event in emitted if event["type"] == "token"]
+    done = next(event for event in emitted if event["type"] == "done")
+    assert tokens == ["\ufffd"]
+    assert "".join(tokens) == done["text"] == "\ufffd"
+    assert done["durable_reply_token_ids"] == [3]
+    assert done["durable_generated_token_count"] == 1
+
+
 def test_persisted_continue_records_segment_provenance(monkeypatch):
     import json
     import threading
@@ -628,6 +686,10 @@ def test_persisted_continue_records_segment_provenance(monkeypatch):
     assert saved_meta["continuations"][-1]["end_offset"] == 7
     assert saved_meta["continuations"][-1]["meta"]["intervention_provenance"]["revision"] == 2
     assert emitted[-1]["meta"]["intervention_provenance"]["revision"] == 2
+    assert emitted[-1]["text"] == " new"
+    assert emitted[-1]["content"] == "old new"
+    assert emitted[-1]["continued"] is True
+    assert emitted[-1]["continuation_noop"] is False
 
 
 def test_zero_length_continuation_does_not_reattribute_existing_text(monkeypatch):
@@ -659,8 +721,10 @@ def test_zero_length_continuation_does_not_reattribute_existing_text(monkeypatch
     emitted = []
     app._persisted_continue({}, 1, threading.Event(), emitted.append, SimpleNamespace(lens=None, intervention_snapshot={"rules": []}))
     assert fake_store.updated is None
-    assert emitted[-1]["text"] == "old"
+    assert emitted[-1]["text"] == ""
+    assert emitted[-1]["content"] == "old"
     assert emitted[-1]["continued"] is False
+    assert emitted[-1]["continuation_noop"] is True
 
 
 def test_preset_save_persists_coordinated_provenance(monkeypatch):
@@ -1652,9 +1716,42 @@ def test_store_migrates_and_increments_conversation_versions(tmp_path, monkeypat
     assert updated.expected_version == 1
     assert updated.observed_version == 2
     row = store._conn().execute(
-        "SELECT version FROM conversations WHERE id = ?", (created.value,)
+        "SELECT version, incarnation_id FROM conversations WHERE id = ?", (created.value,)
     ).fetchone()
     assert row["version"] == 2
+    assert len(row["incarnation_id"]) == 32
+    assert row["incarnation_id"] == row["incarnation_id"].lower()
+
+
+def test_store_migrates_stable_conversation_incarnation(tmp_path, monkeypatch):
+    import sqlite3
+    from core import store as store_mod
+
+    database = tmp_path / "legacy.sqlite3"
+    conn = sqlite3.connect(database)
+    conn.execute(
+        "CREATE TABLE conversations (id INTEGER PRIMARY KEY, title TEXT NOT NULL DEFAULT '', "
+        "tags TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO conversations VALUES (7, 'legacy', '[]', '2020-01-01', '2020-01-01')"
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(store_mod, "DB_PATH", database)
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+
+    first_store = store_mod.Store()
+    first = first_store._conn().execute(
+        "SELECT incarnation_id FROM conversations WHERE id = 7"
+    ).fetchone()[0]
+    first_store._discard_conn(first_store._conn())
+    second = store_mod.Store()._conn().execute(
+        "SELECT incarnation_id FROM conversations WHERE id = 7"
+    ).fetchone()[0]
+    assert second == first
+    assert len(first) == 32
+    assert all(char in "0123456789abcdef" for char in first)
 
 
 def test_conversation_delete_records_causal_tombstone(tmp_path, monkeypatch):
@@ -1669,11 +1766,89 @@ def test_conversation_delete_records_causal_tombstone(tmp_path, monkeypatch):
     assert deleted.expected_version == 1
     assert deleted.observed_version == 2
     tombstone = store._conn().execute(
-        "SELECT mutation_id, deleted_version FROM conversation_tombstones WHERE conversation_id = ?",
+        "SELECT mutation_id, incarnation_id, deleted_version FROM conversation_tombstones WHERE conversation_id = ?",
         (created.value,),
     ).fetchone()
     assert tombstone["mutation_id"] == deleted.value
     assert tombstone["deleted_version"] == 2
+    assert len(tombstone["incarnation_id"]) == 32
+
+
+def test_conversation_recreation_preserves_prior_delete_identity(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    store = store_mod.Store()
+    first = store.create_conversation("first")
+    first_row = store._conn().execute(
+        "SELECT incarnation_id FROM conversations WHERE id = ?", (first.value,)
+    ).fetchone()
+    deleted = store.delete_conversation(first.value)
+    second = store.create_conversation("second")
+    second_row = store._conn().execute(
+        "SELECT incarnation_id, version FROM conversations WHERE id = ?", (second.value,)
+    ).fetchone()
+    tombstone = store._conn().execute(
+        "SELECT incarnation_id, mutation_id FROM conversation_tombstones WHERE mutation_id = ?",
+        (deleted.value,),
+    ).fetchone()
+
+    assert second.value == first.value
+    assert second_row["version"] == 1
+    assert second_row["incarnation_id"] != first_row["incarnation_id"]
+    assert tombstone["incarnation_id"] == first_row["incarnation_id"]
+    assert tombstone["mutation_id"] == deleted.value
+
+
+def test_delete_reconciliation_survives_same_id_recreation(tmp_path, monkeypatch):
+    import sqlite3
+    import uuid
+    from core import store as store_mod
+
+    database = tmp_path / "db.sqlite3"
+    monkeypatch.setattr(store_mod, "DB_PATH", database)
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    store = store_mod.Store()
+    created = store.create_conversation("first")
+    original = store._conn().execute(
+        "SELECT incarnation_id FROM conversations WHERE id = ?", (created.value,)
+    ).fetchone()[0]
+    operational = store._conn()
+
+    class CommitThenRecreate:
+        def __getattr__(self, name):
+            return getattr(operational, name)
+
+        @property
+        def in_transaction(self):
+            return operational.in_transaction
+
+        def commit(self):
+            operational.commit()
+            replacement = sqlite3.connect(database)
+            replacement.execute(
+                "INSERT INTO conversations "
+                "(id, title, tags, created_at, updated_at, version, incarnation_id) "
+                "VALUES (?, 'second', '[]', 'later', 'later', 1, ?)",
+                (created.value, uuid.uuid4().hex),
+            )
+            replacement.commit()
+            replacement.close()
+            raise RuntimeError("commit acknowledgement lost")
+
+    monkeypatch.setattr(store, "_conn", lambda: CommitThenRecreate())
+    deleted = store.delete_conversation(created.value)
+    replacement = sqlite3.connect(database).execute(
+        "SELECT incarnation_id FROM conversations WHERE id = ?", (created.value,)
+    ).fetchone()[0]
+    tombstone = sqlite3.connect(database).execute(
+        "SELECT incarnation_id FROM conversation_tombstones WHERE mutation_id = ?", (deleted.value,)
+    ).fetchone()[0]
+
+    assert deleted.state == "committed"
+    assert replacement != original
+    assert tombstone == original
 
 
 def _commit_then_raise_proxy(conn):

@@ -470,8 +470,8 @@ export default function App() {
         setContinuingId(null)
         setMessages((prev) => applyGenerationTerminal(prev, frame, frames).messages)
       } else if (frame.continued && frame.message_id != null) {
-        // continuation: update the extended reply in place (frame.text is the
-        // FULL new content) and reload its merged frames blob
+        // Continuation text is the generated suffix; content is the complete
+        // durable assistant value used for the in-place update.
         continuingIdRef.current = null
         setContinuingId(null)
         setMessages((prev) => applyGenerationTerminal(prev, frame, frames).messages)
@@ -489,7 +489,7 @@ export default function App() {
       }
       draftRef.current = ''
       setDraft(null)
-      if (!frame.text && !frame.continued) {
+      if (!frame.text && !frame.continued && !frame.continuation_noop) {
         setNotice({
           kind: 'err',
           text: 'the model emitted end-of-turn immediately (0 tokens) — strong '

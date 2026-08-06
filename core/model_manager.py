@@ -843,6 +843,7 @@ class ModelManager:
             started = time.perf_counter()
             penalty_ids = input_ids[0].to(logits.device) if repetition_penalty != 1.0 else None
             for _ in range(max_tokens):
+                assert len(pending) <= FALLBACK_MARKER_TOKEN_LIMIT
                 if stop_event.is_set():
                     break
                 next_id = _sample(logits[0].float(), temperature, top_p, top_k, generator,
@@ -854,7 +855,20 @@ class ModelManager:
                     stop_reason = "hidden_special_token"
                     break
                 absolute_pos = input_ids.shape[1] + len(reply_ids) + len(pending)
+                if len(pending) == FALLBACK_MARKER_TOKEN_LIMIT:
+                    # Conservative overflow policy: the earliest whole token is
+                    # confirmed and flushed before admitting the incoming token.
+                    # Supported role markers cannot require this many tokens;
+                    # importantly, confirmed content is never discarded.
+                    earliest = pending.pop(0)
+                    reply_ids.append(earliest["token_id"])
+                    if earliest["frame"] is not None:
+                        if stop_seqs:
+                            retained_generation_frames.append(earliest["frame"])
+                        else:
+                            emit(earliest["frame"])
                 pending.append({"token_id": next_id, "pos": absolute_pos, "frame": None})
+                assert len(pending) <= FALLBACK_MARKER_TOKEN_LIMIT
                 # ``pending`` is kept at a fixed size below; decoding it can
                 # therefore never grow with max_tokens.
                 pending_text = tokenizer.decode(
@@ -919,6 +933,7 @@ class ModelManager:
                     keep_from, len(pending) - FALLBACK_MARKER_TOKEN_LIMIT
                 )
                 confirmed, pending = pending[:keep_from], pending[keep_from:]
+                assert len(pending) <= FALLBACK_MARKER_TOKEN_LIMIT
                 for item in confirmed:
                     reply_ids.append(item["token_id"])
                     if item["frame"] is not None:
@@ -953,7 +968,11 @@ class ModelManager:
             durable_reply_ids = tuple(int(token_id) for token_id in reply_ids)
             text = tokenizer.decode(durable_reply_ids, skip_special_tokens=True)
             durable_reply_tokens = len(durable_reply_ids)
-            if not text.endswith("�") and len(text) > len(emitted):
+            if stop_seqs:
+                if text:
+                    emit({"type": "token", "text": text})
+                    emitted = text
+            elif not text.endswith("�") and len(text) > len(emitted):
                 emit({"type": "token", "text": text[len(emitted):]})
                 emitted = text
             if stop_seqs:

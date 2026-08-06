@@ -2840,7 +2840,7 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
             done_holder,
             conversation_id=msg["conversation_id"],
             message_id=message_id,
-            text=old_content,
+            text="",
             content=old_content,
             continued=False,
             continuation_noop=True,
@@ -2902,8 +2902,10 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
         done_holder,
         conversation_id=msg["conversation_id"],
         message_id=message_id,
-        text=new_content,
+        text=appended,
+        content=new_content,
         continued=True,
+        continuation_noop=False,
     ))
 
 

@@ -9,10 +9,11 @@ export function applyGenerationTerminal(messages, frame, frames = []) {
     return { messages, clearContinuation: true, clearAttempt: true, reloadFrames: false }
   }
   if (frame.continued && frame.message_id != null) {
+    const durableContent = frame.content !== undefined ? frame.content : frame.text
     return {
       messages: messages.map((message) => message.id === frame.message_id ? {
         ...message,
-        content: frame.text,
+        content: durableContent,
         stats: frame.stats,
         gen_id: frame.gen_id,
         generation_run_id: frame.generation_run_id,
