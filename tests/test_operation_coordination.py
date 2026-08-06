@@ -174,6 +174,57 @@ def test_operation_handoff_closes_unsubmitted_to_thread_wrapper(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_handoff_awaiter_scope_closes_on_base_exception():
+    from api import app
+
+    async def scenario():
+        coordinator = ModelSessionCoordinator()
+        handoff = app.OperationHandoff(coordinator, stop_event=threading.Event())
+        handoff.acquire(OperationType.MODEL_DELETE, include_bundle=False)
+        with pytest.raises(KeyboardInterrupt):
+            async with handoff.awaiter_scope():
+                raise KeyboardInterrupt("setup failed")
+        assert handoff.closed
+        assert coordinator.snapshot().operation is None
+        successor, _ = coordinator.acquire(OperationType.MODEL_DELETE, include_bundle=False)
+        coordinator.release(successor)
+
+    asyncio.run(scenario())
+
+
+def test_dispatched_routes_use_handoff_scope_and_factory_descriptors():
+    import inspect
+    from api import app
+
+    routes = (
+        app.api_delete_model, app.api_lens_load, app.api_edit_export,
+        app.api_edit_export_gguf, app.api_generate_sync,
+        app.api_token_neighbors, app.api_lens_pin, app._setup_ws_worker,
+    )
+    for route in routes:
+        source = inspect.getsource(route)
+        assert "async with handoff.awaiter_scope()" in source
+        assert "create_thread_task(lambda" not in source
+
+
+def test_pin_missing_run_identity_is_rejected_before_handoff(monkeypatch):
+    from api import app
+
+    called = False
+
+    def forbidden(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("coordinator acquisition must not occur")
+
+    monkeypatch.setattr(app.manager.coordinator, "acquire", forbidden)
+    req = app.PinRequest(gen_id=1, token_ids=[1], generation_run_id=None)
+    with pytest.raises(app.HTTPException) as raised:
+        asyncio.run(app.api_lens_pin(req))
+    assert raised.value.status_code == 409
+    assert not called
+
+
 def test_publication_gate_cancellation_wins_before_rename():
     published = []
     gate = PublicationGate(lambda: True)
