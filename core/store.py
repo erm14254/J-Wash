@@ -656,9 +656,6 @@ class Store:
                     if current is None:
                         return "superseded", None, None, None
                     observed = current["version"]
-                    actual = tuple(current[key] for key in ("content", "meta", "frames_file", "version"))
-                    if actual == intended:
-                        return "committed", observed, None, None
                     return "stale", observed, None, "message changed before edit"
                 return self._reconcile_mutation(
                     "update_message", message_id,
@@ -781,6 +778,14 @@ class Store:
                 )
             old_file = row["frames_file"]
             original = tuple(row[key] for key in ("content", "meta", "frames_file", "version"))
+            if row["version"] != expected_version:
+                self._rollback_or_discard(conn)
+                self._unlink_candidate_if_unreferenced(frame_file, final_path)
+                return self._mutation_outcome(
+                    "superseded", mutation, entity_id=message_id,
+                    expected_version=expected_version, observed_version=row["version"],
+                    message="message changed before continuation",
+                )
             target_frame = None if clear_frames else (
                 frame_file if frame_file is not None else old_file
             )
@@ -937,6 +942,12 @@ class Store:
                 "superseded", mutation, entity_id=message_id,
                 expected_version=expected_version,
             )
+        if initial["version"] != expected_version:
+            return self._mutation_outcome(
+                "superseded", mutation, entity_id=message_id,
+                expected_version=expected_version, observed_version=initial["version"],
+                message="frame publication state was replaced",
+            )
         original = tuple(initial[key] for key in ("meta", "frames_file", "version"))
         intended = (meta_sql, None, intended_version)
 
@@ -1015,6 +1026,12 @@ class Store:
         baseline = row["version"] if expected_version is None else expected_version
         old_file = row["frames_file"]
         original = (row["frames_file"], row["meta"], row["version"])
+        if row["version"] != baseline:
+            return self._mutation_outcome(
+                "stale", mutation, entity_id=message_id,
+                expected_version=baseline, observed_version=row["version"],
+                message="message changed before frames attached",
+            )
         try:
             filename, final_path = self._write_unique_frame_candidate(
                 message_id, baseline,
