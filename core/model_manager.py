@@ -481,10 +481,9 @@ def _marker_prefix_suffix(text, markers):
 
 
 # Marker buffering is deliberately independent of the requested generation
-# length.  The character allowance covers a tokenizer boundary that includes
-# ordinary text alongside the beginning of a fallback marker.
+# length. Token count is the bound; a single decoded token may be arbitrarily
+# long while still ending in a live marker prefix.
 FALLBACK_MARKER_TOKEN_LIMIT = 32
-FALLBACK_MARKER_BOUNDARY_CHARS = 16
 
 
 def _smallest_marker_tail_start(pending, tokenizer, markers):
@@ -492,15 +491,11 @@ def _smallest_marker_tail_start(pending, tokenizer, markers):
     if not pending:
         return 0
     lower = max(0, len(pending) - FALLBACK_MARKER_TOKEN_LIMIT)
-    max_chars = max((len(marker) for marker in markers), default=0)
-    max_chars += FALLBACK_MARKER_BOUNDARY_CHARS
     for index in range(len(pending) - 1, lower - 1, -1):
         suffix_text = tokenizer.decode(
             [item["token_id"] for item in pending[index:]],
             skip_special_tokens=True,
         )
-        if len(suffix_text) > max_chars:
-            break
         if _marker_prefix_suffix(suffix_text, markers):
             return index
     return len(pending)
@@ -842,6 +837,7 @@ class ModelManager:
 
             reply_ids = []
             pending = []
+            retained_generation_frames = []
             emitted = ""
             stop_reason = None
             started = time.perf_counter()
@@ -880,7 +876,10 @@ class ModelManager:
                     for item in pending:
                         reply_ids.append(item["token_id"])
                         if item["frame"] is not None:
-                            emit(item["frame"])
+                            if stop_seqs:
+                                retained_generation_frames.append(item["frame"])
+                            else:
+                                emit(item["frame"])
                     pending.clear()
                     stop_reason = "fallback_stop_sequence"
                     break
@@ -923,8 +922,11 @@ class ModelManager:
                 for item in confirmed:
                     reply_ids.append(item["token_id"])
                     if item["frame"] is not None:
-                        emit(item["frame"])
-                if confirmed:
+                        if stop_seqs:
+                            retained_generation_frames.append(item["frame"])
+                        else:
+                            emit(item["frame"])
+                if confirmed and not stop_seqs:
                     delta = tokenizer.decode(
                         [item["token_id"] for item in confirmed],
                         skip_special_tokens=True,
@@ -943,7 +945,10 @@ class ModelManager:
                 for item in pending:
                     reply_ids.append(item["token_id"])
                     if item["frame"] is not None:
-                        emit(item["frame"])
+                        if stop_seqs:
+                            retained_generation_frames.append(item["frame"])
+                        else:
+                            emit(item["frame"])
             pending.clear()
             durable_reply_ids = tuple(int(token_id) for token_id in reply_ids)
             text = tokenizer.decode(durable_reply_ids, skip_special_tokens=True)
@@ -951,6 +956,10 @@ class ModelManager:
             if not text.endswith("�") and len(text) > len(emitted):
                 emit({"type": "token", "text": text[len(emitted):]})
                 emitted = text
+            if stop_seqs:
+                for frame in sorted(retained_generation_frames, key=lambda item: item["pos"]):
+                    emit(frame)
+                retained_generation_frames.clear()
             suffix_start_pos = int(input_ids.shape[1])
             emit(
                 {

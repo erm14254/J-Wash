@@ -99,7 +99,14 @@ CREATE TABLE IF NOT EXISTS conversations (
     title TEXT NOT NULL DEFAULT '',
     tags TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    version INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS conversation_tombstones (
+    conversation_id INTEGER PRIMARY KEY,
+    mutation_id TEXT NOT NULL,
+    deleted_version INTEGER NOT NULL,
+    deleted_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY,
@@ -142,8 +149,15 @@ class Store:
         self._local = threading.local()
         conn = self._conn()
         conn.executescript(SCHEMA)
+        self._ensure_conversation_version(conn)
         self._ensure_message_version(conn)
         conn.commit()
+
+    @staticmethod
+    def _ensure_conversation_version(conn):
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(conversations)").fetchall()}
+        if "version" not in cols:
+            conn.execute("ALTER TABLE conversations ADD COLUMN version INTEGER NOT NULL DEFAULT 1")
 
     @staticmethod
     def _ensure_message_version(conn):
@@ -280,7 +294,8 @@ class Store:
         )
 
     def _reconcile_mutation(self, mutation, entity_id, query, params, classify, *,
-                            expected_version=None, operational_exc=None):
+                            expected_version=None, operational_exc=None,
+                            fallback_value=None, fallback_observed_version=None):
         """Read durable state independently and convert every failure to data."""
         try:
             with self._independent_read_connection() as read:
@@ -298,36 +313,34 @@ class Store:
                         exc_info=True)
             return self._mutation_outcome(
                 "ambiguous", mutation, entity_id=entity_id,
-                expected_version=expected_version, exc=exc,
+                expected_version=expected_version,
+                observed_version=fallback_observed_version,
+                exc=exc, value=fallback_value,
             )
 
     def create_conversation(self, title, tags=None):
+        mutation = "create_conversation"
         try:
             conn = self._conn()
-        except BaseException as exc:
-            return self._mutation_outcome("not_committed", "create_conversation", exc=exc)
-        try:
             now = _now()
             tags_sql = json.dumps(tags or [])
-        except BaseException as exc:
-            return self._mutation_outcome("not_committed", "create_conversation", exc=exc)
-        try:
             conversation_id = int(conn.execute(
                 "SELECT COALESCE(MAX(id), 0) + 1 FROM conversations"
             ).fetchone()[0])
         except BaseException as exc:
-            return self._mutation_outcome("not_committed", "create_conversation", exc=exc)
-        intended = (conversation_id, title, tags_sql, now, now)
+            return self._mutation_outcome("not_committed", mutation, exc=exc)
+        intended = (conversation_id, title, tags_sql, now, now, 1)
         try:
             conn.execute("BEGIN IMMEDIATE")
+            conn.execute("DELETE FROM conversation_tombstones WHERE conversation_id = ?", (conversation_id,))
             conn.execute(
-                "INSERT INTO conversations (id, title, tags, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                intended,
+                "INSERT INTO conversations (id, title, tags, created_at, updated_at, version) "
+                "VALUES (?, ?, ?, ?, ?, ?)", intended,
             )
             conn.commit()
             return self._mutation_outcome(
-                "committed", "create_conversation", entity_id=conversation_id,
-                value=conversation_id,
+                "committed", mutation, entity_id=conversation_id,
+                observed_version=1, value=conversation_id,
             )
         except BaseException as exc:
             self._abort_transaction_or_discard(conn)
@@ -335,119 +348,142 @@ class Store:
             def classify(row):
                 if row is None:
                     return "not_committed", None, None, None
-                actual = tuple(row[key] for key in ("id", "title", "tags", "created_at", "updated_at"))
+                actual = tuple(row[key] for key in (
+                    "id", "title", "tags", "created_at", "updated_at", "version"
+                ))
                 if actual == intended:
-                    return "committed", None, conversation_id, None
-                return "ambiguous", None, None, "conversation ID contains conflicting durable state"
+                    return "committed", row["version"], conversation_id, None
+                return "ambiguous", row["version"], None, "conversation ID contains conflicting durable state"
             return self._reconcile_mutation(
-                "create_conversation", conversation_id,
-                "SELECT id, title, tags, created_at, updated_at FROM conversations WHERE id = ?",
-                (conversation_id,), classify, operational_exc=exc,
+                mutation, conversation_id,
+                "SELECT id, title, tags, created_at, updated_at, version FROM conversations WHERE id = ?",
+                (conversation_id,), classify, expected_version=1, operational_exc=exc,
             )
 
     def update_conversation(self, conversation_id, title=None, tags=None):
+        mutation = "update_conversation"
         try:
             conn = self._conn()
-        except BaseException as exc:
-            return self._mutation_outcome(
-                "ambiguous", "update_conversation", entity_id=conversation_id, exc=exc
-            )
-        try:
             now = _now()
         except BaseException as exc:
-            return self._mutation_outcome(
-                "not_committed", "update_conversation", entity_id=conversation_id, exc=exc
-            )
+            return self._mutation_outcome("ambiguous", mutation, entity_id=conversation_id, exc=exc)
         original = intended = None
+        expected_version = None
         try:
             conn.execute("BEGIN IMMEDIATE")
             current = conn.execute(
-                "SELECT title, tags, created_at, updated_at FROM conversations WHERE id = ?", (conversation_id,)
+                "SELECT title, tags, created_at, updated_at, version FROM conversations WHERE id = ?",
+                (conversation_id,),
             ).fetchone()
             if current is None:
                 self._abort_transaction_or_discard(conn)
-                return self._mutation_outcome("superseded", "update_conversation", entity_id=conversation_id)
-            original = tuple(current[key] for key in ("title", "tags", "created_at", "updated_at"))
+                return self._mutation_outcome("superseded", mutation, entity_id=conversation_id)
+            expected_version = current["version"]
+            original = tuple(current[key] for key in ("title", "tags", "created_at", "updated_at", "version"))
             new_title = current["title"] if title is None else title
             new_tags = current["tags"] if tags is None else json.dumps(tags)
-            intended = (new_title, new_tags, current["created_at"], now)
+            intended = (new_title, new_tags, current["created_at"], now, expected_version + 1)
             cur = conn.execute(
-                "UPDATE conversations SET title = ?, tags = ?, updated_at = ? WHERE id = ?",
-                (new_title, new_tags, now, conversation_id),
+                "UPDATE conversations SET title = ?, tags = ?, updated_at = ?, version = version + 1 "
+                "WHERE id = ? AND version = ?",
+                (new_title, new_tags, now, conversation_id, expected_version),
             )
             if cur.rowcount != 1:
                 self._abort_transaction_or_discard(conn)
-                return self._mutation_outcome("superseded", "update_conversation", entity_id=conversation_id)
+                return self._mutation_outcome(
+                    "superseded", mutation, entity_id=conversation_id,
+                    expected_version=expected_version,
+                )
             conn.commit()
-            return self._mutation_outcome("committed", "update_conversation", entity_id=conversation_id)
+            return self._mutation_outcome(
+                "committed", mutation, entity_id=conversation_id,
+                expected_version=expected_version, observed_version=expected_version + 1,
+            )
         except BaseException as exc:
             self._abort_transaction_or_discard(conn)
             self._discard_conn(conn)
             def classify(row):
                 if row is None:
                     return "superseded", None, None, None
-                actual = tuple(row[key] for key in ("title", "tags", "created_at", "updated_at"))
+                observed = row["version"]
+                actual = tuple(row[key] for key in ("title", "tags", "created_at", "updated_at", "version"))
                 if original is None:
-                    return "ambiguous", None, None, "conversation pre-mutation state is unavailable"
-                if intended is not None and actual == intended:
-                    return "committed", None, None, None
-                if original is not None and actual == original:
-                    return "not_committed", None, None, None
-                return "superseded", None, None, "conversation contains different durable state"
+                    return "ambiguous", observed, None, "conversation pre-mutation state is unavailable"
+                if actual == intended:
+                    return "committed", observed, None, None
+                if actual == original:
+                    return "not_committed", observed, None, None
+                return "superseded", observed, None, "conversation contains different durable state"
             return self._reconcile_mutation(
-                "update_conversation", conversation_id,
-                "SELECT title, tags, created_at, updated_at FROM conversations WHERE id = ?",
-                (conversation_id,), classify, operational_exc=exc,
+                mutation, conversation_id,
+                "SELECT title, tags, created_at, updated_at, version FROM conversations WHERE id = ?",
+                (conversation_id,), classify, expected_version=expected_version, operational_exc=exc,
             )
 
     def delete_conversation(self, conversation_id):
+        mutation = "delete_conversation"
+        mutation_id = uuid.uuid4().hex
+        deleted_at = _now()
         try:
             conn = self._conn()
         except BaseException as exc:
-            return self._mutation_outcome(
-                "ambiguous", "delete_conversation", entity_id=conversation_id, exc=exc
-            )
+            return self._mutation_outcome("ambiguous", mutation, entity_id=conversation_id, exc=exc)
         rows = []
-        original = None
+        original_version = intended_version = None
         try:
             conn.execute("BEGIN IMMEDIATE")
             conversation = conn.execute(
-                "SELECT id, title, tags, created_at, updated_at FROM conversations WHERE id = ?",
-                (conversation_id,),
+                "SELECT version FROM conversations WHERE id = ?", (conversation_id,),
             ).fetchone()
-            if conversation is not None:
-                original = tuple(conversation[key] for key in (
-                    "id", "title", "tags", "created_at", "updated_at"
-                ))
+            if conversation is None:
+                self._abort_transaction_or_discard(conn)
+                return self._mutation_outcome("superseded", mutation, entity_id=conversation_id)
+            original_version = conversation["version"]
+            intended_version = original_version + 1
             rows = conn.execute(
                 "SELECT frames_file FROM messages WHERE conversation_id = ? AND frames_file IS NOT NULL",
                 (conversation_id,),
             ).fetchall()
-            conn.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
+            conn.execute(
+                "INSERT INTO conversation_tombstones (conversation_id, mutation_id, deleted_version, deleted_at) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(conversation_id) DO UPDATE SET "
+                "mutation_id = excluded.mutation_id, deleted_version = excluded.deleted_version, "
+                "deleted_at = excluded.deleted_at",
+                (conversation_id, mutation_id, intended_version, deleted_at),
+            )
+            conn.execute("DELETE FROM conversations WHERE id = ? AND version = ?", (conversation_id, original_version))
             conn.commit()
+            outcome = self._mutation_outcome(
+                "committed", mutation, entity_id=conversation_id,
+                expected_version=original_version, observed_version=intended_version,
+                value=mutation_id,
+            )
         except BaseException as exc:
             self._abort_transaction_or_discard(conn)
             self._discard_conn(conn)
             def classify(row):
-                if row is None:
-                    for frame_row in rows:
-                        self._unlink_best_effort(FRAMES_DIR / frame_row["frames_file"])
-                    return "committed", None, None, None
-                actual = tuple(row[key] for key in (
-                    "id", "title", "tags", "created_at", "updated_at"
-                ))
-                if original is not None and actual == original:
-                    return "not_committed", None, None, None
-                return "superseded", None, None, "conversation ID contains different durable state"
-            return self._reconcile_mutation(
-                "delete_conversation", conversation_id,
-                "SELECT id, title, tags, created_at, updated_at FROM conversations WHERE id = ?",
-                (conversation_id,),
-                classify, operational_exc=exc,
+                observed = row["conversation_version"]
+                if observed is None:
+                    if row["mutation_id"] == mutation_id and row["deleted_version"] == intended_version:
+                        return "committed", intended_version, mutation_id, None
+                    return "ambiguous", row["deleted_version"], mutation_id, "conversation absence is not attributable to this delete"
+                if original_version is not None and observed == original_version:
+                    return "not_committed", observed, mutation_id, None
+                return "superseded", observed, mutation_id, "conversation contains newer durable state"
+            outcome = self._reconcile_mutation(
+                mutation, conversation_id,
+                "SELECT (SELECT version FROM conversations WHERE id = ?) AS conversation_version, "
+                "mutation_id, deleted_version FROM conversation_tombstones WHERE conversation_id = ? "
+                "UNION ALL SELECT (SELECT version FROM conversations WHERE id = ?), NULL, NULL "
+                "WHERE NOT EXISTS (SELECT 1 FROM conversation_tombstones WHERE conversation_id = ?)",
+                (conversation_id, conversation_id, conversation_id, conversation_id), classify,
+                expected_version=original_version, operational_exc=exc,
+                fallback_value=mutation_id, fallback_observed_version=original_version,
             )
-        for row in rows:
-            self._unlink_best_effort(FRAMES_DIR / row["frames_file"])
-        return self._mutation_outcome("committed", "delete_conversation", entity_id=conversation_id)
+        if outcome.state == "committed":
+            for row in rows:
+                self._unlink_best_effort(FRAMES_DIR / row["frames_file"])
+        return outcome
 
     def list_conversations(self, query=None, limit=200):
         conn = self._conn()
@@ -812,6 +848,8 @@ class Store:
                     mutation, message_id,
                     "SELECT content, meta, frames_file, version FROM messages WHERE id = ?",
                     (message_id,), classify_miss, expected_version=expected_version,
+                    fallback_value=frame_file,
+                    fallback_observed_version=row["version"],
                 )
                 if outcome.state != "ambiguous":
                     self._unlink_candidate_if_unreferenced(frame_file, final_path)
@@ -846,6 +884,8 @@ class Store:
                 "SELECT content, meta, frames_file, version FROM messages WHERE id = ?",
                 (message_id,), classify, expected_version=expected_version,
                 operational_exc=exc,
+                fallback_value=frame_file,
+                fallback_observed_version=(original[3] if original is not None else None),
             )
             if outcome.state != "ambiguous":
                 self._unlink_candidate_if_unreferenced(frame_file, final_path)
@@ -1085,6 +1125,8 @@ class Store:
                     mutation, message_id,
                     "SELECT frames_file, meta, version FROM messages WHERE id = ?",
                     (message_id,), classify, expected_version=baseline,
+                    fallback_value=filename,
+                    fallback_observed_version=row["version"],
                 )
             else:
                 conn.commit()
@@ -1101,6 +1143,8 @@ class Store:
                 "SELECT frames_file, meta, version FROM messages WHERE id = ?",
                 (message_id,), classify, expected_version=baseline,
                 operational_exc=exc,
+                fallback_value=filename,
+                fallback_observed_version=row["version"],
             )
 
         if outcome.state == "committed":

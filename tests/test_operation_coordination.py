@@ -1556,6 +1556,66 @@ def test_marker_tail_keeps_latest_eligible_token_boundary():
     assert FALLBACK_MARKER_TOKEN_LIMIT == 32
 
 
+def test_marker_tail_accepts_arbitrarily_long_decoded_token_prefix():
+    from core.model_manager import _smallest_marker_tail_start
+
+    class Tokenizer:
+        def decode(self, ids, **_kwargs):
+            return "".join({1: "x" * 10_000 + "\nU", 2: "ser:"}[token_id] for token_id in ids)
+
+    pending = [{"token_id": 1, "pos": 0, "frame": None}]
+    assert _smallest_marker_tail_start(
+        pending, Tokenizer(), ("\nUser:", "\nAssistant:")
+    ) == 0
+
+
+def test_store_migrates_and_increments_conversation_versions(tmp_path, monkeypatch):
+    import sqlite3
+    from core import store as store_mod
+
+    database = tmp_path / "db.sqlite3"
+    conn = sqlite3.connect(database)
+    conn.execute(
+        "CREATE TABLE conversations (id INTEGER PRIMARY KEY, title TEXT NOT NULL DEFAULT '', "
+        "tags TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(store_mod, "DB_PATH", database)
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    store = store_mod.Store()
+    created = store.create_conversation("versioned")
+    assert created.state == "committed"
+    assert created.observed_version == 1
+    updated = store.update_conversation(created.value, title="twice")
+    assert updated.state == "committed"
+    assert updated.expected_version == 1
+    assert updated.observed_version == 2
+    row = store._conn().execute(
+        "SELECT version FROM conversations WHERE id = ?", (created.value,)
+    ).fetchone()
+    assert row["version"] == 2
+
+
+def test_conversation_delete_records_causal_tombstone(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    store = store_mod.Store()
+    created = store.create_conversation("delete")
+    deleted = store.delete_conversation(created.value)
+    assert deleted.state == "committed"
+    assert deleted.expected_version == 1
+    assert deleted.observed_version == 2
+    tombstone = store._conn().execute(
+        "SELECT mutation_id, deleted_version FROM conversation_tombstones WHERE conversation_id = ?",
+        (created.value,),
+    ).fetchone()
+    assert tombstone["mutation_id"] == deleted.value
+    assert tombstone["deleted_version"] == 2
+
+
 def _commit_then_raise_proxy(conn):
     class Proxy:
         def __getattr__(self, name):

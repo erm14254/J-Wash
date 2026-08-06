@@ -2582,9 +2582,11 @@ def _persisted_generate(req, stop_event, emit, gen_context):
                 emit({"type": "error", "message": "message changed before frames were attached"})
                 return
             if attached.state == "ambiguous":
+                candidate = f", candidate {attached.value}" if isinstance(attached.value, str) else ""
+                versions = f", expected version {attached.expected_version}, observed version {attached.observed_version}"
                 emit({
                     "type": "error",
-                    "message": f"frame attachment outcome is ambiguous for message {attached.entity_id}; operator recovery is required",
+                    "message": f"frame attachment durability is unknown for message {attached.entity_id}{candidate}{versions}; operator recovery is required",
                 })
                 return
             if attached.state == "not_committed":
@@ -2809,7 +2811,9 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
         emit({"type": "error", "message": "message changed during continuation"})
         return
     if outcome.state == "ambiguous":
-        emit({"type": "error", "message": f"continuation outcome is ambiguous for message {outcome.entity_id}; operator recovery is required"})
+        candidate = f", candidate {outcome.value}" if isinstance(outcome.value, str) else ""
+        versions = f", expected version {outcome.expected_version}, observed version {outcome.observed_version}"
+        emit({"type": "error", "message": f"continuation durability is unknown for message {outcome.entity_id}{candidate}{versions}; operator recovery is required"})
         return
     if outcome.state == "not_committed":
         emit({"type": "error", "message": "continuation did not commit; storage recovery is required"})
