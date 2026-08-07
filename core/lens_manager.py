@@ -120,8 +120,18 @@ class LensGenerationView:
         self.binding_id = manager.binding_id
         self.model_session_id = manager.model_session_id
 
-    def start_gen(self, generation_run_id=None):
-        return self._manager.start_gen(generation_run_id=generation_run_id)
+    def start_gen(self, generation_run_id=None, provisional=False):
+        return self._manager.start_gen(
+            generation_run_id=generation_run_id, provisional=provisional,
+        )
+
+    def finalize_gen(self, gen_id, *, retained_thinking=None, publish=True):
+        return self._manager.finalize_gen(
+            gen_id, retained_thinking=retained_thinking, publish=publish,
+        )
+
+    def discard_gen(self, gen_id):
+        return self._manager.discard_gen(gen_id)
 
     def compute_frames(self, acts, positions, phase, jl, token_ids, gen_id=None, abs_positions=None, chunk=None):
         old_layers, old_k, old_mask, old_J = self._manager.layers, self._manager.k, self._manager.mask, self._manager._J
@@ -143,6 +153,7 @@ class LensManager:
         self._J = None
         self._tok_strs = {}
         self.gen_store = OrderedDict()
+        self._provisional_gen_store = {}
         self._gen_counter = itertools.count(1)
         self._pref_key = None
         self.binding_id = 0
@@ -302,6 +313,7 @@ class LensManager:
                 "binding_id": self.binding_id,
                 "model_session_id": self.model_session_id,
                 "gen_store": self.gen_store,
+                "provisional_gen_store": self._provisional_gen_store,
             }
             self.lens = None
             self.meta = None
@@ -310,6 +322,7 @@ class LensManager:
             self._J = None
             self._tok_strs = {}
             self.gen_store = OrderedDict()
+            self._provisional_gen_store = {}
             self.model_session_id = None
             return old
 
@@ -328,6 +341,7 @@ class LensManager:
             self.binding_id = old["binding_id"]
             self.model_session_id = old["model_session_id"]
             self.gen_store = old["gen_store"]
+            self._provisional_gen_store = old.get("provisional_gen_store", {})
 
     @staticmethod
     def cleanup_withdrawn(_old):
@@ -347,9 +361,9 @@ class LensManager:
                 first_error = exc
         return first_error
 
-    def start_gen(self, generation_run_id=None):
+    def start_gen(self, generation_run_id=None, provisional=False):
         gen_id = next(self._gen_counter)
-        self.gen_store[gen_id] = {
+        store = {
             "generation_run_id": generation_run_id,
             "model_session_id": self.model_session_id,
             "lens_binding_id": self.binding_id,
@@ -358,10 +372,89 @@ class LensManager:
             "positions": [],
             "token_ids": [],
             "phases": [],
+            "finalized_thinking": None,
         }
-        while len(self.gen_store) > GEN_STORE_MAX:
-            self.gen_store.popitem(last=False)
+        if provisional:
+            self._provisional_gen_store[gen_id] = store
+        else:
+            self.gen_store[gen_id] = store
+            while len(self.gen_store) > GEN_STORE_MAX:
+                self.gen_store.popitem(last=False)
         return gen_id
+
+    def finalize_gen(self, gen_id, *, retained_thinking=None, publish=True):
+        store = self._provisional_gen_store.get(gen_id)
+        already_published = False
+        if store is None:
+            store = self.gen_store.get(gen_id)
+            already_published = store is not None
+        if store is None:
+            raise ValueError("unknown provisional generation")
+
+        retained = None if retained_thinking is None else tuple(
+            (int(position), int(token_id)) for position, token_id in retained_thinking
+        )
+        previous = store.get("finalized_thinking")
+        if previous is not None:
+            if retained is not None and retained != previous:
+                raise ValueError("generation was finalized with a different retained sequence")
+        else:
+            if retained is None:
+                raise ValueError("retained thinking sequence is required before publication")
+            positions = store["positions"]
+            token_ids = store["token_ids"]
+            phases = store["phases"]
+            count = len(positions)
+            if len(token_ids) != count or len(phases) != count:
+                raise ValueError("generation residual metadata is not aligned")
+            residual_rows = {}
+            for layer in store["layers"]:
+                chunks = store["residuals"].get(layer)
+                if chunks is None:
+                    raise ValueError("generation residual layer is missing")
+                rows = sum(int(chunk.shape[0]) for chunk in chunks)
+                if rows != count:
+                    raise ValueError("generation residual rows are not aligned")
+                residual_rows[layer] = torch.cat(chunks, dim=0) if chunks else None
+
+            retained_index = 0
+            keep = []
+            for phase, position, token_id in zip(phases, positions, token_ids):
+                if phase == "reading":
+                    keep.append(True)
+                elif phase == "thinking":
+                    wanted = retained_index < len(retained) and retained[retained_index] == (position, token_id)
+                    keep.append(wanted)
+                    if wanted:
+                        retained_index += 1
+                else:
+                    raise ValueError("generation residual phase is invalid")
+            if retained_index != len(retained):
+                raise ValueError("retained thinking sequence is not present in captured residuals")
+            for layer, rows in residual_rows.items():
+                if rows is None:
+                    store["residuals"][layer] = []
+                else:
+                    mask = torch.tensor(keep, dtype=torch.bool, device=rows.device)
+                    store["residuals"][layer] = [rows[mask]] if any(keep) else []
+            store["positions"] = [value for value, selected in zip(positions, keep) if selected]
+            store["token_ids"] = [value for value, selected in zip(token_ids, keep) if selected]
+            store["phases"] = [value for value, selected in zip(phases, keep) if selected]
+            store["finalized_thinking"] = retained
+
+        if publish and not already_published:
+            self._provisional_gen_store.pop(gen_id, None)
+            self.gen_store[gen_id] = store
+            while len(self.gen_store) > GEN_STORE_MAX:
+                self.gen_store.popitem(last=False)
+        return gen_id
+
+    def discard_gen(self, gen_id):
+        store = self._provisional_gen_store.pop(gen_id, None)
+        if store is not None:
+            store.clear()
+            return True
+        return False
 
     @torch.no_grad()
     def pin_ranks(self, gen_id, token_ids, jl, chunk=32, generation_run_id=None):
@@ -437,7 +530,9 @@ class LensManager:
             }
             for pos, tid in zip(abs_positions, token_ids)
         ]
-        store = self.gen_store.get(gen_id) if gen_id is not None else None
+        store = None
+        if gen_id is not None:
+            store = self._provisional_gen_store.get(gen_id) or self.gen_store.get(gen_id)
         if store is not None:
             store["positions"].extend(int(p) for p in abs_positions)
             store["token_ids"].extend(int(t) for t in token_ids)

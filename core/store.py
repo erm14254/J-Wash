@@ -509,20 +509,45 @@ class Store:
             self._discard_conn(conn)
             def classify(row):
                 observed = row["conversation_version"]
-                if row["tombstone_mutation_id"] == mutation_id and row["deleted_version"] == intended_version:
+                own_tombstone = (
+                    row["tombstone_mutation_id"] == mutation_id
+                    and row["tombstone_conversation_id"] == conversation_id
+                    and row["tombstone_incarnation_id"] == incarnation_id
+                    and row["deleted_version"] == intended_version
+                )
+                if own_tombstone:
                     return "committed", intended_version, mutation_id, None
-                if row["conversation_incarnation"] == incarnation_id and observed == original_version:
+                other_delete = bool(row["other_tombstone_count"])
+                if (
+                    row["conversation_incarnation"] == incarnation_id
+                    and observed == original_version
+                    and not other_delete
+                ):
                     return "not_committed", observed, mutation_id, None
                 if row["conversation_incarnation"] == incarnation_id and observed is not None:
                     return "superseded", observed, mutation_id, "conversation contains newer durable state"
+                if observed is not None and row["conversation_incarnation"] != incarnation_id:
+                    return "superseded", observed, mutation_id, "conversation ID contains a newer incarnation"
+                if other_delete:
+                    return "superseded", row["other_deleted_version"], mutation_id, "another delete won"
                 return "ambiguous", observed, mutation_id, "conversation incarnation cannot be causally classified"
             outcome = self._reconcile_mutation(
                 mutation, conversation_id,
                 "SELECT (SELECT version FROM conversations WHERE id = ?) AS conversation_version, "
                 "(SELECT incarnation_id FROM conversations WHERE id = ?) AS conversation_incarnation, "
                 "(SELECT mutation_id FROM conversation_tombstones WHERE mutation_id = ?) AS tombstone_mutation_id, "
-                "(SELECT deleted_version FROM conversation_tombstones WHERE mutation_id = ?) AS deleted_version",
-                (conversation_id, conversation_id, mutation_id, mutation_id), classify,
+                "(SELECT conversation_id FROM conversation_tombstones WHERE mutation_id = ?) AS tombstone_conversation_id, "
+                "(SELECT incarnation_id FROM conversation_tombstones WHERE mutation_id = ?) AS tombstone_incarnation_id, "
+                "(SELECT deleted_version FROM conversation_tombstones WHERE mutation_id = ?) AS deleted_version, "
+                "(SELECT COUNT(*) FROM conversation_tombstones WHERE conversation_id = ? AND incarnation_id = ? "
+                "AND mutation_id != ?) AS other_tombstone_count, "
+                "(SELECT MAX(deleted_version) FROM conversation_tombstones WHERE conversation_id = ? "
+                "AND incarnation_id = ? AND mutation_id != ?) AS other_deleted_version",
+                (
+                    conversation_id, conversation_id, mutation_id, mutation_id, mutation_id,
+                    mutation_id, conversation_id, incarnation_id, mutation_id,
+                    conversation_id, incarnation_id, mutation_id,
+                ), classify,
                 expected_version=original_version, operational_exc=exc,
                 fallback_value=mutation_id, fallback_observed_version=original_version,
             )

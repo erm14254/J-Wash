@@ -19,7 +19,7 @@ test('successful continuation updates its existing assistant', () => {
 test('continuation no-op preserves durable message and clears attempt state', () => {
   const result = applyGenerationTerminal(existing, {
     type: 'done', continuation_noop: true, continued: false, message_id: 7,
-    text: '', content: 'old', gen_id: 9, generation_run_id: 'b'.repeat(32),
+    text: '', content: 'old',
   }, [{ gen: 9 }])
   assert.equal(result.messages, existing)
   assert.equal(result.messages.length, 1)

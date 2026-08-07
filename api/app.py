@@ -2895,9 +2895,9 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
     def emit_inner(frame):
         if frame["type"] == "done":
             done_holder.update(frame)
+        elif frame["type"] == "frame":
+            frames_acc.append(frame)
         else:
-            if frame["type"] == "frame":
-                frames_acc.append(frame)
             emit(frame)
 
     manager.generate(
@@ -2905,12 +2905,21 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
         ablator=interventions if gen_context.intervention_snapshot.get("rules") else None,
         continue_final=True,
         capture_full_input_frames=lens is not None,
+        defer_lens_publication=lens is not None,
     )
     old_content = expected_content
     appended = done_holder.get("text", "")
+
+    def discard_lens_attempt():
+        gen_id = done_holder.get("gen_id")
+        if lens is not None and gen_id is not None:
+            lens.discard_gen(gen_id)
+
     if not appended:
+        frames_acc.clear()
+        discard_lens_attempt()
         emit(dict(
-            done_holder,
+            type="done",
             conversation_id=msg["conversation_id"],
             message_id=message_id,
             text="",
@@ -2943,6 +2952,7 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
                 done_holder.get("generation_run_id"),
             )
         except Exception as exc:
+            discard_lens_attempt()
             emit({"type": "error", "message": f"could not finalize continuation frames; continuation not persisted: {exc}"})
             return
     elif msg.get("frames_file") and lens is None:
@@ -2958,21 +2968,43 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
         frame_descriptor=_frame_descriptor(lens, layers_used, k_used) if merged is not None else None,
     )
     if outcome.state in {"stale", "superseded"}:
+        discard_lens_attempt()
         emit({"type": "error", "message": "message changed during continuation"})
         return
     if outcome.state == "ambiguous":
+        discard_lens_attempt()
         candidate = f", candidate {outcome.value}" if isinstance(outcome.value, str) else ""
         versions = f", expected version {outcome.expected_version}, observed version {outcome.observed_version}"
         emit({"type": "error", "message": f"continuation durability is unknown for message {outcome.entity_id}{candidate}{versions}; operator recovery is required"})
         return
     if outcome.state == "not_committed":
+        discard_lens_attempt()
         emit({"type": "error", "message": "continuation did not commit; storage recovery is required"})
         return
     if outcome.state != "committed":
+        discard_lens_attempt()
         emit({"type": "error", "message": "invalid continuation storage outcome"})
         return
+    terminal = dict(done_holder)
+    pin_published = True
+    if lens is not None and terminal.get("gen_id") is not None:
+        try:
+            lens.finalize_gen(terminal["gen_id"], publish=True)
+        except Exception as exc:
+            pin_published = False
+            logging.getLogger(__name__).warning(
+                "durable continuation committed but residual publication failed: %s",
+                str(exc)[:512],
+            )
+            terminal.pop("gen_id", None)
+            terminal.pop("generation_run_id", None)
+            discard_lens_attempt()
+    if pin_published:
+        for frame in frames_acc:
+            emit(frame)
+    frames_acc.clear()
     emit(dict(
-        done_holder,
+        terminal,
         conversation_id=msg["conversation_id"],
         message_id=message_id,
         text=appended,

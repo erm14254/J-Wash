@@ -691,7 +691,8 @@ class ModelManager:
 
     @torch.no_grad()
     def generate(self, messages, sampling, stop_event, emit, lens=None, ablator=None,
-                 continue_final=False, capture_full_input_frames=False):
+                 continue_final=False, capture_full_input_frames=False,
+                 defer_lens_publication=False):
         """``continue_final=True``: the last message is an assistant reply to
         EXTEND — the template leaves its turn open instead of starting a new
         one, and the model picks up where it stopped."""
@@ -714,6 +715,7 @@ class ModelManager:
         reader = None
         attachment = None
         ok = False
+        lens_attempt_resolved = False
         try:
             if ablator is not None:
                 attachment = ablator.attach(jl, snapshot=ablator_snapshot)
@@ -759,7 +761,9 @@ class ModelManager:
             generation_run_id = uuid.uuid4().hex
             if lens is not None and lens.lens is not None:
                 reader = ActivationCatcher(jl.layers, lens.layers)
-                gen_id = lens.start_gen(generation_run_id=generation_run_id)
+                gen_id = lens.start_gen(
+                    generation_run_id=generation_run_id, provisional=True,
+                )
                 if not capture_full_input_frames and len(messages) > 1 and any(m["role"] != "system" for m in messages[:-1]):
                     prev = tokenizer.apply_chat_template(
                         messages[:-1],
@@ -836,6 +840,7 @@ class ModelManager:
                     emit(frame)
 
             reply_ids = []
+            reply_positions = []
             pending = []
             retained_generation_frames = []
             emitted = ""
@@ -862,6 +867,7 @@ class ModelManager:
                     # importantly, confirmed content is never discarded.
                     earliest = pending.pop(0)
                     reply_ids.append(earliest["token_id"])
+                    reply_positions.append(earliest["pos"])
                     if earliest["frame"] is not None:
                         if stop_seqs:
                             retained_generation_frames.append(earliest["frame"])
@@ -889,6 +895,7 @@ class ModelManager:
                     # Any earlier pending entries are confirmed ordinary text.
                     for item in pending:
                         reply_ids.append(item["token_id"])
+                        reply_positions.append(item["pos"])
                         if item["frame"] is not None:
                             if stop_seqs:
                                 retained_generation_frames.append(item["frame"])
@@ -936,6 +943,7 @@ class ModelManager:
                 assert len(pending) <= FALLBACK_MARKER_TOKEN_LIMIT
                 for item in confirmed:
                     reply_ids.append(item["token_id"])
+                    reply_positions.append(item["pos"])
                     if item["frame"] is not None:
                         if stop_seqs:
                             retained_generation_frames.append(item["frame"])
@@ -959,6 +967,7 @@ class ModelManager:
             if pending and not _marker_prefix_suffix(pending_text, stop_seqs):
                 for item in pending:
                     reply_ids.append(item["token_id"])
+                    reply_positions.append(item["pos"])
                     if item["frame"] is not None:
                         if stop_seqs:
                             retained_generation_frames.append(item["frame"])
@@ -966,6 +975,16 @@ class ModelManager:
                             emit(item["frame"])
             pending.clear()
             durable_reply_ids = tuple(int(token_id) for token_id in reply_ids)
+            durable_reply_positions = tuple(int(position) for position in reply_positions)
+            if len(durable_reply_positions) != len(durable_reply_ids):
+                raise RuntimeError("retained generated token positions are not aligned")
+            if gen_id is not None:
+                lens.finalize_gen(
+                    gen_id,
+                    retained_thinking=tuple(zip(durable_reply_positions, durable_reply_ids)),
+                    publish=not defer_lens_publication,
+                )
+                lens_attempt_resolved = not defer_lens_publication
             text = tokenizer.decode(durable_reply_ids, skip_special_tokens=True)
             durable_reply_tokens = len(durable_reply_ids)
             if stop_seqs:
@@ -1021,6 +1040,12 @@ class ModelManager:
             ok = True
         finally:
             cleanup_error = None
+            if gen_id is not None and not ok and not lens_attempt_resolved:
+                try:
+                    lens.discard_gen(gen_id)
+                    lens_attempt_resolved = True
+                except Exception as exc:
+                    cleanup_error = cleanup_error or exc
             if attachment is not None:
                 try:
                     attachment.close()

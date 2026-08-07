@@ -797,7 +797,14 @@ def test_zero_length_continuation_does_not_reattribute_existing_text(monkeypatch
             return SimpleNamespace(state="committed", entity_id=str(message_id))
 
     def fake_generate(**kwargs):
-        kwargs["emit"]({"type": "done", "text": "", "stats": {"tokens": 0}, "stopped": True, "meta": {"intervention_provenance": {"revision": 2}}})
+        kwargs["emit"]({"type": "frame", "pos": 1, "gen": 9, "generation_run_id": "b" * 32})
+        kwargs["emit"]({
+            "type": "done", "text": "", "stats": {"tokens": 0}, "stopped": True,
+            "meta": {"intervention_provenance": {"revision": 2}}, "gen_id": 9,
+            "generation_run_id": "b" * 32, "generated_token_start_pos": 1,
+            "generated_token_end_pos": 1, "continuation_suffix_start_pos": 1,
+            "continuation_suffix_end_pos": 1,
+        })
 
     fake_store = FakeStore()
     monkeypatch.setattr(app, "store", fake_store)
@@ -809,6 +816,55 @@ def test_zero_length_continuation_does_not_reattribute_existing_text(monkeypatch
     assert emitted[-1]["content"] == "old"
     assert emitted[-1]["continued"] is False
     assert emitted[-1]["continuation_noop"] is True
+    assert [frame["type"] for frame in emitted] == ["done"]
+    for key in (
+        "gen_id", "generation_run_id", "generated_token_start_pos", "generated_token_end_pos",
+        "continuation_suffix_start_pos", "continuation_suffix_end_pos", "stats", "meta",
+    ):
+        assert key not in emitted[-1]
+
+
+def test_lens_generation_provisional_finalize_prunes_and_publishes():
+    import torch
+    from core.lens_manager import LensManager
+
+    lens = LensManager()
+    lens.layers = [0]
+    lens.model_session_id = 4
+    lens.binding_id = 7
+    gen_id = lens.start_gen(generation_run_id="a" * 32, provisional=True)
+    store = lens._provisional_gen_store[gen_id]
+    store["positions"] = [0, 10, 11, 12]
+    store["token_ids"] = [1, 20, 21, 22]
+    store["phases"] = ["reading", "thinking", "thinking", "thinking"]
+    store["residuals"][0] = [torch.arange(8, dtype=torch.float16).reshape(4, 2)]
+
+    assert gen_id not in lens.gen_store
+    lens.finalize_gen(gen_id, retained_thinking=[(10, 20), (12, 22)], publish=False)
+    assert gen_id not in lens.gen_store
+    assert store["positions"] == [0, 10, 12]
+    assert store["token_ids"] == [1, 20, 22]
+    assert store["phases"] == ["reading", "thinking", "thinking"]
+    assert store["residuals"][0][0].tolist() == [[0.0, 1.0], [2.0, 3.0], [6.0, 7.0]]
+
+    lens.finalize_gen(gen_id, publish=True)
+    assert gen_id in lens.gen_store
+    assert gen_id not in lens._provisional_gen_store
+
+
+def test_provisional_generation_does_not_evict_committed_store():
+    from core.lens_manager import GEN_STORE_MAX, LensManager
+
+    lens = LensManager()
+    committed = [lens.start_gen(generation_run_id=f"{index:032x}") for index in range(GEN_STORE_MAX)]
+    attempt = lens.start_gen(generation_run_id="f" * 32, provisional=True)
+    assert list(lens.gen_store) == committed
+    assert attempt not in lens.gen_store
+    with pytest.raises(ValueError, match="unknown generation"):
+        lens.pin_ranks(attempt, [1], SimpleNamespace(), generation_run_id="f" * 32)
+    assert lens.discard_gen(attempt) is True
+    assert lens.discard_gen(attempt) is False
+    assert list(lens.gen_store) == committed
 
 
 def test_preset_save_persists_coordinated_provenance(monkeypatch):
@@ -1935,6 +1991,64 @@ def test_delete_reconciliation_survives_same_id_recreation(tmp_path, monkeypatch
     assert deleted.state == "committed"
     assert replacement != original
     assert tombstone == original
+
+
+def test_competing_delete_and_recreation_is_superseded(tmp_path, monkeypatch):
+    import sqlite3
+    import uuid
+    from core import store as store_mod
+
+    database = tmp_path / "db.sqlite3"
+    monkeypatch.setattr(store_mod, "DB_PATH", database)
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    store = store_mod.Store()
+    created = store.create_conversation("first")
+    original = store._conn().execute(
+        "SELECT incarnation_id FROM conversations WHERE id = ?", (created.value,)
+    ).fetchone()[0]
+    operational = store._conn()
+    competing_mutation = uuid.uuid4().hex
+    replacement_incarnation = uuid.uuid4().hex
+
+    class RollbackThenCompete:
+        def __getattr__(self, name):
+            return getattr(operational, name)
+
+        @property
+        def in_transaction(self):
+            return operational.in_transaction
+
+        def commit(self):
+            operational.rollback()
+            competing = sqlite3.connect(database)
+            competing.execute(
+                "INSERT INTO conversation_tombstones "
+                "(mutation_id, conversation_id, incarnation_id, deleted_version, deleted_at) "
+                "VALUES (?, ?, ?, 2, 'later')",
+                (competing_mutation, created.value, original),
+            )
+            competing.execute("DELETE FROM conversations WHERE id = ?", (created.value,))
+            competing.execute(
+                "INSERT INTO conversations "
+                "(id, title, tags, created_at, updated_at, version, incarnation_id) "
+                "VALUES (?, 'replacement', '[]', 'later', 'later', 1, ?)",
+                (created.value, replacement_incarnation),
+            )
+            competing.commit()
+            competing.close()
+            raise RuntimeError("first delete did not commit")
+
+    monkeypatch.setattr(store, "_conn", lambda: RollbackThenCompete())
+    outcome = store.delete_conversation(created.value)
+    assert outcome.state == "superseded"
+    assert outcome.observed_version == 1
+    assert store_mod.Store()._conn().execute(
+        "SELECT incarnation_id FROM conversations WHERE id = ?", (created.value,)
+    ).fetchone()[0] == replacement_incarnation
+    tombstones = sqlite3.connect(database).execute(
+        "SELECT mutation_id FROM conversation_tombstones WHERE incarnation_id = ?", (original,)
+    ).fetchall()
+    assert [row[0] for row in tombstones] == [competing_mutation]
 
 
 def _commit_then_raise_proxy(conn):
