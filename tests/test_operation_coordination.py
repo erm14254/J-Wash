@@ -1797,6 +1797,78 @@ def test_dispatched_routes_use_one_preacquisition_handoff():
         assert "_handoff_thread_worker" not in source, route.__name__
 
 
+def test_neighbor_heavy_helper_failure_does_not_retain_model_graph():
+    import gc
+    import weakref
+    from types import SimpleNamespace
+    from api import app
+
+    class Resource:
+        pass
+
+    model = Resource()
+    tokenizer = Resource()
+    jl = Resource()
+    bundle = SimpleNamespace(hf_model=model, tokenizer=tokenizer, jl=jl, meta={"model_id": "m"})
+    refs = [weakref.ref(value) for value in (model, tokenizer, jl)]
+
+    class Handoff:
+        token = object()
+        snapshot = SimpleNamespace(bundle=bundle, model_session_id=1)
+        def create_dispatch(self, _payload):
+            raise RuntimeError("dispatch failed")
+
+    handoff = Handoff()
+    setup = asyncio.run(app._prepare_token_neighbors_handoff(handoff, [1], 1))
+    assert setup.status == 500
+    assert setup.task is setup.dispatch is None
+    handoff.snapshot = None
+    bundle = model = tokenizer = jl = handoff = None
+    gc.collect()
+    assert all(ref() is None for ref in refs)
+
+
+def test_neighbor_task_transfer_failure_composes_with_helper_teardown():
+    import gc
+    import weakref
+    from types import SimpleNamespace
+    from api import app
+
+    class Resource:
+        pass
+
+    model = Resource()
+    tokenizer = Resource()
+    jl = Resource()
+    bundle = SimpleNamespace(hf_model=model, tokenizer=tokenizer, jl=jl, meta={"model_id": "m"})
+    refs = [weakref.ref(value) for value in (model, tokenizer, jl)]
+
+    class Dispatch:
+        payload = None
+        def clear_payload(self):
+            self.payload = None
+
+    dispatch = Dispatch()
+    class Handoff:
+        token = object()
+        snapshot = SimpleNamespace(bundle=bundle, model_session_id=1)
+        def create_dispatch(self, payload):
+            dispatch.payload = payload
+            return dispatch
+        async def create_thread_task(self, *_args, **_kwargs):
+            dispatch.clear_payload()
+            raise RuntimeError("task transfer failed")
+
+    handoff = Handoff()
+    setup = asyncio.run(app._prepare_token_neighbors_handoff(handoff, [1], 1))
+    assert setup.status == 500
+    assert dispatch.payload is None
+    handoff.snapshot = None
+    bundle = model = tokenizer = jl = handoff = None
+    gc.collect()
+    assert all(ref() is None for ref in refs)
+
+
 def test_marker_tail_recognizes_alternate_decoded_prefixes_without_full_history():
     from core.model_manager import _marker_prefix_suffix
 
