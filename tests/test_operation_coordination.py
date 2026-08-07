@@ -2747,3 +2747,409 @@ def test_frame_api_requires_durable_state_and_live_exact_residual_membership(mon
     assert hidden["pin_generation_run_id"] is None
     assert hidden["frames"][0]["gen"] is None
     assert hidden["frames"][0]["generation_run_id"] is None
+
+
+def test_total_worker_release_retries_false_raise_and_current_faults(monkeypatch):
+    from api import app
+
+    class Coordinator:
+        def __init__(self):
+            self.current = True
+            self.release_calls = 0
+            self.current_calls = 0
+
+        def is_current(self, _token):
+            self.current_calls += 1
+            if self.current_calls == 1:
+                raise RuntimeError("transient current failure")
+            return self.current
+
+    coordinator = Coordinator()
+    outcomes = [RuntimeError("release failed"), False, True]
+
+    class Dispatch:
+        token = object()
+
+        def __init__(self):
+            self.coordinator = coordinator
+
+        def release_from_worker(self):
+            coordinator.release_calls += 1
+            result = outcomes.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            if result:
+                coordinator.current = False
+            return result
+
+    yields = []
+    monkeypatch.setattr(app, "_retry_thread_yield", lambda: yields.append(True))
+    app._release_worker_total(Dispatch())
+    assert coordinator.current is False
+    assert coordinator.release_calls == 3
+    assert yields
+
+
+def test_total_unclaimed_abort_retries_until_payload_and_owner_clear(monkeypatch):
+    from api import app
+
+    class Coordinator:
+        current = True
+        current_calls = 0
+
+        def is_current(self, _token):
+            self.current_calls += 1
+            if self.current_calls == 1:
+                raise RuntimeError("transient current failure")
+            return self.current
+
+    coordinator = Coordinator()
+    outcomes = [RuntimeError("abort failed"), False, True]
+
+    class Dispatch:
+        token = object()
+        claimed = False
+        payload = object()
+
+        def __init__(self):
+            self.coordinator = coordinator
+
+        def abort_unclaimed(self):
+            result = outcomes.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            self.payload = None
+            if result:
+                coordinator.current = False
+            return result
+
+    dispatch = Dispatch()
+    yields = []
+    monkeypatch.setattr(app, "_retry_thread_yield", lambda: yields.append(True))
+    app._abort_unclaimed_total(dispatch)
+    assert coordinator.current is False
+    assert dispatch.payload is None
+    assert yields
+
+
+def test_handoff_registration_failure_retains_token_until_total_release(monkeypatch):
+    from api import app
+    from core.model_session import OperationType
+
+    class Coordinator:
+        def __init__(self):
+            self.owner = None
+            self.release_results = [RuntimeError("release fault"), False, True]
+            self.release_calls = 0
+
+        def acquire(self, operation_type, **_kwargs):
+            assert self.owner is None
+            self.owner = SimpleNamespace(type=operation_type)
+            return self.owner, SimpleNamespace(bundle=object())
+
+        def release(self, token):
+            assert token is self.owner
+            self.release_calls += 1
+            result = self.release_results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            if result:
+                self.owner = None
+            return result
+
+        def is_current(self, token):
+            return self.owner is token
+
+    coordinator = Coordinator()
+    handoff = app.OperationHandoff(coordinator)
+    original = handoff._set_state
+    failed = False
+
+    def fail_registration(state):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise RuntimeError("registration failed")
+        return original(state)
+
+    monkeypatch.setattr(handoff, "_set_state", fail_registration)
+    with pytest.raises(RuntimeError, match="registration failed") as caught:
+        handoff.acquire(OperationType.MODEL_READ)
+    assert coordinator.owner is None
+    assert coordinator.release_calls == 3
+    assert handoff.token is None
+    assert handoff.closed is True
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+
+
+def test_await_transferred_worker_claimed_cancellation_waits_for_exact_release():
+    from api import app
+    from core.model_session import ModelSessionCoordinator, OperationType, WorkerDispatch
+
+    async def scenario():
+        coordinator = ModelSessionCoordinator()
+        token, _ = coordinator.acquire(OperationType.MODEL_READ)
+        stop = threading.Event()
+        dispatch = WorkerDispatch(coordinator, token, stop_event=stop, payload={})
+        claimed = asyncio.Event()
+        finish = asyncio.Event()
+
+        async def worker():
+            assert dispatch.claim()
+            dispatch.take_payload()
+            claimed.set()
+            await finish.wait()
+            dispatch.release_from_worker()
+            return app.WorkerOutcome(value="ok")
+
+        retained = asyncio.create_task(worker())
+        await claimed.wait()
+        waiter = asyncio.create_task(app._await_transferred_worker(retained, dispatch))
+        await asyncio.sleep(0)
+        waiter.cancel()
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        assert coordinator.is_current(token)
+        finish.set()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await waiter
+        assert caught.value.__context__ is None
+        assert caught.value.__cause__ is None
+        assert retained.done()
+        assert not coordinator.is_current(token)
+
+    asyncio.run(scenario())
+
+
+def test_await_transferred_worker_unclaimed_cancellation_releases_payload():
+    from api import app
+    from core.model_session import ModelSessionCoordinator, OperationType, WorkerDispatch
+
+    async def scenario():
+        coordinator = ModelSessionCoordinator()
+        token, _ = coordinator.acquire(OperationType.MODEL_READ)
+        dispatch = WorkerDispatch(coordinator, token, payload={"heavy": object()})
+
+        async def worker():
+            await asyncio.sleep(0)
+            assert dispatch.claim() is False
+            return app.WorkerOutcome()
+
+        retained = asyncio.create_task(worker())
+        waiter = asyncio.create_task(app._await_transferred_worker(retained, dispatch))
+        await asyncio.sleep(0)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert retained.done()
+        assert dispatch.take_payload() is None
+        assert not coordinator.is_current(token)
+
+    asyncio.run(scenario())
+
+
+def test_ws_terminal_suppresses_drain_diagnostic_error(monkeypatch):
+    from api import app
+
+    async def scenario():
+        worker = asyncio.create_task(asyncio.sleep(0, result=app.WorkerOutcome()))
+        waiter = asyncio.create_task(asyncio.sleep(0))
+        receiver = asyncio.create_task(asyncio.sleep(0))
+        calls = 0
+        sent = []
+
+        async def flaky_drain(task):
+            nonlocal calls
+            if task is worker and calls == 0:
+                calls += 1
+                raise RuntimeError("injected drain failure")
+            return await asyncio.gather(task, return_exceptions=True)
+
+        class Coordinator:
+            def is_current(self, _token):
+                return False
+
+        class Dispatch:
+            coordinator = Coordinator()
+            token = object()
+            claimed = True
+
+            def cancel_from_awaiter(self):
+                return False
+
+        async def send(_ws, payload):
+            sent.append(payload)
+
+        monkeypatch.setattr(app, "_drain_worker_uninterruptibly", flaky_drain)
+        monkeypatch.setattr(app, "_ws_send", send)
+        await app._finalize_ws_runtime(
+            object(), worker, receiver, waiter, threading.Event(), Dispatch(), True,
+        )
+        assert worker.done() and receiver.done() and waiter.done()
+        assert sent == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mode", ["success", "failure", "rollback_failure", "cancelled"])
+def test_lens_load_worker_clears_rollback_resources_before_exact_release(mode, monkeypatch):
+    import gc
+    from api import app
+    from core.model_session import WorkerDispatch
+
+    class Resource:
+        pass
+
+    class FakeLensManager:
+        def __init__(self):
+            self.lens = Resource()
+            self.mask = Resource()
+            self._J = Resource()
+
+        def state_record(self):
+            return {"lens": self.lens, "mask": self.mask, "_J": self._J}
+
+        def restore_state_record(self, state):
+            self.lens, self.mask, self._J = state["lens"], state["mask"], state["_J"]
+            if mode == "rollback_failure":
+                raise KeyboardInterrupt("rollback failed")
+
+        def load(self, *_args, **_kwargs):
+            self.lens, self.mask, self._J = Resource(), Resource(), Resource()
+            if mode == "failure" or mode == "rollback_failure":
+                raise RuntimeError("load failed")
+            if mode == "cancelled":
+                raise asyncio.CancelledError()
+            return {"loaded": True}
+
+    fake_lens = FakeLensManager()
+    refs = [weakref.ref(fake_lens.lens), weakref.ref(fake_lens.mask), weakref.ref(fake_lens._J)]
+
+    class Coordinator:
+        def __init__(self):
+            self.owner = object()
+            self.released_with_dead_predecessor = False
+
+        def update_lens_binding(self, _token, _result):
+            return None
+
+        def release(self, token):
+            assert token is self.owner
+            self.owner = None
+            # Model the admitted successor withdrawing the authoritative state.
+            fake_lens.lens = fake_lens.mask = fake_lens._J = None
+            gc.collect()
+            self.released_with_dead_predecessor = all(ref() is None for ref in refs)
+            return True
+
+        def is_current(self, token):
+            return self.owner is token
+
+        def request_cancel(self, _token):
+            return True
+
+    coordinator = Coordinator()
+    token = coordinator.owner
+    dispatch = WorkerDispatch(coordinator, token, payload={
+        "repo_id": "r", "filename": "f", "revision": "main", "path": None,
+        "layers": [0], "k": 1,
+    })
+    monkeypatch.setattr(app, "lens_manager", fake_lens)
+    monkeypatch.setattr(app.manager, "coordinator", coordinator)
+    worker = app._make_lens_load_worker(dispatch, token)
+    if mode == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            worker()
+    else:
+        outcome = worker()
+        assert isinstance(outcome, app.WorkerOutcome)
+        assert outcome.ok is (mode == "success")
+    assert coordinator.owner is None
+    assert coordinator.released_with_dead_predecessor
+
+
+def test_all_seven_http_worker_routes_use_total_transferred_await():
+    import inspect
+    from api import app
+
+    routes = (
+        app.api_delete_model, app.api_lens_load, app.api_edit_export,
+        app.api_edit_export_gguf, app.api_generate_sync,
+        app.api_token_neighbors, app.api_lens_pin,
+    )
+    for route in routes:
+        source = inspect.getsource(route)
+        assert "_await_transferred_worker(" in source, route.__name__
+        assert "await asyncio.shield(task)" not in source, route.__name__
+
+
+def test_cancel_task_uninterruptibly_survives_repeated_caller_cancellation():
+    from api import app
+
+    async def scenario():
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def resistant():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release.wait()
+
+        child = asyncio.create_task(resistant())
+        await started.wait()
+        cleanup = asyncio.create_task(app._cancel_task_uninterruptibly(child))
+        await asyncio.sleep(0)
+        cleanup.cancel()
+        await asyncio.sleep(0)
+        cleanup.cancel()
+        await asyncio.sleep(0)
+        assert not cleanup.done()
+        assert not child.done()
+        release.set()
+        observed = await cleanup
+        assert observed is True
+        assert child.done()
+
+    asyncio.run(scenario())
+
+
+def test_transferred_worker_cancellation_wins_over_cancel_cleanup_failure(monkeypatch):
+    from api import app
+    from core.model_session import ModelSessionCoordinator, OperationType, WorkerDispatch
+
+    async def scenario():
+        coordinator = ModelSessionCoordinator()
+        token, _ = coordinator.acquire(OperationType.MODEL_READ)
+        dispatch = WorkerDispatch(coordinator, token, payload={})
+        claimed = asyncio.Event()
+        finish = asyncio.Event()
+
+        async def worker():
+            dispatch.claim()
+            dispatch.take_payload()
+            claimed.set()
+            await finish.wait()
+            dispatch.release_from_worker()
+            return app.WorkerOutcome(failure_kind="worker", failure_message="failed", http_status=500)
+
+        retained = asyncio.create_task(worker())
+        await claimed.wait()
+        monkeypatch.setattr(
+            dispatch, "cancel_from_awaiter",
+            lambda: (_ for _ in ()).throw(RuntimeError("cancel cleanup failed")),
+        )
+        waiter = asyncio.create_task(app._await_transferred_worker(retained, dispatch))
+        await asyncio.sleep(0)
+        waiter.cancel()
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert retained.done()
+        assert not coordinator.is_current(token)
+
+    asyncio.run(scenario())

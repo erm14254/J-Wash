@@ -8,6 +8,7 @@ import mimetypes
 import os
 import re
 import threading
+import time
 from threading import Event as ThreadingEvent
 import uuid
 from pathlib import Path
@@ -214,7 +215,7 @@ def _release_worker_total(dispatch):
                 return
         except BaseException:
             pass
-        time.sleep(0)
+        _retry_thread_yield()
 
 
 def _abort_unclaimed_total(dispatch):
@@ -229,14 +230,65 @@ def _abort_unclaimed_total(dispatch):
                 return
         except BaseException:
             pass
-        time.sleep(0)
+        _retry_thread_yield()
+
+
+def _retry_thread_yield():
+    """Yield a worker thread without allowing an injected yield fault to escape."""
+    while True:
+        try:
+            time.sleep(0)
+            return
+        except BaseException:
+            continue
+
+
+def _release_token_total(coordinator, token):
+    """Release an acquired token only after exact non-ownership is proven."""
+    while True:
+        try:
+            coordinator.release(token)
+        except BaseException:
+            pass
+        try:
+            if not coordinator.is_current(token):
+                return
+        except BaseException:
+            pass
+        _retry_thread_yield()
+
+
+def _remember_task_cancellation():
+    current = asyncio.current_task()
+    if current is not None and hasattr(current, "uncancel"):
+        current.uncancel()
+
+
+async def _cleanup_yield():
+    """Yield during cleanup while retaining and reporting caller cancellation."""
+    cancelled = False
+    sleeper = asyncio.create_task(asyncio.sleep(0))
+    while not sleeper.done():
+        try:
+            await asyncio.shield(sleeper)
+        except asyncio.CancelledError:
+            cancelled = True
+            _remember_task_cancellation()
+        except BaseException:
+            if not sleeper.done():
+                continue
+    try:
+        sleeper.result()
+    except BaseException:
+        pass
+    return cancelled
 
 
 def _execute_dispatched_worker(dispatch, execute, *, default_status=500, value_status=422,
-                               rollback=None):
+                               rollback=None, teardown=None):
     """Exception-complete claim, payload transfer, body, rollback and release."""
     claimed = False
-    payload = result = failure = cancellation = rollback_failure = None
+    payload = result = failure = cancellation = rollback_failure = teardown_failure = None
     try:
         try:
             claimed = bool(dispatch.claim())
@@ -281,7 +333,17 @@ def _execute_dispatched_worker(dispatch, execute, *, default_status=500, value_s
                 pass
             exc = None
         finally:
-            payload = result = execute = rollback = rollback_failure = None
+            if teardown is not None:
+                try:
+                    teardown()
+                except BaseException as teardown_exc:
+                    teardown_failure = _worker_failure(teardown_exc)
+                    try:
+                        teardown_exc.__traceback__ = teardown_exc.__context__ = teardown_exc.__cause__ = None
+                    except BaseException:
+                        pass
+                    teardown_exc = None
+            payload = result = execute = rollback = teardown = rollback_failure = teardown_failure = None
             try:
                 dispatch.clear_payload()
             except BaseException:
@@ -291,7 +353,7 @@ def _execute_dispatched_worker(dispatch, execute, *, default_status=500, value_s
             raise asyncio.CancelledError() from None
         return failure
     finally:
-        payload = result = execute = rollback = failure = rollback_failure = None
+        payload = result = execute = rollback = teardown = failure = rollback_failure = teardown_failure = None
 
 
 def _raise_worker_outcome(outcome: WorkerOutcome):
@@ -418,7 +480,7 @@ class OperationHandoff:
                     except BaseException:
                         if close_task.done():
                             break
-                        await asyncio.sleep(0)
+                        cancelled |= await _cleanup_yield()
                 if close_coro is not None and hasattr(close_coro, "close"):
                     try:
                         close_coro.close()
@@ -429,7 +491,7 @@ class OperationHandoff:
                 current = asyncio.current_task()
                 if current is not None and hasattr(current, "uncancel"):
                     current.uncancel()
-            await asyncio.sleep(0)
+            cancelled |= await _cleanup_yield()
         return cancelled
 
     def _set_state(self, state):
@@ -452,11 +514,14 @@ class OperationHandoff:
         if self.closed or self.state is not HandoffState.NEW:
             raise RuntimeError("operation handoff acquire is not available")
         token, snap = self.coordinator.acquire(operation_type, **kwargs)
+        self.token = token
         failure = self._register_acquired(token, snap)
         if failure is not None:
             snap = None
-            self.coordinator.release(token)
+            self.clear_heavy()
+            _release_token_total(self.coordinator, token)
             token = None
+            self.token = None
             self.closed = True
             self.state = HandoffState.CLOSED
             raise RuntimeError(f"{failure[0]}: {failure[1]}") from None
@@ -468,14 +533,10 @@ class OperationHandoff:
             self.token = token
             self.set_heavy(snap=snap)
         except BaseException as exc:
-            failure = (type(exc).__name__, str(exc)[:512])
-            exc.__traceback__ = None
-            exc.__context__ = None
-            exc.__cause__ = None
+            failure = _bounded_failure(exc, "operation acquisition registration failed")
             exc = None
             snap = None
             self.heavy.clear()
-            self.token = None
             return failure
         return None
 
@@ -691,7 +752,7 @@ class OperationHandoff:
                         if current is not None and hasattr(current, "uncancel"):
                             current.uncancel()
                     except BaseException:
-                        await asyncio.sleep(0)
+                        cancelled |= await _cleanup_yield()
             factory = args = kwargs = worker = wrapper = task = task_to_drain = None
             if not self.closed and not self.transferred:
                 cancelled |= await self._close_uninterruptibly()
@@ -740,9 +801,7 @@ async def _drain_worker_uninterruptibly(task):
         except BaseException as exc:
             if isinstance(exc, asyncio.CancelledError):
                 cancelled = True
-                current = asyncio.current_task()
-                if current is not None and hasattr(current, "uncancel"):
-                    current.uncancel()
+                _remember_task_cancellation()
             if drain_coro is not None and hasattr(drain_coro, "close"):
                 drain_coro.close()
             drain_coro = None
@@ -750,35 +809,91 @@ async def _drain_worker_uninterruptibly(task):
                 try:
                     await asyncio.shield(task)
                 except asyncio.CancelledError:
-                    cancelled = True
-                    current = asyncio.current_task()
-                    if current is not None and hasattr(current, "uncancel"):
-                        current.uncancel()
+                    if not task.done():
+                        cancelled = True
+                        _remember_task_cancellation()
                 except BaseException:
-                    if task.done():
-                        break
-            result = await asyncio.gather(task, return_exceptions=True)
+                    if not task.done():
+                        cancelled |= await _cleanup_yield()
+            try:
+                result = [task.result()]
+            except BaseException as task_exc:
+                result = [task_exc]
             if cancelled:
-                raise asyncio.CancelledError()
+                raise asyncio.CancelledError() from None
             return result
         while not drain.done():
             try:
                 await asyncio.shield(drain)
             except asyncio.CancelledError:
-                cancelled = True
-                current = asyncio.current_task()
-                if current is not None and hasattr(current, "uncancel"):
-                    current.uncancel()
+                if not drain.done():
+                    cancelled = True
+                    _remember_task_cancellation()
+            except BaseException:
+                if not drain.done():
+                    cancelled |= await _cleanup_yield()
         result = drain.result()
     finally:
         if drain_coro is not None and hasattr(drain_coro, "close"):
             drain_coro.close()
         if drain is not None and not drain.done():
             drain.cancel()
-            await asyncio.gather(drain, return_exceptions=True)
+            while not drain.done():
+                try:
+                    await asyncio.shield(drain)
+                except asyncio.CancelledError:
+                    if not drain.done():
+                        cancelled = True
+                        _remember_task_cancellation()
+                except BaseException:
+                    if not drain.done():
+                        cancelled |= await _cleanup_yield()
     if cancelled:
-        raise asyncio.CancelledError()
+        raise asyncio.CancelledError() from None
     return result
+
+
+async def _await_transferred_worker(task, dispatch, *, on_cancel=None):
+    """Await a retained worker and resolve exact ownership before cancellation."""
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        _remember_task_cancellation()
+        if on_cancel is not None:
+            try:
+                on_cancel()
+            except BaseException as exc:
+                _bounded_failure(exc, "publication cancellation failed")
+        try:
+            dispatch.cancel_from_awaiter()
+        except BaseException as exc:
+            _bounded_failure(exc, "dispatch cancellation failed")
+        while not task.done():
+            try:
+                await _drain_worker_uninterruptibly(task)
+            except asyncio.CancelledError:
+                _remember_task_cancellation()
+            except BaseException:
+                await _cleanup_yield()
+        while True:
+            try:
+                current = dispatch.coordinator.is_current(dispatch.token)
+            except BaseException:
+                current = True
+            if not current:
+                break
+            if dispatch.claimed:
+                _release_worker_total(dispatch)
+            else:
+                _abort_unclaimed_total(dispatch)
+            await _cleanup_yield()
+        try:
+            if not task.cancelled():
+                task.exception()
+        except BaseException as exc:
+            _bounded_failure(exc, "worker completion failed")
+        task = dispatch = on_cancel = None
+        raise asyncio.CancelledError() from None
 
 def _valid_devices():
     """Accepted devices = "auto" + one cuda:N per GPU actually present.
@@ -1090,11 +1205,7 @@ async def api_delete_model(req: DeleteModelRequest):
     if setup.status is not None:
         raise HTTPException(setup.status, setup.message or "model deletion setup failed") from None
     task, dispatch = setup.task, setup.dispatch
-    try:
-        return _raise_worker_outcome(await asyncio.shield(task))
-    except asyncio.CancelledError:
-        dispatch.cancel_from_awaiter()
-        raise
+    return _raise_worker_outcome(await _await_transferred_worker(task, dispatch))
 
 
 
@@ -1194,10 +1305,15 @@ def _make_lens_load_worker(dispatch, token):
         def rollback():
             if old_state is not None:
                 lens_manager.restore_state_record(old_state)
+        def teardown():
+            nonlocal old_state
+            old_state = None
         try:
-            return _execute_dispatched_worker(dispatch, execute, rollback=rollback)
+            return _execute_dispatched_worker(
+                dispatch, execute, rollback=rollback, teardown=teardown,
+            )
         finally:
-            old_state = execute = rollback = None
+            old_state = execute = rollback = teardown = None
     return worker
 
 
@@ -1246,11 +1362,7 @@ async def api_lens_load(req: LensLoadRequest):
     if setup.status is not None:
         raise HTTPException(setup.status, setup.message or "lens setup failed") from None
     task, dispatch = setup.task, setup.dispatch
-    try:
-        return _raise_worker_outcome(await asyncio.shield(task))
-    except asyncio.CancelledError:
-        dispatch.cancel_from_awaiter()
-        raise
+    return _raise_worker_outcome(await _await_transferred_worker(task, dispatch))
 
 
 
@@ -1782,12 +1894,9 @@ async def api_edit_export(req: ExportRequest):
     if setup.status is not None:
         raise HTTPException(setup.status, setup.message or "export setup failed") from None
     task, dispatch, publication_gate = setup.task, setup.dispatch, setup.gate
-    try:
-        return _raise_worker_outcome(await asyncio.shield(task))
-    except asyncio.CancelledError:
-        publication_gate.cancel()
-        dispatch.cancel_from_awaiter()
-        raise
+    return _raise_worker_outcome(await _await_transferred_worker(
+        task, dispatch, on_cancel=publication_gate.cancel,
+    ))
 
 
 
@@ -2074,12 +2183,9 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
         if setup.status is not None:
             raise HTTPException(setup.status, setup.message or "GGUF bake setup failed") from None
         task, dispatch, publication_gate = setup.task, setup.dispatch, setup.gate
-        try:
-            _raise_worker_outcome(await asyncio.shield(task))
-        except asyncio.CancelledError:
-            publication_gate.cancel()
-            dispatch.cancel_from_awaiter()
-            raise
+        _raise_worker_outcome(await _await_transferred_worker(
+            task, dispatch, on_cancel=publication_gate.cancel,
+        ))
         baked = "baked"
 
     _gguf_state.update(state="running", name=validated_name, step="starting", error=None, result=None)
@@ -2218,11 +2324,7 @@ async def api_generate_sync(req: GenerateSyncRequest):
     if setup.status is not None:
         raise HTTPException(setup.status, setup.message or "generation setup failed") from None
     task, dispatch = setup.task, setup.dispatch
-    try:
-        outcome_value = _raise_worker_outcome(await asyncio.shield(task))
-    except asyncio.CancelledError:
-        dispatch.cancel_from_awaiter()
-        raise
+    outcome_value = _raise_worker_outcome(await _await_transferred_worker(task, dispatch))
     for ws in list(_ws_locks):
         try:
             await _ws_send(ws, json.dumps({"type": "api_generation"}))
@@ -2308,11 +2410,7 @@ async def api_token_neighbors(req: NeighborsRequest):
     if setup.status is not None:
         raise HTTPException(setup.status, setup.message or "token-neighbor setup failed") from None
     task, dispatch = setup.task, setup.dispatch
-    try:
-        result = _raise_worker_outcome(await asyncio.shield(task))
-    except asyncio.CancelledError:
-        dispatch.cancel_from_awaiter()
-        raise
+    result = _raise_worker_outcome(await _await_transferred_worker(task, dispatch))
     return {"neighbors": {str(tid): entries for tid, entries in result.items()}}
 
 
@@ -2492,11 +2590,7 @@ async def api_lens_pin(req: PinRequest):
     if setup.status is not None:
         raise HTTPException(setup.status, setup.message or "lens pin setup failed") from None
     task, dispatch = setup.task, setup.dispatch
-    try:
-        return _raise_worker_outcome(await asyncio.shield(task))
-    except asyncio.CancelledError:
-        dispatch.cancel_from_awaiter()
-        raise
+    return _raise_worker_outcome(await _await_transferred_worker(task, dispatch))
 
 
 
@@ -3456,7 +3550,10 @@ async def _cancel_task_uninterruptibly(task):
     cancelled = False
     try:
         task.cancel()
-    except BaseException:
+    except BaseException as exc:
+        if isinstance(exc, asyncio.CancelledError):
+            cancelled = True
+            _remember_task_cancellation()
         logging.getLogger(__name__).exception("task cancellation failed during websocket cleanup")
     while not task.done():
         try:
@@ -3470,7 +3567,38 @@ async def _cancel_task_uninterruptibly(task):
             # The task remains strongly owned here.  A broken drain helper is
             # not evidence that receiver/waiter cleanup completed.
             logging.getLogger(__name__).exception("task drain failed during websocket cleanup")
-            await asyncio.sleep(0)
+            cancelled |= await _cleanup_yield()
+    return cancelled
+
+
+async def _drain_retained_worker_total(worker, dispatch):
+    """Drain a transferred worker and prove its coordinator token is resolved."""
+    cancelled = False
+    while not worker.done():
+        try:
+            await _drain_worker_uninterruptibly(worker)
+        except asyncio.CancelledError:
+            cancelled = True
+            _remember_task_cancellation()
+        except BaseException:
+            logging.getLogger(__name__).exception("websocket worker drain helper failed")
+            cancelled |= await _cleanup_yield()
+    coordinator = getattr(dispatch, "coordinator", None)
+    token = getattr(dispatch, "token", None)
+    if coordinator is None or token is None:
+        return cancelled
+    while True:
+        try:
+            current = coordinator.is_current(token)
+        except BaseException:
+            current = True
+        if not current:
+            break
+        if dispatch.claimed:
+            _release_worker_total(dispatch)
+        else:
+            _abort_unclaimed_total(dispatch)
+        cancelled |= await _cleanup_yield()
     return cancelled
 
 
@@ -3480,7 +3608,10 @@ async def _finalize_ws_runtime(ws, worker, receiver, waiter, stop_event, dispatc
     failure_message = None
     try:
         stop_event.set()
-    except BaseException:
+    except BaseException as exc:
+        if isinstance(exc, asyncio.CancelledError):
+            cancelled = True
+            _remember_task_cancellation()
         logging.getLogger(__name__).exception("failed to set websocket generation stop event")
     try:
         cancelled |= await _cancel_task_uninterruptibly(waiter)
@@ -3492,32 +3623,12 @@ async def _finalize_ws_runtime(ws, worker, receiver, waiter, stop_event, dispatc
         logging.getLogger(__name__).exception("websocket receiver cleanup failed")
     try:
         dispatch.cancel_from_awaiter()
-    except BaseException:
-        logging.getLogger(__name__).exception("websocket dispatch cancellation failed")
-    try:
-        await _drain_worker_uninterruptibly(worker)
-    except asyncio.CancelledError:
-        cancelled = True
-        current = asyncio.current_task()
-        if current is not None and hasattr(current, "uncancel"):
-            current.uncancel()
     except BaseException as exc:
-        failure_message = f"worker drain cleanup failed: {getattr(type(exc), '__name__', 'BaseException')[:128]}"
-        try:
-            exc.__traceback__ = exc.__context__ = exc.__cause__ = None
-        except BaseException:
-            pass
-        exc = None
-        while not worker.done():
-            try:
-                await _drain_worker_uninterruptibly(worker)
-            except asyncio.CancelledError:
-                cancelled = True
-                current = asyncio.current_task()
-                if current is not None and hasattr(current, "uncancel"):
-                    current.uncancel()
-            except BaseException:
-                await asyncio.sleep(0)
+        if isinstance(exc, asyncio.CancelledError):
+            cancelled = True
+            _remember_task_cancellation()
+        logging.getLogger(__name__).exception("websocket dispatch cancellation failed")
+    cancelled |= await _drain_retained_worker_total(worker, dispatch)
     raw_failure = None
     if worker.cancelled():
         raw_failure = "generation worker was cancelled without a terminal frame"
@@ -3536,6 +3647,8 @@ async def _finalize_ws_runtime(ws, worker, receiver, waiter, stop_event, dispatc
             failure_message = raw_failure
         else:
             failure_message = "generation worker returned an invalid result without a terminal frame"
+    else:
+        failure_message = None
     worker = receiver = waiter = dispatch = outcome = None
     if failure_message is not None:
         try:
