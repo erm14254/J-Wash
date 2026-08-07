@@ -267,6 +267,8 @@ def test_mode_event_classification_uses_acquired_snapshot(monkeypatch):
     """A stale pre-acquire Standard observation would suppress this transition."""
     acquired = SimpleNamespace(
         model_session_id=22,
+        loaded=True,
+        bundle=SimpleNamespace(capability_profile=_supported_profile()),
         interventions={"mode": "readthrough", "scale": 1.0, "summary": []},
     )
 

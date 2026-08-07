@@ -1598,9 +1598,8 @@ def api_interventions_scale(req: InterventionsScale):
 def _interventions_scale_resource(token, snap, req):
     try:
         if req.mode is not None:
-            status = manager.coordinator.status_snapshot()
-            capabilities.require(status.capability_profile, "modes", req.mode,
-                                 loaded=status.loaded)
+            profile = snap.bundle.capability_profile if snap.bundle is not None else None
+            capabilities.require(profile, "modes", req.mode, loaded=snap.loaded)
         def mutate():
             return interventions.set_scale_and_mode(scale=req.scale, mode=req.mode)
         (scale, mode), _ = _run_intervention_transaction(token, snap, mutate)
