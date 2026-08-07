@@ -160,6 +160,19 @@ class WorkerDispatch:
                 self.stop_event.set()
             return False
 
+    def abort_unclaimed(self) -> bool:
+        """Clear an unclaimed payload and resolve awaiter ownership atomically.
+
+        This is the worker-side emergency path for a failure while attempting
+        to claim.  It never releases behind a worker that successfully claimed.
+        """
+        with self._lock:
+            if self._claimed:
+                return False
+            self._released_before_claim = True
+            self._payload = None
+            return self.coordinator.release(self.token)
+
     def release_from_worker(self) -> bool:
         return self.coordinator.release(self.token)
 

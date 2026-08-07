@@ -2160,3 +2160,63 @@ def test_frame_attachment_and_lens_clear_reconcile_lost_commit_ack(tmp_path, mon
     _assert_primitive_outcome(cleared)
     assert cleared.state == "committed"
     assert not (store_mod.FRAMES_DIR / old_file).exists()
+
+
+def test_dispatched_worker_claim_failure_resolves_unclaimed_owner(monkeypatch):
+    from api import app
+    from core.model_session import ModelSessionCoordinator, OperationType, WorkerDispatch
+
+    coordinator = ModelSessionCoordinator()
+    token, _ = coordinator.acquire(OperationType.MODEL_READ)
+    dispatch = WorkerDispatch(coordinator, token, payload=object())
+    monkeypatch.setattr(dispatch, "claim", lambda: (_ for _ in ()).throw(RuntimeError("claim failed")))
+
+    outcome = app._execute_dispatched_worker(dispatch, lambda value: value)
+    assert outcome.ok is False
+    assert outcome.failure_kind == "RuntimeError"
+    assert not coordinator.is_current(token)
+    assert dispatch.take_payload() is None
+
+
+def test_dispatched_worker_payload_transfer_failure_releases_claimed_owner(monkeypatch):
+    from api import app
+    from core.model_session import ModelSessionCoordinator, OperationType, WorkerDispatch
+
+    coordinator = ModelSessionCoordinator()
+    token, _ = coordinator.acquire(OperationType.MODEL_READ)
+    dispatch = WorkerDispatch(coordinator, token, payload=object())
+    monkeypatch.setattr(dispatch, "take_payload", lambda: (_ for _ in ()).throw(RuntimeError("take failed")))
+
+    outcome = app._execute_dispatched_worker(dispatch, lambda value: value)
+    assert outcome.ok is False
+    assert outcome.failure_message == "take failed"
+    assert not coordinator.is_current(token)
+
+
+def test_dispatched_worker_cancellation_is_fresh_after_release():
+    from api import app
+    from core.model_session import ModelSessionCoordinator, OperationType, WorkerDispatch
+
+    coordinator = ModelSessionCoordinator()
+    token, _ = coordinator.acquire(OperationType.MODEL_READ)
+    dispatch = WorkerDispatch(coordinator, token, payload={})
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        app._execute_dispatched_worker(
+            dispatch, lambda _payload: (_ for _ in ()).throw(asyncio.CancelledError()),
+        )
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+    assert not coordinator.is_current(token)
+
+
+def test_worker_failure_survives_unformattable_exception():
+    from api import app
+
+    class BadString(BaseException):
+        def __str__(self):
+            raise RuntimeError("formatting failed")
+
+    outcome = app._worker_failure(BadString())
+    assert outcome.failure_kind == "BadString"
+    assert outcome.failure_message == "worker failure could not be formatted"

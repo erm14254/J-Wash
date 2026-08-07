@@ -155,8 +155,11 @@ def _worker_success(value=None):
 
 
 def _worker_failure(exc, *, default_status=500, value_status=422):
-    kind = exc.__class__.__name__
-    message = str(exc)[:512]
+    kind = getattr(type(exc), "__name__", "BaseException")[:128]
+    try:
+        message = str(exc)[:512]
+    except BaseException:
+        message = "worker failure could not be formatted"
     if isinstance(exc, HTTPException):
         outcome = WorkerOutcome(
             failure_kind="http",
@@ -171,6 +174,96 @@ def _worker_failure(exc, *, default_status=500, value_status=422):
     except BaseException:
         pass
     return outcome
+
+
+def _release_worker_total(dispatch):
+    """Do not let a transient release failure orphan coordinator ownership."""
+    while True:
+        try:
+            if dispatch.release_from_worker():
+                return
+            if not dispatch.coordinator.is_current(dispatch.token):
+                return
+        except BaseException:
+            pass
+        time.sleep(0)
+
+
+def _abort_unclaimed_total(dispatch):
+    while True:
+        try:
+            if dispatch.abort_unclaimed():
+                return
+            if dispatch.claimed:
+                _release_worker_total(dispatch)
+                return
+            if not dispatch.coordinator.is_current(dispatch.token):
+                return
+        except BaseException:
+            pass
+        time.sleep(0)
+
+
+def _execute_dispatched_worker(dispatch, execute, *, default_status=500, value_status=422,
+                               rollback=None):
+    """Exception-complete claim, payload transfer, body, rollback and release."""
+    claimed = False
+    payload = result = failure = cancellation = rollback_failure = None
+    try:
+        try:
+            claimed = bool(dispatch.claim())
+        except BaseException as exc:
+            cancellation = isinstance(exc, asyncio.CancelledError)
+            failure = None if cancellation else _worker_failure(
+                exc, default_status=default_status, value_status=value_status,
+            )
+            try:
+                exc.__traceback__ = exc.__context__ = exc.__cause__ = None
+            except BaseException:
+                pass
+            exc = None
+            _abort_unclaimed_total(dispatch)
+            if cancellation:
+                raise asyncio.CancelledError() from None
+            return failure
+        if not claimed:
+            return _worker_success()
+        try:
+            payload = dispatch.take_payload()
+            result = execute(payload)
+            return _worker_success(result)
+        except BaseException as exc:
+            cancellation = isinstance(exc, asyncio.CancelledError)
+            failure = None if cancellation else _worker_failure(
+                exc, default_status=default_status, value_status=value_status,
+            )
+            if rollback is not None:
+                try:
+                    rollback()
+                except BaseException as rollback_exc:
+                    rollback_failure = _worker_failure(rollback_exc)
+                    try:
+                        rollback_exc.__traceback__ = rollback_exc.__context__ = rollback_exc.__cause__ = None
+                    except BaseException:
+                        pass
+                    rollback_exc = None
+            try:
+                exc.__traceback__ = exc.__context__ = exc.__cause__ = None
+            except BaseException:
+                pass
+            exc = None
+        finally:
+            payload = result = execute = rollback = rollback_failure = None
+            try:
+                dispatch.clear_payload()
+            except BaseException:
+                pass
+            _release_worker_total(dispatch)
+        if cancellation:
+            raise asyncio.CancelledError() from None
+        return failure
+    finally:
+        payload = result = execute = rollback = failure = rollback_failure = None
 
 
 def _raise_worker_outcome(outcome: WorkerOutcome):
@@ -244,10 +337,20 @@ class OperationHandoff:
             raise asyncio.CancelledError()
 
     async def _close_uninterruptibly(self):
-        """Run close with a strongly retained task and an inline fallback."""
-        close_coro = close_task = None
+        """Resolve ownership without a bounded-retry escape hatch."""
         cancelled = False
-        try:
+        while True:
+            try:
+                if self.closed or self.transferred:
+                    break
+                if self.token is None or not self.coordinator.is_current(self.token):
+                    self.token = None
+                    self.closed = True
+                    self.state = HandoffState.CLOSED
+                    break
+            except BaseException:
+                pass
+            close_coro = close_task = None
             try:
                 close_coro = self.close()
                 try:
@@ -261,32 +364,44 @@ class OperationHandoff:
                         await self.close()
                     except asyncio.CancelledError:
                         cancelled = True
+                    except BaseException:
+                        pass
                 else:
                     try:
                         await _drain_worker_uninterruptibly(close_task)
                         close_task.result()
                     except asyncio.CancelledError:
                         cancelled = True
+                    except BaseException:
+                        pass
+            except asyncio.CancelledError:
+                cancelled = True
             except BaseException:
-                logging.getLogger(__name__).exception("operation handoff cleanup failed")
-                if not self.closed and not self.transferred:
+                pass
+            finally:
+                while close_task is not None and not close_task.done():
                     try:
-                        await self.close()
+                        await asyncio.shield(close_task)
                     except asyncio.CancelledError:
                         cancelled = True
+                        current = asyncio.current_task()
+                        if current is not None and hasattr(current, "uncancel"):
+                            current.uncancel()
                     except BaseException:
-                        logging.getLogger(__name__).exception("operation handoff inline cleanup retry failed")
-                if not self.closed and not self.transferred and self.dispatch is None and self.token is not None:
-                    if self.coordinator.release(self.token) or not self.coordinator.is_current(self.token):
-                        self.token = None
-                        self.closed = True
-                        self.state = HandoffState.CLOSED
-        finally:
-            close_coro = close_task = None
+                        if close_task.done():
+                            break
+                        await asyncio.sleep(0)
+                if close_coro is not None and hasattr(close_coro, "close"):
+                    try:
+                        close_coro.close()
+                    except BaseException:
+                        pass
+                close_coro = close_task = None
             if cancelled:
                 current = asyncio.current_task()
                 if current is not None and hasattr(current, "uncancel"):
                     current.uncancel()
+            await asyncio.sleep(0)
         return cancelled
 
     def _set_state(self, state):
@@ -357,23 +472,57 @@ class OperationHandoff:
     def create_dispatch(self, payload=None):
         if self.state not in (HandoffState.ACQUIRED, HandoffState.PREPARING):
             raise RuntimeError("operation handoff dispatch is not available")
-        dispatch = None
         self.set_heavy(dispatch_payload=payload)
+        dispatch, failure = self._construct_dispatch(payload)
+        payload = None
+        if failure is not None:
+            self.heavy.pop("dispatch_payload", None)
+            raise RuntimeError(f"{failure[0]}: {failure[1]}") from None
+        try:
+            self.set_dispatch(dispatch)
+        except BaseException as exc:
+            try:
+                dispatch.clear_payload()
+            except BaseException:
+                pass
+            try:
+                message = str(exc)[:512]
+            except BaseException:
+                message = "dispatch registration failed"
+            failure = (getattr(type(exc), "__name__", "BaseException")[:128], message)
+            try:
+                exc.__traceback__ = exc.__context__ = exc.__cause__ = None
+            except BaseException:
+                pass
+            exc = dispatch = None
+            self.heavy.pop("dispatch_payload", None)
+            raise RuntimeError(f"{failure[0]}: {failure[1]}") from None
+        self.heavy.pop("dispatch_payload", None)
+        return dispatch
+
+    def _construct_dispatch(self, payload):
+        dispatch = failure = None
         try:
             dispatch = WorkerDispatch(self.coordinator, self.token, self.stop_event, payload=payload)
-            self.set_dispatch(dispatch)
-            self.heavy.pop("dispatch_payload", None)
-            return dispatch
         except BaseException as exc:
             if dispatch is not None:
                 try:
                     dispatch.clear_payload()
                 except BaseException:
                     pass
-            self.heavy.pop("dispatch_payload", None)
-            kind, message = type(exc).__name__, str(exc)[:512]
-            exc.__traceback__ = exc.__context__ = exc.__cause__ = None
-            raise RuntimeError(f"{kind}: {message}") from None
+            try:
+                message = str(exc)[:512]
+            except BaseException:
+                message = "dispatch construction failed"
+            failure = (getattr(type(exc), "__name__", "BaseException")[:128], message)
+            try:
+                exc.__traceback__ = exc.__context__ = exc.__cause__ = None
+            except BaseException:
+                pass
+            exc = None
+        finally:
+            payload = None
+        return dispatch, failure
 
     @asynccontextmanager
     async def awaiter_scope(self):
@@ -477,7 +626,17 @@ class OperationHandoff:
             factory = args = kwargs = worker = wrapper = None
             return task
         except BaseException as exc:
-            primary_error = exc
+            cancelled = isinstance(exc, asyncio.CancelledError)
+            try:
+                message = str(exc)[:512]
+            except BaseException:
+                message = "worker task construction failed"
+            failure = (getattr(type(exc), "__name__", "BaseException")[:128], message)
+            try:
+                exc.__traceback__ = exc.__context__ = exc.__cause__ = None
+            except BaseException:
+                pass
+            primary_error = exc = None
             self.wrapper = None
             wrapper_to_close = wrapper if task is None else None
             if wrapper_to_close is not None and hasattr(wrapper_to_close, "close"):
@@ -488,38 +647,27 @@ class OperationHandoff:
             self.clear_heavy()
             if retained or task is not None:
                 _deferred_worker_tasks.discard(task)
-            if self.dispatch is not None:
+            task_to_drain = task or self.task
+            if task_to_drain is not None:
                 try:
-                    self.dispatch.cancel_from_awaiter()
+                    if not task_to_drain.done():
+                        task_to_drain.cancel()
                 except BaseException:
-                    logging.getLogger(__name__).exception("dispatch cancellation failed during task setup")
-                task_to_drain = task or self.task
-                if task_to_drain is not None:
-                    try:
-                        if not task_to_drain.done():
-                            task_to_drain.cancel()
-                    except BaseException:
-                        logging.getLogger(__name__).exception("worker cancellation failed during task setup")
+                    pass
+                while not task_to_drain.done():
                     try:
                         await _drain_worker_uninterruptibly(task_to_drain)
                     except asyncio.CancelledError:
-                        if isinstance(primary_error, asyncio.CancelledError):
-                            raise
+                        cancelled = True
+                        current = asyncio.current_task()
+                        if current is not None and hasattr(current, "uncancel"):
+                            current.uncancel()
                     except BaseException:
-                        logging.getLogger(__name__).exception("worker drain failed during operation handoff cleanup")
-                if not self.transferred:
-                    try:
-                        resolved = not self.coordinator.is_current(self.token)
-                    except BaseException:
-                        resolved = False
-                    if resolved:
-                        self.closed = True
-                        self._set_state(HandoffState.CLOSED)
-            elif self.token is not None and not self.closed:
-                self.coordinator.release(self.token)
-                self.closed = True
-                self._set_state(HandoffState.CLOSED)
-            raise
+                        await asyncio.sleep(0)
+            factory = args = kwargs = worker = wrapper = task = task_to_drain = None
+            if cancelled:
+                raise asyncio.CancelledError() from None
+            raise RuntimeError(f"{failure[0]}: {failure[1]}") from None
 
 
 def _return_worker(worker):
@@ -865,15 +1013,10 @@ async def api_load(req: LoadRequest):
 
 def _make_delete_model_worker(dispatch, model_id, delete_fn):
     def worker():
-        if not dispatch.claim():
-            return _worker_success()
-        try:
-            try:
-                return _worker_success(delete_fn(model_id))
-            except BaseException as exc:
-                return _worker_failure(exc, default_status=500, value_status=400)
-        finally:
-            dispatch.release_from_worker()
+        return _execute_dispatched_worker(
+            dispatch, lambda _payload: delete_fn(model_id),
+            default_status=500, value_status=400,
+        )
     return worker
 
 
@@ -989,30 +1132,24 @@ async def api_unload():
 
 def _make_lens_load_worker(dispatch, token):
     def worker():
-        if not dispatch.claim():
-            return _worker_success()
-        payload = old_state = result = None
+        old_state = None
+        def execute(payload):
+            nonlocal old_state
+            old_state = lens_manager.state_record()
+            result = lens_manager.load(
+                manager, repo_id=payload["repo_id"], filename=payload["filename"],
+                revision=payload["revision"], path=payload["path"],
+                layers=payload["layers"], k=payload["k"],
+            )
+            manager.coordinator.update_lens_binding(token, result)
+            return result
+        def rollback():
+            if old_state is not None:
+                lens_manager.restore_state_record(old_state)
         try:
-            payload = dispatch.take_payload()
-            try:
-                old_state = lens_manager.state_record()
-                result = lens_manager.load(
-                    manager, repo_id=payload["repo_id"], filename=payload["filename"],
-                    revision=payload["revision"], path=payload["path"],
-                    layers=payload["layers"], k=payload["k"],
-                )
-                manager.coordinator.update_lens_binding(token, result)
-                return _worker_success(result)
-            except BaseException as exc:
-                if old_state is not None:
-                    try:
-                        lens_manager.restore_state_record(old_state)
-                    except Exception:
-                        logging.getLogger(__name__).exception("failed to restore lens state after worker failure")
-                return _worker_failure(exc)
+            return _execute_dispatched_worker(dispatch, execute, rollback=rollback)
         finally:
-            payload = old_state = result = None
-            dispatch.release_from_worker()
+            old_state = execute = rollback = None
     return worker
 
 
@@ -1513,30 +1650,16 @@ def api_presets_delete(name: str):
 
 def _make_export_worker(dispatch):
     def worker():
-        if not dispatch.claim():
-            return _worker_success()
-        payload = call_kwargs = result = None
-        try:
-            payload = dispatch.take_payload()
-            try:
-                call_kwargs = dict(payload["kwargs"])
-                if payload["export_fn"] is editing.export_rebase:
-                    call_kwargs["publication_guard"] = payload["publication_gate"]
-                result = payload["export_fn"](
-                    payload["rules"], payload["bundle"].jl, payload["meta"],
-                    fmt=payload["format"], name=payload["name"],
-                    source_dir=payload["source_dir"], scale=payload["scale"], **call_kwargs,
-                )
-                return _worker_success(result)
-            except BaseException as exc:
-                return _worker_failure(exc)
-        finally:
-            try:
-                import gc
-                payload = call_kwargs = result = None
-                gc.collect()
-            finally:
-                dispatch.release_from_worker()
+        def execute(payload):
+            call_kwargs = dict(payload["kwargs"])
+            if payload["export_fn"] is editing.export_rebase:
+                call_kwargs["publication_guard"] = payload["publication_gate"]
+            return payload["export_fn"](
+                payload["rules"], payload["bundle"].jl, payload["meta"],
+                fmt=payload["format"], name=payload["name"],
+                source_dir=payload["source_dir"], scale=payload["scale"], **call_kwargs,
+            )
+        return _execute_dispatched_worker(dispatch, execute)
     return worker
 
 
@@ -1778,26 +1901,16 @@ def _gguf_worker(job_name, job_dir, filename_stem, gguf_type,
 
 def _make_gguf_bake_worker(dispatch):
     def worker():
-        if not dispatch.claim():
-            return _worker_success()
-        payload = call_kwargs = result = None
-        try:
-            payload = dispatch.take_payload()
-            try:
-                call_kwargs = dict(payload["kwargs"])
-                if payload["export_fn"] is editing.export_rebase:
-                    call_kwargs["publication_guard"] = payload["publication_gate"]
-                result = payload["export_fn"](
-                    payload["rules"], payload["bundle"].jl, payload["meta"],
-                    fmt="full", name=payload["name"], source_dir=payload["source_dir"],
-                    scale=payload["scale"], **call_kwargs,
-                )
-                return _worker_success(result)
-            except BaseException as exc:
-                return _worker_failure(exc)
-        finally:
-            payload = call_kwargs = result = None
-            dispatch.release_from_worker()
+        def execute(payload):
+            call_kwargs = dict(payload["kwargs"])
+            if payload["export_fn"] is editing.export_rebase:
+                call_kwargs["publication_guard"] = payload["publication_gate"]
+            return payload["export_fn"](
+                payload["rules"], payload["bundle"].jl, payload["meta"],
+                fmt="full", name=payload["name"], source_dir=payload["source_dir"],
+                scale=payload["scale"], **call_kwargs,
+            )
+        return _execute_dispatched_worker(dispatch, execute)
     return worker
 
 
@@ -1930,33 +2043,25 @@ def _make_http_generation_worker(dispatch, stop_event, done, token):
 
     def worker():
         global _generation_counter
-        if not dispatch.claim():
-            return _worker_success()
-        payload = context = last = None
-        try:
-            payload = dispatch.take_payload()
-            try:
-                context = payload["context"]
-                manager.generate(
-                    payload["messages"], payload["sampling"], stop_event, emit,
-                    lens=context, ablator=interventions if context.intervention_snapshot.get("rules") else None,
-                )
-                if done.get("error"):
-                    return _worker_failure(RuntimeError(done["error"]))
-                _generation_counter += 1
-                last = {
-                    "n": _generation_counter,
-                    "prompt": next((m.get("content", "") for m in reversed(payload["messages"]) if m.get("role") == "user"), ""),
-                    "text": done.get("text", ""), "stats": done.get("stats"), "meta": done.get("meta"),
-                }
-                manager.coordinator.publish_last_generation(token, context.model_session_id, last)
-                done["last_generation"] = last
-                return _worker_success({"text": done.get("text", ""), "stats": done.get("stats"), "meta": done.get("meta"), "last_generation": last})
-            except BaseException as exc:
-                return _worker_failure(exc)
-        finally:
-            payload = context = last = None
-            dispatch.release_from_worker()
+        def execute(payload):
+            global _generation_counter
+            context = payload["context"]
+            manager.generate(
+                payload["messages"], payload["sampling"], stop_event, emit,
+                lens=context, ablator=interventions if context.intervention_snapshot.get("rules") else None,
+            )
+            if done.get("error"):
+                raise RuntimeError(done["error"])
+            _generation_counter += 1
+            last = {
+                "n": _generation_counter,
+                "prompt": next((m.get("content", "") for m in reversed(payload["messages"]) if m.get("role") == "user"), ""),
+                "text": done.get("text", ""), "stats": done.get("stats"), "meta": done.get("meta"),
+            }
+            manager.coordinator.publish_last_generation(token, context.model_session_id, last)
+            done["last_generation"] = last
+            return {"text": done.get("text", ""), "stats": done.get("stats"), "meta": done.get("meta"), "last_generation": last}
+        return _execute_dispatched_worker(dispatch, execute)
     return worker
 
 
@@ -2008,22 +2113,13 @@ class NeighborsRequest(BaseModel):
 
 def _make_token_neighbors_worker(dispatch):
     def worker():
-        if not dispatch.claim():
-            return _worker_success()
-        payload = None
-        try:
-            payload = dispatch.take_payload()
-            try:
-                result = neighbors.lookup(
-                    payload["bundle"].jl, payload["bundle"].tokenizer,
-                    payload["key"], payload["token_ids"], payload["k"],
-                )
-                return _worker_success(result)
-            except BaseException as exc:
-                return _worker_failure(exc)
-        finally:
-            payload = result = None
-            dispatch.release_from_worker()
+        return _execute_dispatched_worker(
+            dispatch,
+            lambda payload: neighbors.lookup(
+                payload["bundle"].jl, payload["bundle"].tokenizer,
+                payload["key"], payload["token_ids"], payload["k"],
+            ),
+        )
     return worker
 
 
@@ -2179,22 +2275,13 @@ def api_fit_stop():
 
 def _make_lens_pin_worker(dispatch):
     def worker():
-        if not dispatch.claim():
-            return _worker_success()
-        payload = result = None
-        try:
-            payload = dispatch.take_payload()
-            try:
-                result = lens_manager.pin_ranks(
-                    payload["gen_id"], payload["token_ids"], payload["jl"],
-                    generation_run_id=payload["generation_run_id"],
-                )
-                return _worker_success(result)
-            except BaseException as exc:
-                return _worker_failure(exc)
-        finally:
-            payload = result = None
-            dispatch.release_from_worker()
+        return _execute_dispatched_worker(
+            dispatch,
+            lambda payload: lens_manager.pin_ranks(
+                payload["gen_id"], payload["token_ids"], payload["jl"],
+                generation_run_id=payload["generation_run_id"],
+            ),
+        )
     return worker
 
 
@@ -3029,24 +3116,14 @@ def _make_ws_generation_worker(dispatch, stop_event, loop, queue):
         loop.call_soon_threadsafe(queue.put_nowait, frame)
 
     def worker():
-        if not dispatch.claim():
-            return _worker_success()
-        payload = context = request = None
-        try:
-            payload = dispatch.take_payload()
-            try:
-                request = payload["request"]
-                context = payload["context"]
-                if "messages" in request:
-                    _generate_safely(request["messages"], request.get("sampling", {}), stop_event, emit, context)
-                else:
-                    _persisted_generate(request, stop_event, emit, context)
-                return _worker_success()
-            except BaseException as exc:
-                return _worker_failure(exc)
-        finally:
-            payload = context = request = None
-            dispatch.release_from_worker()
+        def execute(payload):
+            request = payload["request"]
+            context = payload["context"]
+            if "messages" in request:
+                _generate_safely(request["messages"], request.get("sampling", {}), stop_event, emit, context)
+            else:
+                _persisted_generate(request, stop_event, emit, context)
+        return _execute_dispatched_worker(dispatch, execute)
     return worker
 
 
@@ -3099,16 +3176,19 @@ async def _cancel_task_uninterruptibly(task):
         task.cancel()
     except BaseException:
         logging.getLogger(__name__).exception("task cancellation failed during websocket cleanup")
-    try:
-        if not task.done():
+    while not task.done():
+        try:
             await _drain_worker_uninterruptibly(task)
-    except asyncio.CancelledError:
-        cancelled = True
-        current = asyncio.current_task()
-        if current is not None and hasattr(current, "uncancel"):
-            current.uncancel()
-    except BaseException:
-        logging.getLogger(__name__).exception("task drain failed during websocket cleanup")
+        except asyncio.CancelledError:
+            cancelled = True
+            current = asyncio.current_task()
+            if current is not None and hasattr(current, "uncancel"):
+                current.uncancel()
+        except BaseException:
+            # The task remains strongly owned here.  A broken drain helper is
+            # not evidence that receiver/waiter cleanup completed.
+            logging.getLogger(__name__).exception("task drain failed during websocket cleanup")
+            await asyncio.sleep(0)
     return cancelled
 
 
@@ -3139,6 +3219,23 @@ async def _finalize_ws_runtime(ws, worker, receiver, waiter, stop_event, dispatc
         current = asyncio.current_task()
         if current is not None and hasattr(current, "uncancel"):
             current.uncancel()
+    except BaseException as exc:
+        failure_message = f"worker drain cleanup failed: {getattr(type(exc), '__name__', 'BaseException')[:128]}"
+        try:
+            exc.__traceback__ = exc.__context__ = exc.__cause__ = None
+        except BaseException:
+            pass
+        exc = None
+        while not worker.done():
+            try:
+                await _drain_worker_uninterruptibly(worker)
+            except asyncio.CancelledError:
+                cancelled = True
+                current = asyncio.current_task()
+                if current is not None and hasattr(current, "uncancel"):
+                    current.uncancel()
+            except BaseException:
+                await asyncio.sleep(0)
     raw_failure = None
     if worker.cancelled():
         raw_failure = "generation worker was cancelled without a terminal frame"
@@ -3166,8 +3263,12 @@ async def _finalize_ws_runtime(ws, worker, receiver, waiter, stop_event, dispatc
             current = asyncio.current_task()
             if current is not None and hasattr(current, "uncancel"):
                 current.uncancel()
-        except Exception:
-            pass
+        except BaseException as exc:
+            try:
+                exc.__traceback__ = exc.__context__ = exc.__cause__ = None
+            except BaseException:
+                pass
+            exc = None
     failure_message = None
     if cancelled:
         raise asyncio.CancelledError()
