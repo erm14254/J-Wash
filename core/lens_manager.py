@@ -3,6 +3,7 @@ import itertools
 import json
 import threading
 from collections import OrderedDict
+from dataclasses import dataclass
 
 import torch
 from jlens.lens import JacobianLens
@@ -10,6 +11,14 @@ from jlens.lens import JacobianLens
 import config
 
 GEN_STORE_MAX = 4
+
+
+@dataclass(frozen=True)
+class GenerationPublicationResult:
+    published: bool
+    gen_id: int
+    generation_run_id: str
+
 
 MASKS_DIR = config.DATA_DIR / "masks"
 
@@ -132,6 +141,14 @@ class LensGenerationView:
 
     def discard_gen(self, gen_id):
         return self._manager.discard_gen(gen_id)
+
+    def unpublish_gen(self, gen_id, *, generation_run_id, model_session_id, lens_binding_id):
+        return self._manager.unpublish_gen(
+            gen_id,
+            generation_run_id=generation_run_id,
+            model_session_id=model_session_id,
+            lens_binding_id=lens_binding_id,
+        )
 
     def compute_frames(self, acts, positions, phase, jl, token_ids, gen_id=None, abs_positions=None, chunk=None):
         old_layers, old_k, old_mask, old_J = self._manager.layers, self._manager.k, self._manager.mask, self._manager._J
@@ -390,6 +407,17 @@ class LensManager:
             already_published = store is not None
         if store is None:
             raise ValueError("unknown provisional generation")
+        run_id = store.get("generation_run_id")
+        if (
+            not isinstance(run_id, str) or len(run_id) != 32
+            or any(ch not in "0123456789abcdef" for ch in run_id)
+        ):
+            raise ValueError("generation run identity is invalid")
+        if (
+            store.get("model_session_id") != self.model_session_id
+            or store.get("lens_binding_id") != self.binding_id
+        ):
+            raise ValueError("generation binding is no longer current")
 
         retained = None if retained_thinking is None else tuple(
             (int(position), int(token_id)) for position, token_id in retained_thinking
@@ -443,11 +471,29 @@ class LensManager:
             store["finalized_thinking"] = retained
 
         if publish and not already_published:
-            self._provisional_gen_store.pop(gen_id, None)
-            self.gen_store[gen_id] = store
-            while len(self.gen_store) > GEN_STORE_MAX:
-                self.gen_store.popitem(last=False)
-        return gen_id
+            # Publication is an in-memory transaction.  Keep the provisional
+            # owner until committed visibility and eviction both succeed, and
+            # restore both maps exactly if any injected/runtime failure occurs.
+            committed_before = OrderedDict(self.gen_store)
+            provisional_before = dict(self._provisional_gen_store)
+            try:
+                self.gen_store[gen_id] = store
+                while len(self.gen_store) > GEN_STORE_MAX:
+                    self.gen_store.popitem(last=False)
+                removed = self._provisional_gen_store.pop(gen_id, None)
+                if removed is not store:
+                    raise RuntimeError("provisional generation ownership changed during publication")
+            except BaseException:
+                self.gen_store.clear()
+                self.gen_store.update(committed_before)
+                self._provisional_gen_store.clear()
+                self._provisional_gen_store.update(provisional_before)
+                raise
+        return GenerationPublicationResult(
+            published=publish or already_published,
+            gen_id=int(gen_id),
+            generation_run_id=run_id,
+        )
 
     def discard_gen(self, gen_id):
         store = self._provisional_gen_store.pop(gen_id, None)
@@ -455,6 +501,30 @@ class LensManager:
             store.clear()
             return True
         return False
+
+    def unpublish_gen(self, gen_id, *, generation_run_id, model_session_id, lens_binding_id):
+        """Remove exactly one committed run after durable publication rollback."""
+        store = self.gen_store.get(gen_id)
+        if store is None:
+            return False
+        if (
+            store.get("generation_run_id") != generation_run_id
+            or store.get("model_session_id") != model_session_id
+            or store.get("lens_binding_id") != lens_binding_id
+        ):
+            return False
+        self.gen_store.pop(gen_id, None)
+        store.clear()
+        return True
+
+    def has_published_gen(self, gen_id, generation_run_id):
+        store = self.gen_store.get(gen_id)
+        return bool(
+            store is not None
+            and store.get("generation_run_id") == generation_run_id
+            and store.get("model_session_id") == self.model_session_id
+            and store.get("lens_binding_id") == self.binding_id
+        )
 
     @torch.no_grad()
     def pin_ranks(self, gen_id, token_ids, jl, chunk=32, generation_run_id=None):

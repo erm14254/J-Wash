@@ -835,13 +835,16 @@ class Store:
                 log.warning("failed to clean frame candidate %s", final, exc_info=True)
             raise FrameStorageError(str(exc)) from exc
 
-    def update_message_and_frames_if_unchanged(self, message_id, expected_version, content, meta=None, *, frames=None, layers=None, k=0, clear_frames=False, frame_descriptor=None):
+    def update_message_and_frames_if_unchanged(self, message_id, expected_version, content, meta=None, *, frames=None, layers=None, k=0, clear_frames=False, frame_descriptor=None, pin_publication_state=None):
         mutation = "update_message_and_frames_if_unchanged"
         frame_file = None
         final_path = None
         try:
             if frames:
-                frame_blob = self._pack_frames_blob(frames, layers or [], k, frame_descriptor)
+                frame_blob = self._pack_frames_blob(
+                    frames, layers or [], k, frame_descriptor,
+                    pin_publication_state=pin_publication_state,
+                )
                 frame_file, final_path = self._write_unique_frame_candidate(
                     message_id, expected_version, frame_blob
                 )
@@ -982,10 +985,11 @@ class Store:
         return path
 
     @staticmethod
-    def _pack_frames_blob(frames, layers, k, descriptor=None):
+    def _pack_frames_blob(frames, layers, k, descriptor=None, *, pin_publication_state=None):
         vocab = {}
         packed = []
         run_ids = {frame.get("generation_run_id") for frame in frames}
+        gen_ids = {frame.get("gen") for frame in frames}
         archive_version = 2 if not frames or run_ids == {None} else 3
         if archive_version == 3 and (
             len(run_ids) != 1
@@ -995,6 +999,19 @@ class Store:
             or any(ch not in "0123456789abcdef" for ch in next(iter(run_ids)))
         ):
             raise FrameStorageError("schema-v3 frames require one valid generation run id")
+        if archive_version == 3 and (
+            len(gen_ids) != 1
+            or isinstance(next(iter(gen_ids)), bool)
+            or not isinstance(next(iter(gen_ids)), int)
+            or next(iter(gen_ids)) < 0
+        ):
+            raise FrameStorageError("schema-v3 frames require one valid generation id")
+        if archive_version == 3:
+            pin_publication_state = pin_publication_state or "published"
+            if pin_publication_state not in {"pending", "published", "unavailable"}:
+                raise FrameStorageError("invalid pin publication state")
+        else:
+            pin_publication_state = "unavailable"
         for frame in frames:
             vocab[frame["token_id"]] = frame["tok"]
             entry = {
@@ -1022,10 +1039,137 @@ class Store:
             "version": archive_version,
             "k": k,
             "descriptor": dict(descriptor) if descriptor is not None else None,
+            "pin_publication_state": pin_publication_state,
+            "pin_gen_id": next(iter(gen_ids)) if archive_version == 3 else None,
+            "pin_generation_run_id": next(iter(run_ids)) if archive_version == 3 else None,
             "layers": [int(l) for l in layers],
             "frames": packed,
             "vocab": {str(t): s for t, s in vocab.items()},
         })
+
+    def finalize_continuation_pin_publication(
+        self, message_id, *, expected_version, generation_run_id, gen_id, state,
+    ):
+        """Resolve pending frame pin state without changing assistant version/content."""
+        mutation = "finalize_continuation_pin_publication"
+        if state not in {"published", "unavailable"}:
+            return self._mutation_outcome(
+                "not_committed", mutation, entity_id=message_id,
+                expected_version=expected_version, message="invalid publication state",
+            )
+        conn = None
+        old_file = new_file = None
+        final_path = None
+        intended_meta = None
+        try:
+            conn = self._conn()
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT meta, frames_file, version FROM messages WHERE id = ?", (message_id,)
+            ).fetchone()
+            if row is None or row["frames_file"] is None:
+                self._rollback_or_discard(conn)
+                return self._mutation_outcome(
+                    "superseded", mutation, entity_id=message_id,
+                    expected_version=expected_version,
+                )
+            if row["version"] != expected_version:
+                self._rollback_or_discard(conn)
+                return self._mutation_outcome(
+                    "superseded", mutation, entity_id=message_id,
+                    expected_version=expected_version, observed_version=row["version"],
+                )
+            old_file = row["frames_file"]
+            data = msgpack.unpackb((FRAMES_DIR / old_file).read_bytes(), strict_map_key=False)
+            if (
+                data.get("version") != 3
+                or data.get("pin_publication_state") != "pending"
+                or data.get("pin_generation_run_id") != generation_run_id
+                or (gen_id is not None and data.get("pin_gen_id") != gen_id)
+            ):
+                self._rollback_or_discard(conn)
+                return self._mutation_outcome(
+                    "superseded", mutation, entity_id=message_id,
+                    expected_version=expected_version, observed_version=row["version"],
+                    message="continuation pin segment changed before publication resolved",
+                )
+            data["pin_publication_state"] = state
+            if state != "published":
+                data["pin_gen_id"] = None
+                data["pin_generation_run_id"] = None
+            meta = json.loads(row["meta"]) if row["meta"] else {}
+            meta["pin_publication_state"] = state
+            if state == "published":
+                meta["pin_gen_id"] = gen_id
+                meta["pin_generation_run_id"] = generation_run_id
+            else:
+                meta.pop("pin_gen_id", None)
+                meta.pop("pin_generation_run_id", None)
+            continuations = meta.get("continuations")
+            if isinstance(continuations, list) and continuations:
+                segment = continuations[-1]
+                if isinstance(segment, dict):
+                    segment["pin_publication_state"] = state
+                    if state == "published":
+                        segment["pin_gen_id"] = gen_id
+                        segment["pin_generation_run_id"] = generation_run_id
+                    else:
+                        segment.pop("pin_gen_id", None)
+                        segment.pop("pin_generation_run_id", None)
+            intended_meta = json.dumps(meta, ensure_ascii=False)
+            blob = msgpack.packb(data)
+            new_file, final_path = self._write_unique_frame_candidate(
+                message_id, expected_version, blob
+            )
+            self._validate_frame_candidate(final_path, message_id)
+            cur = conn.execute(
+                "UPDATE messages SET meta = ?, frames_file = ? "
+                "WHERE id = ? AND version = ? AND frames_file = ?",
+                (intended_meta, new_file, message_id, expected_version, old_file),
+            )
+            if cur.rowcount != 1:
+                self._rollback_or_discard(conn)
+                self._unlink_candidate_if_unreferenced(new_file, final_path)
+                return self._mutation_outcome(
+                    "superseded", mutation, entity_id=message_id,
+                    expected_version=expected_version,
+                )
+            conn.commit()
+            outcome = self._mutation_outcome(
+                "committed", mutation, entity_id=message_id,
+                expected_version=expected_version, observed_version=expected_version,
+                value=state,
+            )
+        except BaseException as exc:
+            if conn is not None:
+                self._abort_transaction_or_discard(conn)
+                self._discard_conn(conn)
+            def classify(current):
+                if current is None:
+                    return "superseded", None, None, None
+                observed = current["version"]
+                if intended_meta is None or new_file is None or old_file is None:
+                    return "ambiguous", observed, None, "pin publication state could not be read"
+                if (
+                    current["meta"] == intended_meta
+                    and current["frames_file"] == new_file
+                    and observed == expected_version
+                ):
+                    return "committed", observed, state, None
+                if observed != expected_version or current["frames_file"] != old_file:
+                    return "superseded", observed, None, "message pin state changed"
+                return "not_committed", observed, None, None
+            outcome = self._reconcile_mutation(
+                mutation, message_id,
+                "SELECT meta, frames_file, version FROM messages WHERE id = ?",
+                (message_id,), classify, expected_version=expected_version,
+                operational_exc=exc, fallback_observed_version=expected_version,
+            )
+            if outcome.state != "ambiguous":
+                self._unlink_candidate_if_unreferenced(new_file, final_path)
+        if outcome.state == "committed" and old_file and old_file != new_file:
+            self._unlink_best_effort(FRAMES_DIR / old_file)
+        return outcome
 
     def mark_frame_publication_failed(self, message_id, *, expected_version, failure_meta):
         mutation = "mark_frame_publication_failed"
@@ -1239,6 +1383,16 @@ class Store:
             if not isinstance(data, dict) or data.get("version") not in (1, 2, 3):
                 raise ValueError("unsupported frame archive version")
             archive_version = data["version"]
+            pin_publication_state = (
+                data.get("pin_publication_state", "unavailable")
+                if archive_version >= 3 else "unavailable"
+            )
+            if pin_publication_state not in {"pending", "published", "unavailable"}:
+                raise ValueError("invalid pin publication state")
+            pin_gen_id = data.get("pin_gen_id") if pin_publication_state == "published" else None
+            pin_generation_run_id = (
+                data.get("pin_generation_run_id") if pin_publication_state == "published" else None
+            )
             descriptor = data.get("descriptor") if archive_version >= 2 else None
             if descriptor is not None and not isinstance(descriptor, dict):
                 raise ValueError("invalid frame archive descriptor")
@@ -1305,8 +1459,8 @@ class Store:
                     "pos": entry["pos"],
                     "token_id": entry["token_id"],
                     "tok": vocab.get(str(entry["token_id"]), ""),
-                    "gen": frame_gen,
-                    "generation_run_id": generation_run_id,
+                    "gen": frame_gen if pin_publication_state == "published" else None,
+                    "generation_run_id": generation_run_id if pin_publication_state == "published" else None,
                     "layers": {},
                 }
                 for layer, d in normalized_layers.items():
@@ -1335,11 +1489,20 @@ class Store:
                         "m_strs": [vocab.get(str(t), "") for t in m_ids],
                     }
                 frames.append(frame)
+            if pin_publication_state == "published":
+                if (
+                    isinstance(pin_gen_id, bool) or not isinstance(pin_gen_id, int) or pin_gen_id < 0
+                    or pin_generation_run_id != archive_run_id
+                ):
+                    raise ValueError("published frame archive pin identity is invalid")
             return {
                 "version": archive_version,
                 "k": data["k"],
                 "layers": [int(l) for l in data["layers"]],
                 "descriptor": dict(descriptor) if descriptor is not None else None,
+                "pin_publication_state": pin_publication_state,
+                "pin_gen_id": pin_gen_id,
+                "pin_generation_run_id": pin_generation_run_id,
                 "frames": frames,
             }
         except Exception as exc:

@@ -4,7 +4,7 @@ import DOMPurify from 'dompurify'
 import LensView from './LensView.jsx'
 import LensDiff from './Diff.jsx'
 import Editor from './Editor.jsx'
-import { applyGenerationTerminal } from './continuationState.js'
+import { applyGenerationTerminal, frameArchivePinIdentity } from './continuationState.js'
 import { fmtTok } from './tok'
 
 const GB = 2 ** 30
@@ -367,7 +367,7 @@ export default function App() {
     jsonFetch(`/api/messages/${mid}/frames`)
       .then((body) => {
         if (body.frames?.length) {
-          setMessages((prev) => prev.map((x) => (x.id === mid ? { ...x, frames: body.frames } : x)))
+          setMessages((prev) => prev.map((x) => (x.id === mid ? { ...x, frames: body.frames, ...frameArchivePinIdentity(body) } : x)))
         }
       })
       .catch(() => {})
@@ -480,7 +480,7 @@ export default function App() {
           .then((body) => {
             if (body.frames?.length) {
               setMessages((prev) => prev.map((x) => (x.id === frame.message_id
-                ? { ...x, frames: body.frames } : x)))
+                ? { ...x, frames: body.frames, ...frameArchivePinIdentity(body) } : x)))
             }
           })
           .catch(() => {})
@@ -683,7 +683,7 @@ export default function App() {
     if (m.has_frames && !m.frames?.length && m.id != null) {
       try {
         const body = await jsonFetch(`/api/messages/${m.id}/frames`)
-        setMessages((prev) => prev.map((x, j) => (j === i ? { ...x, frames: body.frames } : x)))
+        setMessages((prev) => prev.map((x, j) => (j === i ? { ...x, frames: body.frames, ...frameArchivePinIdentity(body) } : x)))
       } catch (err) {
         setNotice({ kind: 'err', text: String(err.message || err) })
         return
@@ -835,17 +835,11 @@ export default function App() {
     // gen_id is only known for messages generated THIS page session; after a
     // reload, fall back to the id carried by the persisted frames themselves —
     // the server-side residual store survives a page refresh.
-    const msgGen = idx >= 0
-      ? messages[idx].gen_id ?? messages[idx].frames[messages[idx].frames.length - 1]?.gen ?? null
-      : null
-    const genId = live ? live[live.length - 1]?.gen ?? null : msgGen
-    const msgRunId = idx >= 0
-      ? messages[idx].generation_run_id
-        ?? messages[idx].frames[messages[idx].frames.length - 1]?.generation_run_id ?? null
-      : null
-    const generationRunId = live
-      ? live[live.length - 1]?.generation_run_id ?? null
-      : msgRunId
+    const publishedMessage = idx >= 0 && messages[idx].pin_publication_state === 'published'
+    const msgGen = publishedMessage ? messages[idx].gen_id ?? null : null
+    const genId = live ? null : msgGen
+    const msgRunId = publishedMessage ? messages[idx].generation_run_id ?? null : null
+    const generationRunId = live ? null : msgRunId
     return { live, idx, genId, generationRunId }
   }
 

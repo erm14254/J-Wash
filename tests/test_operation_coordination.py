@@ -848,7 +848,12 @@ def test_lens_generation_provisional_finalize_prunes_and_publishes():
     assert store["phases"] == ["reading", "thinking", "thinking"]
     assert store["residuals"][0][0].tolist() == [[0.0, 1.0], [2.0, 3.0], [6.0, 7.0]]
 
-    lens.finalize_gen(gen_id, publish=True)
+    publication = lens.finalize_gen(gen_id, publish=True)
+    assert publication.published is True
+    assert publication.gen_id == gen_id
+    assert publication.generation_run_id == "a" * 32
+    repeated = lens.finalize_gen(gen_id, publish=True)
+    assert repeated == publication
     assert gen_id in lens.gen_store
     assert gen_id not in lens._provisional_gen_store
 
@@ -1489,6 +1494,7 @@ def test_schema_v3_requires_one_valid_homogeneous_run_id(tmp_path, monkeypatch, 
     cid = s.create_conversation("c").value
     mid = s.add_message(cid, None, "assistant", "T").value[0]
     frame = _frame(0, "reading", "0")
+    frame["gen"] = 1
     frame["generation_run_id"] = "1" * 32
     blob = msgpack.unpackb(store_mod.Store._pack_frames_blob([frame], [0], 1), strict_map_key=False)
     if run_id == "__missing__":
@@ -1549,7 +1555,7 @@ def test_persisted_continue_drops_overlapping_reread_frames_and_reloads(tmp_path
     loaded = s.load_frames(mid)
     assert [frame["pos"] for frame in loaded["frames"]] == [1, 2]
     assert [frame["phase"] for frame in loaded["frames"]] == ["reading", "thinking"]
-    assert [frame["gen"] for frame in loaded["frames"]] == [None, 20]
+    assert [frame["gen"] for frame in loaded["frames"]] == [None, None]
 
     def generate_second(**kwargs):
         run_id = "3" * 32
@@ -1639,7 +1645,7 @@ def test_pointerless_framed_continuation_replaces_stale_frame_metadata(tmp_path,
         assert stale not in meta
     loaded = s.load_frames(mid)
     assert loaded["version"] == 3
-    assert [frame["generation_run_id"] for frame in loaded["frames"]] == [run_id, run_id]
+    assert [frame["generation_run_id"] for frame in loaded["frames"]] == [None, None]
 
 
 def test_lens_disabled_continuation_invalidates_existing_frames(tmp_path, monkeypatch):
@@ -2512,3 +2518,232 @@ def test_worker_failure_survives_unformattable_exception():
     outcome = app._worker_failure(BadString())
     assert outcome.failure_kind == "BadString"
     assert outcome.failure_message == "worker failure could not be formatted"
+
+
+def test_frame_pin_publication_state_survives_reload_without_version_increment(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c").value
+    mid, version = s.add_message(cid, None, "assistant", "old", return_version=True).value
+    run_id = "a" * 32
+    frame = _frame(1, "thinking", "0")
+    frame.update(gen=7, generation_run_id=run_id)
+    pending = s.update_message_and_frames_if_unchanged(
+        mid, version, "old plus",
+        {"pin_publication_state": "pending", "continuations": [{"pin_publication_state": "pending"}]},
+        frames=[frame], layers=[0], k=1, pin_publication_state="pending",
+    )
+    assert pending.state == "committed"
+    committed_version = pending.observed_version
+    loaded = s.load_frames(mid)
+    assert loaded["pin_publication_state"] == "pending"
+    assert loaded["pin_gen_id"] is None
+    assert loaded["pin_generation_run_id"] is None
+    assert loaded["frames"][0]["gen"] is None
+    assert loaded["frames"][0]["generation_run_id"] is None
+
+    published = s.finalize_continuation_pin_publication(
+        mid, expected_version=committed_version, generation_run_id=run_id,
+        gen_id=7, state="published",
+    )
+    assert published.state == "committed"
+    assert published.observed_version == committed_version
+    assert s.get_message(mid)["version"] == committed_version
+    loaded = s.load_frames(mid)
+    assert loaded["pin_publication_state"] == "published"
+    assert loaded["pin_gen_id"] == 7
+    assert loaded["pin_generation_run_id"] == run_id
+    assert loaded["frames"][0]["gen"] == 7
+    assert loaded["frames"][0]["generation_run_id"] == run_id
+
+
+def test_persisted_continue_publication_failure_commits_visualization_without_pin(tmp_path, monkeypatch):
+    from api import app
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    monkeypatch.setattr(app, "store", s)
+    cid = s.create_conversation("c").value
+    mid, version = s.add_message(cid, None, "assistant", "old", return_version=True).value
+    run_id = "b" * 32
+
+    class FailingLens:
+        layers = [0]
+        k = 1
+        binding_id = 4
+        model_session_id = 3
+        meta = {"path": "/lens", "model_id": "m", "model_revision": "r", "fitted_layers_all": [0], "tapped_layers": [0], "k": 1}
+
+        def __init__(self):
+            self.provisional = {9}
+            self.committed = set()
+
+        def finalize_gen(self, gen_id, *, publish=True):
+            assert gen_id == 9 and publish
+            raise RuntimeError("injected residual publication failure")
+
+        def discard_gen(self, gen_id):
+            self.provisional.discard(gen_id)
+            return True
+
+        def unpublish_gen(self, gen_id, **_identity):
+            self.committed.discard(gen_id)
+            return False
+
+    lens = FailingLens()
+
+    def generate(**kwargs):
+        frame = _frame(1, "thinking", "0")
+        frame.update(gen=9, generation_run_id=run_id)
+        kwargs["emit"]({"type": "frame", **frame})
+        kwargs["emit"]({
+            "type": "done", "text": " plus", "meta": {"model_id": "m", "generation_run_id": run_id},
+            "stats": {"tokens": 1}, "stopped": False, "gen_id": 9,
+            "generation_run_id": run_id, "pin_publication_state": "pending",
+            "continuation_suffix_start_pos": 1, "continuation_suffix_end_pos": 2,
+        })
+
+    monkeypatch.setattr(app.manager, "generate", generate)
+    emitted = []
+    context = SimpleNamespace(lens=lens, intervention_snapshot={"rules": []})
+    app._persisted_continue({}, mid, threading.Event(), emitted.append, context)
+
+    message = s.get_message(mid)
+    assert message["content"] == "old plus"
+    assert message["version"] == version + 1
+    metadata = json.loads(message["meta"])
+    assert metadata["pin_publication_state"] == "unavailable"
+    assert "pin_gen_id" not in metadata
+    assert "pin_generation_run_id" not in metadata
+    loaded = s.load_frames(mid)
+    assert loaded["pin_publication_state"] == "unavailable"
+    assert loaded["pin_gen_id"] is None
+    assert loaded["pin_generation_run_id"] is None
+    assert loaded["frames"][0]["gen"] is None
+    assert loaded["frames"][0]["generation_run_id"] is None
+    terminal = emitted[-1]
+    assert terminal["type"] == "done"
+    assert terminal["content"] == "old plus"
+    assert terminal["pin_publication_state"] == "unavailable"
+    assert "gen_id" not in terminal
+    assert "generation_run_id" not in terminal
+    assert not lens.provisional
+    assert not lens.committed
+
+
+def test_finalize_gen_publication_failure_restores_committed_and_provisional_maps(monkeypatch):
+    from collections import OrderedDict
+    from core.lens_manager import GEN_STORE_MAX, LensManager
+
+    lens = LensManager()
+    lens.layers = []
+    lens.model_session_id = 1
+    lens.binding_id = 2
+    old_ids = [lens.start_gen(generation_run_id=f"{i:032x}") for i in range(GEN_STORE_MAX)]
+    attempt = lens.start_gen(generation_run_id="f" * 32, provisional=True)
+    lens.finalize_gen(attempt, retained_thinking=[], publish=False)
+
+    class FailOnceOrderedDict(OrderedDict):
+        def __init__(self, values):
+            super().__init__(values)
+            self.failed = False
+
+        def __setitem__(self, key, value):
+            if key == attempt and not self.failed:
+                self.failed = True
+                raise RuntimeError("injected committed insertion failure")
+            return super().__setitem__(key, value)
+
+    lens.gen_store = FailOnceOrderedDict(lens.gen_store)
+    with pytest.raises(RuntimeError, match="injected committed insertion failure"):
+        lens.finalize_gen(attempt, publish=True)
+    assert list(lens.gen_store) == old_ids
+    assert attempt in lens._provisional_gen_store
+    assert lens.discard_gen(attempt)
+    assert list(lens.gen_store) == old_ids
+
+
+def test_persisted_continue_unexpected_metadata_failure_discards_provisional(monkeypatch):
+    from api import app
+
+    class FakeStore:
+        def get_message(self, message_id):
+            return {
+                "id": message_id, "conversation_id": 1, "role": "assistant",
+                "content": "old", "meta": "{broken", "version": 2, "frames_file": None,
+            }
+
+        def path_to_root(self, _message_id):
+            return [{"role": "assistant", "content": "old"}]
+
+        def update_message_and_frames_if_unchanged(self, *_args, **_kwargs):
+            raise AssertionError("Store must not mutate after metadata parse failure")
+
+    class FakeLens:
+        layers = [0]
+        k = 1
+        binding_id = 1
+        model_session_id = 1
+        meta = {"model_id": "m"}
+
+        def __init__(self):
+            self.provisional = {8}
+            self.committed = {3}
+
+        def discard_gen(self, gen_id):
+            self.provisional.discard(gen_id)
+            return True
+
+        def unpublish_gen(self, gen_id, **_kwargs):
+            self.committed.discard(gen_id)
+            return False
+
+    lens = FakeLens()
+
+    def generate(**kwargs):
+        kwargs["emit"]({
+            "type": "done", "text": " plus", "gen_id": 8,
+            "generation_run_id": "c" * 32, "pin_publication_state": "pending",
+            "meta": {}, "stats": {}, "stopped": False,
+        })
+
+    monkeypatch.setattr(app, "store", FakeStore())
+    monkeypatch.setattr(app.manager, "generate", generate)
+    with pytest.raises(json.JSONDecodeError):
+        app._persisted_continue(
+            {}, 1, threading.Event(), lambda _frame: None,
+            SimpleNamespace(lens=lens, intervention_snapshot={"rules": []}),
+        )
+    assert lens.provisional == set()
+    assert lens.committed == {3}
+
+
+def test_frame_api_requires_durable_state_and_live_exact_residual_membership(monkeypatch):
+    from api import app
+
+    run_id = "d" * 32
+    archive = {
+        "pin_publication_state": "published", "pin_gen_id": 5,
+        "pin_generation_run_id": run_id,
+        "frames": [{"type": "frame", "gen": 5, "generation_run_id": run_id}],
+    }
+    monkeypatch.setattr(app, "store", SimpleNamespace(load_frames=lambda _mid: archive))
+    membership = SimpleNamespace(has_published_gen=lambda gen_id, candidate: (gen_id, candidate) == (5, run_id))
+    monkeypatch.setattr(app, "lens_manager", membership)
+    visible = app.api_message_frames(1)
+    assert visible["pin_publication_state"] == "published"
+    assert visible["pin_gen_id"] == 5
+    assert visible["frames"][0]["generation_run_id"] == run_id
+
+    membership.has_published_gen = lambda _gen_id, _candidate: False
+    hidden = app.api_message_frames(1)
+    assert hidden["pin_publication_state"] == "unavailable"
+    assert hidden["pin_gen_id"] is None
+    assert hidden["pin_generation_run_id"] is None
+    assert hidden["frames"][0]["gen"] is None
+    assert hidden["frames"][0]["generation_run_id"] is None

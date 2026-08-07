@@ -15,8 +15,9 @@ export function applyGenerationTerminal(messages, frame, frames = []) {
         ...message,
         content: durableContent,
         stats: frame.stats,
-        gen_id: frame.gen_id,
-        generation_run_id: frame.generation_run_id,
+        gen_id: frame.pin_publication_state === 'published' ? frame.gen_id : undefined,
+        generation_run_id: frame.pin_publication_state === 'published' ? frame.generation_run_id : undefined,
+        pin_publication_state: frame.pin_publication_state,
         has_frames: message.has_frames || frames.length > 0,
         frames: undefined,
       } : message),
@@ -44,4 +45,16 @@ export function applyGenerationTerminal(messages, frame, frames = []) {
     clearAttempt: true,
     reloadFrames: false,
   }
+}
+
+export function frameArchivePinIdentity(archive) {
+  if (archive?.pin_publication_state !== 'published') {
+    return { gen_id: null, generation_run_id: null, pin_publication_state: archive?.pin_publication_state ?? 'unavailable' }
+  }
+  const genId = archive.pin_gen_id
+  const runId = archive.pin_generation_run_id
+  if (!Number.isInteger(genId) || genId < 0 || !/^[0-9a-f]{32}$/.test(runId || '')) {
+    return { gen_id: null, generation_run_id: null, pin_publication_state: 'unavailable' }
+  }
+  return { gen_id: genId, generation_run_id: runId, pin_publication_state: 'published' }
 }

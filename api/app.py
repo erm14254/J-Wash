@@ -2811,7 +2811,19 @@ def api_conversation_delete(cid: int):
 @app.get("/api/messages/{mid}/frames")
 def api_message_frames(mid: int):
     try:
-        return store.load_frames(mid)
+        archive = store.load_frames(mid)
+        if archive.get("pin_publication_state") == "published" and not lens_manager.has_published_gen(
+            archive.get("pin_gen_id"), archive.get("pin_generation_run_id"),
+        ):
+            archive = dict(archive)
+            archive["pin_publication_state"] = "unavailable"
+            archive["pin_gen_id"] = None
+            archive["pin_generation_run_id"] = None
+            archive["frames"] = [
+                dict(frame, gen=None, generation_run_id=None)
+                for frame in archive.get("frames", [])
+            ]
+        return archive
     except FramesNotAttached as exc:
         raise HTTPException(404, str(exc)) from None
     except FramePointerTurnover as exc:
@@ -3131,9 +3143,7 @@ def _finalize_continuation_frames(new_frames, suffix_start, suffix_end, generati
 
 
 def _persisted_continue(req, message_id, stop_event, emit, gen_context):
-    """Extend an existing assistant reply: generate with the turn left open,
-    append the text to the message, and merge the new lens frames into its
-    stored blob (positions keep increasing, so both parts stay coherent)."""
+    """Persist one continuation while owning its provisional residual capture."""
     msg = store.get_message(message_id)
     expected_content = msg["content"]
     expected_meta = msg.get("meta")
@@ -3149,9 +3159,6 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
     done_holder = {}
     existing_archive = None
 
-    # Descriptor and storage compatibility are checked before generation emits
-    # any user-visible token or frame.  The final CAS still protects against a
-    # writer changing the row after this preflight.
     if msg.get("frames_file"):
         try:
             existing_archive = store.load_frames(message_id)
@@ -3176,111 +3183,192 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
         capture_full_input_frames=lens is not None,
         defer_lens_publication=lens is not None,
     )
-    old_content = expected_content
-    appended = done_holder.get("text", "")
+    attempt_gen_id = done_holder.get("gen_id") if lens is not None else None
+    attempt_run_id = done_holder.get("generation_run_id") if attempt_gen_id is not None else None
+    attempt_resolved = attempt_gen_id is None
+    durable_committed = False
+    durable_version = expected_version + 1
 
-    def discard_lens_attempt():
-        gen_id = done_holder.get("gen_id")
-        if lens is not None and gen_id is not None:
-            lens.discard_gen(gen_id)
+    def discard_attempt():
+        nonlocal attempt_resolved
+        if not attempt_resolved and lens is not None:
+            lens.discard_gen(attempt_gen_id)
+        attempt_resolved = True
 
-    if not appended:
-        frames_acc.clear()
-        discard_lens_attempt()
-        emit(dict(
-            type="done",
-            conversation_id=msg["conversation_id"],
-            message_id=message_id,
-            text="",
-            content=old_content,
-            continued=False,
-            continuation_noop=True,
-        ))
-        return
-    new_content = old_content + appended
-    previous_meta = json.loads(expected_meta) if expected_meta else {}
-    meta = _continuation_metadata(
-        previous_meta, len(old_content), len(new_content),
-        done_holder.get("meta"), done_holder.get("stats"), done_holder.get("stopped"),
-    )
-    merged = None
-    clear_frames = False
-    if frames_acc:
-        for stale_key in (
-            "frames_invalidated", "frames_invalidation_reason", "frames_error_kind",
-            "frames_error", "frames_pending",
-        ):
-            meta.pop(stale_key, None)
-        meta.update(publication_state="complete", frames_expected=True)
-        meta.update(_frames_lens_signature(lens, layers_used, k_used))
-        try:
+    def resolve_durable_state(state):
+        return store.finalize_continuation_pin_publication(
+            message_id,
+            expected_version=durable_version,
+            generation_run_id=attempt_run_id,
+            gen_id=attempt_gen_id,
+            state=state,
+        )
+
+    try:
+        old_content = expected_content
+        appended = done_holder.get("text", "")
+        if not appended:
+            frames_acc.clear()
+            discard_attempt()
+            emit(dict(
+                type="done", conversation_id=msg["conversation_id"], message_id=message_id,
+                text="", content=old_content, continued=False, continuation_noop=True,
+            ))
+            return
+
+        new_content = old_content + appended
+        previous_meta = json.loads(expected_meta) if expected_meta else {}
+        done_meta = dict(done_holder.get("meta") or {})
+        # Pin identity has its own durable state; model provenance metadata must
+        # not independently resurrect an unpublished run after reload.
+        done_meta.pop("generation_run_id", None)
+        meta = _continuation_metadata(
+            previous_meta, len(old_content), len(new_content),
+            done_meta, done_holder.get("stats"), done_holder.get("stopped"),
+        )
+        merged = None
+        clear_frames = False
+        if frames_acc:
+            for stale_key in (
+                "frames_invalidated", "frames_invalidation_reason", "frames_error_kind",
+                "frames_error", "frames_pending",
+            ):
+                meta.pop(stale_key, None)
+            meta.update(
+                publication_state="complete", frames_expected=True,
+                pin_publication_state="pending",
+            )
+            meta.pop("pin_gen_id", None)
+            meta.pop("pin_generation_run_id", None)
+            if meta.get("continuations"):
+                meta["continuations"][-1]["pin_publication_state"] = "pending"
+            meta.update(_frames_lens_signature(lens, layers_used, k_used))
             merged = _finalize_continuation_frames(
                 frames_acc,
                 done_holder.get("continuation_suffix_start_pos"),
                 done_holder.get("continuation_suffix_end_pos"),
-                done_holder.get("generation_run_id"),
+                attempt_run_id,
             )
-        except Exception as exc:
-            discard_lens_attempt()
-            emit({"type": "error", "message": f"could not finalize continuation frames; continuation not persisted: {exc}"})
-            return
-    elif msg.get("frames_file") and lens is None:
-        clear_frames = True
-        meta.update(
-            frames_expected=False,
-            frames_invalidated=True,
-            frames_invalidation_reason="lens_disabled_continuation",
+        elif msg.get("frames_file") and lens is None:
+            clear_frames = True
+            meta.update(
+                frames_expected=False,
+                frames_invalidated=True,
+                frames_invalidation_reason="lens_disabled_continuation",
+            )
+        outcome = store.update_message_and_frames_if_unchanged(
+            message_id, expected_version, new_content, meta,
+            frames=merged, layers=layers_used, k=k_used, clear_frames=clear_frames,
+            frame_descriptor=_frame_descriptor(lens, layers_used, k_used) if merged is not None else None,
+            pin_publication_state="pending" if merged is not None else None,
         )
-    outcome = store.update_message_and_frames_if_unchanged(
-        message_id, expected_version, new_content, meta,
-        frames=merged, layers=layers_used, k=k_used, clear_frames=clear_frames,
-        frame_descriptor=_frame_descriptor(lens, layers_used, k_used) if merged is not None else None,
-    )
-    if outcome.state in {"stale", "superseded"}:
-        discard_lens_attempt()
-        emit({"type": "error", "message": "message changed during continuation"})
-        return
-    if outcome.state == "ambiguous":
-        discard_lens_attempt()
-        candidate = f", candidate {outcome.value}" if isinstance(outcome.value, str) else ""
-        versions = f", expected version {outcome.expected_version}, observed version {outcome.observed_version}"
-        emit({"type": "error", "message": f"continuation durability is unknown for message {outcome.entity_id}{candidate}{versions}; operator recovery is required"})
-        return
-    if outcome.state == "not_committed":
-        discard_lens_attempt()
-        emit({"type": "error", "message": "continuation did not commit; storage recovery is required"})
-        return
-    if outcome.state != "committed":
-        discard_lens_attempt()
-        emit({"type": "error", "message": "invalid continuation storage outcome"})
-        return
-    terminal = dict(done_holder)
-    pin_published = True
-    if lens is not None and terminal.get("gen_id") is not None:
-        try:
-            lens.finalize_gen(terminal["gen_id"], publish=True)
-        except Exception as exc:
-            pin_published = False
-            logging.getLogger(__name__).warning(
-                "durable continuation committed but residual publication failed: %s",
-                str(exc)[:512],
-            )
-            terminal.pop("gen_id", None)
-            terminal.pop("generation_run_id", None)
-            discard_lens_attempt()
-    if pin_published:
-        for frame in frames_acc:
-            emit(frame)
-    frames_acc.clear()
-    emit(dict(
-        terminal,
-        conversation_id=msg["conversation_id"],
-        message_id=message_id,
-        text=appended,
-        content=new_content,
-        continued=True,
-        continuation_noop=False,
-    ))
+        if outcome.state in {"stale", "superseded"}:
+            discard_attempt()
+            emit({"type": "error", "message": "message changed during continuation"})
+            return
+        if outcome.state == "ambiguous":
+            discard_attempt()
+            candidate = f", candidate {outcome.value}" if isinstance(outcome.value, str) else ""
+            versions = f", expected version {outcome.expected_version}, observed version {outcome.observed_version}"
+            emit({"type": "error", "message": f"continuation durability is unknown for message {outcome.entity_id}{candidate}{versions}; operator recovery is required"})
+            return
+        if outcome.state == "not_committed":
+            discard_attempt()
+            emit({"type": "error", "message": "continuation did not commit; storage recovery is required"})
+            return
+        if outcome.state != "committed":
+            discard_attempt()
+            emit({"type": "error", "message": "invalid continuation storage outcome"})
+            return
+        durable_committed = True
+        terminal = dict(done_holder)
+
+        if attempt_gen_id is not None:
+            publication_ok = False
+            try:
+                publication = lens.finalize_gen(attempt_gen_id, publish=True)
+                publication_ok = (
+                    publication.published
+                    and publication.gen_id == attempt_gen_id
+                    and publication.generation_run_id == attempt_run_id
+                )
+                if not publication_ok:
+                    raise RuntimeError("residual publication identity mismatch")
+                durable = resolve_durable_state("published")
+                if durable.state != "committed":
+                    raise RuntimeError(f"durable pin publication state was {durable.state}")
+                attempt_resolved = True
+                terminal["pin_publication_state"] = "published"
+            except BaseException as exc:
+                logging.getLogger(__name__).warning(
+                    "durable continuation committed but residual publication failed: %s",
+                    _bounded_failure(exc, "residual publication failed")[1],
+                )
+                lens.unpublish_gen(
+                    attempt_gen_id,
+                    generation_run_id=attempt_run_id,
+                    model_session_id=lens.model_session_id,
+                    lens_binding_id=lens.binding_id,
+                )
+                discard_attempt()
+                unavailable = resolve_durable_state("unavailable")
+                if unavailable.state != "committed":
+                    logging.getLogger(__name__).error(
+                        "could not resolve durable pin state for message %s: %s",
+                        message_id, unavailable.state,
+                    )
+                terminal.pop("gen_id", None)
+                terminal.pop("generation_run_id", None)
+                terminal["pin_publication_state"] = "unavailable"
+                publication_ok = False
+            if publication_ok:
+                for frame in frames_acc:
+                    emit(frame)
+        else:
+            if merged is not None:
+                unavailable = resolve_durable_state("unavailable")
+                if unavailable.state != "committed":
+                    logging.getLogger(__name__).error(
+                        "could not resolve identity-free frame state for message %s: %s",
+                        message_id, unavailable.state,
+                    )
+                terminal["pin_publication_state"] = "unavailable"
+                terminal.pop("gen_id", None)
+                terminal.pop("generation_run_id", None)
+                for frame in frames_acc:
+                    emit(dict(frame, gen=None, generation_run_id=None))
+            else:
+                for frame in frames_acc:
+                    emit(frame)
+        frames_acc.clear()
+        emit(dict(
+            terminal,
+            conversation_id=msg["conversation_id"], message_id=message_id,
+            text=appended, content=new_content, continued=True, continuation_noop=False,
+        ))
+    finally:
+        frames_acc.clear()
+        if not attempt_resolved:
+            # Any unexpected post-generation failure leaves durable content true
+            # but makes the process-local pin attempt definitively unavailable.
+            try:
+                lens.unpublish_gen(
+                    attempt_gen_id,
+                    generation_run_id=attempt_run_id,
+                    model_session_id=lens.model_session_id,
+                    lens_binding_id=lens.binding_id,
+                )
+            except BaseException:
+                pass
+            try:
+                discard_attempt()
+            except BaseException:
+                attempt_resolved = True
+            if durable_committed:
+                try:
+                    resolve_durable_state("unavailable")
+                except BaseException:
+                    pass
 
 
 async def _watch_stop(ws, stop_event):

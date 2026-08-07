@@ -1005,6 +1005,10 @@ class ModelManager:
                     "text": text,
                     "gen_id": gen_id,
                     "generation_run_id": generation_run_id,
+                    "pin_publication_state": (
+                        "pending" if gen_id is not None and defer_lens_publication
+                        else "published" if gen_id is not None else "unavailable"
+                    ),
                     "durable_reply_token_ids": list(durable_reply_ids),
                     "durable_generated_token_count": durable_reply_tokens,
                     "stop_reason": stop_reason or ("cancelled" if stop_event.is_set() else "max_tokens"),
