@@ -979,10 +979,12 @@ def _broadcast_capabilities_changed(model_session_id):
         return
     payload = json.dumps({"type": "capabilities_changed", "model_session_id": model_session_id})
     for ws in list(_ws_locks):
+        notification = _ws_send(ws, payload)
         try:
-            future = asyncio.run_coroutine_threadsafe(_ws_send(ws, payload), loop)
+            future = asyncio.run_coroutine_threadsafe(notification, loop)
             future.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
         except Exception:
+            notification.close()
             logging.getLogger(__name__).debug("capability notification failed", exc_info=True)
 
 # concurrent HF downloads: one state per repo_id
@@ -1535,10 +1537,13 @@ def api_interventions_patch(rule_id: int, req: InterventionPatch):
 
 def _interventions_patch_resource(token, snap, rule_id, req, needs_dirs):
     bundle = rules = None
-    try:
-        bundle = _bundle_from_snapshot_or_legacy(snap) if needs_dirs else None
-        if needs_dirs:
+    if needs_dirs:
+        bundle = _bundle_from_snapshot_or_legacy(snap)
+        try:
             capabilities.require(bundle.capability_profile, "modes", "standard", loaded=True)
+        except ValueError as exc:
+            return _route_http(422, str(exc))
+    try:
         def mutate():
             return interventions.update(
                 rule_id,

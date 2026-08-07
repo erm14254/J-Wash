@@ -2,10 +2,15 @@ import asyncio
 import inspect
 import logging
 import threading
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
+import pytest
 
 from api import app as app_module
+from core import capabilities
+from core.ablation import Interventions
+from core.model_session import LoadedModelBundle, ModelSessionCoordinator, OperationType
 
 
 def _result(errors=None):
@@ -127,3 +132,127 @@ def test_cleanup_runs_off_the_event_loop_thread(monkeypatch):
         assert cleanup_thread[0] != loop_thread
 
     asyncio.run(exercise())
+
+
+def _loaded_coordinator(profile=None):
+    coordinator = ModelSessionCoordinator()
+    token, snap = coordinator.acquire(OperationType.LOAD)
+    bundle = LoadedModelBundle.from_parts(
+        object(), object(), object(), {"model_id": "m", "quant": None},
+        profile if profile is not None else _supported_profile(),
+    )
+    coordinator.publish_loaded(token, bundle, expected_unloaded_session=snap.model_session_id)
+    coordinator.release(token)
+    return coordinator
+
+
+def _supported_profile():
+    yes = capabilities.decision(True, "supported")
+    return {
+        "declared_quantization": None, "has_packed_read_parameters": False,
+        "modes": {"standard": dict(yes), "readthrough": dict(yes),
+                  "exact": dict(yes), "abliteration": capabilities.decision(
+                      False, "global_projection_unvalidated")},
+    }
+
+
+def test_mode_notification_is_exact_and_scale_or_rejection_emit_none(monkeypatch):
+    coordinator = _loaded_coordinator(_supported_profile())
+    iv = Interventions()
+    monkeypatch.setattr(app_module.manager, "coordinator", coordinator)
+    monkeypatch.setattr(app_module, "interventions", iv)
+    events = []
+    monkeypatch.setattr(app_module, "_broadcast_capabilities_changed", events.append)
+
+    result = app_module.api_interventions_scale(SimpleNamespace(scale=None, mode="readthrough"))
+    assert result == {"scale": 1.0, "mode": "readthrough"}
+    assert events == [coordinator.status_snapshot().model_session_id]
+
+    assert app_module.api_interventions_scale(SimpleNamespace(scale=2.0, mode=None)) == {
+        "scale": 2.0, "mode": "readthrough",
+    }
+    assert events == [coordinator.status_snapshot().model_session_id]
+
+    with pytest.raises(app_module.HTTPException) as exc:
+        app_module.api_interventions_scale(SimpleNamespace(scale=None, mode="abliteration"))
+    assert exc.value.status_code == 422
+    assert events == [coordinator.status_snapshot().model_session_id]
+
+
+class _SessionSequence:
+    def __init__(self, *session_ids):
+        self._ids = iter(session_ids)
+
+    def status_snapshot(self):
+        return SimpleNamespace(model_session_id=next(self._ids))
+
+
+@pytest.mark.parametrize("case", ["initial-load", "replacement"])
+def test_successful_load_and_replacement_session_changes_notify(monkeypatch, case):
+    monkeypatch.setattr(app_module.manager, "coordinator", _SessionSequence(4, 5))
+    monkeypatch.setattr(app_module.manager, "load", lambda *_args: {"model_id": case})
+    monkeypatch.setattr(app_module, "_valid_devices", lambda: {"cpu"})
+    events = []
+    monkeypatch.setattr(app_module, "_broadcast_capabilities_changed", events.append)
+    result = asyncio.run(app_module.api_load(SimpleNamespace(
+        model_id="m", dtype="bf16", quant=None, device="cpu",
+    )))
+    assert result == {"model_id": case}
+    assert events == [5]
+
+
+def test_successful_unload_session_change_notifies(monkeypatch):
+    monkeypatch.setattr(app_module.manager, "coordinator", _SessionSequence(8, 9))
+    monkeypatch.setattr(app_module.manager, "unload", lambda: {"unloaded": True})
+    events = []
+    monkeypatch.setattr(app_module, "_broadcast_capabilities_changed", events.append)
+    assert asyncio.run(app_module.api_unload()) == {"unloaded": True}
+    assert events == [9]
+
+
+def test_failed_replacement_with_changed_session_notifies_resulting_session(monkeypatch):
+    monkeypatch.setattr(app_module.manager, "coordinator", _SessionSequence(11, 12))
+    monkeypatch.setattr(app_module.manager, "load", lambda *_args: (_ for _ in ()).throw(RuntimeError("replacement failed")))
+    monkeypatch.setattr(app_module, "_valid_devices", lambda: {"cpu"})
+    events = []
+    monkeypatch.setattr(app_module, "_broadcast_capabilities_changed", events.append)
+    with pytest.raises(app_module.HTTPException) as exc:
+        asyncio.run(app_module.api_load(SimpleNamespace(
+            model_id="replacement", dtype="bf16", quant=None, device="cpu",
+        )))
+    assert exc.value.status_code == 500
+    assert events == [12]
+
+
+def test_failed_load_without_session_change_does_not_notify(monkeypatch):
+    monkeypatch.setattr(app_module.manager, "coordinator", _SessionSequence(3, 3))
+    monkeypatch.setattr(app_module.manager, "load", lambda *_args: (_ for _ in ()).throw(RuntimeError("load failed")))
+    monkeypatch.setattr(app_module, "_valid_devices", lambda: {"cpu"})
+    events = []
+    monkeypatch.setattr(app_module, "_broadcast_capabilities_changed", events.append)
+    with pytest.raises(app_module.HTTPException):
+        asyncio.run(app_module.api_load(SimpleNamespace(
+            model_id="m", dtype="bf16", quant=None, device="cpu",
+        )))
+    assert events == []
+
+
+def test_notification_scheduling_failure_cannot_fail_committed_mode(monkeypatch):
+    coordinator = _loaded_coordinator(_supported_profile())
+    iv = Interventions()
+    monkeypatch.setattr(app_module.manager, "coordinator", coordinator)
+    monkeypatch.setattr(app_module, "interventions", iv)
+    app_module._loop_holder["loop"] = object()
+    app_module._ws_locks[object()] = object()
+    monkeypatch.setattr(
+        app_module.asyncio, "run_coroutine_threadsafe",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("schedule failed")),
+    )
+    try:
+        assert app_module.api_interventions_scale(
+            SimpleNamespace(scale=None, mode="readthrough")
+        ) == {"scale": 1.0, "mode": "readthrough"}
+        assert iv.mode == "readthrough"
+    finally:
+        app_module._loop_holder.clear()
+        app_module._ws_locks.clear()
