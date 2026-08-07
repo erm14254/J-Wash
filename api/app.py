@@ -267,21 +267,15 @@ def _remember_task_cancellation():
 async def _cleanup_yield():
     """Yield during cleanup while retaining and reporting caller cancellation."""
     cancelled = False
-    sleeper = asyncio.create_task(asyncio.sleep(0))
-    while not sleeper.done():
+    while True:
         try:
-            await asyncio.shield(sleeper)
+            await asyncio.sleep(0)
+            return cancelled
         except asyncio.CancelledError:
             cancelled = True
             _remember_task_cancellation()
         except BaseException:
-            if not sleeper.done():
-                continue
-    try:
-        sleeper.result()
-    except BaseException:
-        pass
-    return cancelled
+            continue
 
 
 def _execute_dispatched_worker(dispatch, execute, *, default_status=500, value_status=422,

@@ -150,7 +150,7 @@ def test_operation_handoff_factory_failure_releases_unclaimed_dispatch():
     asyncio.run(scenario())
 
 
-def test_operation_handoff_closes_unsubmitted_to_thread_wrapper(monkeypatch):
+def test_operation_handoff_closes_unsubmitted_to_thread_wrapper(monkeypatch, recwarn):
     from api import app
     from core.model_session import WorkerDispatch
 
@@ -176,6 +176,50 @@ def test_operation_handoff_closes_unsubmitted_to_thread_wrapper(monkeypatch):
             await handoff.create_thread_task(lambda: (lambda: None))
         assert wrapper_closed["value"]
         assert c.snapshot().operation is None
+
+    asyncio.run(scenario())
+    import gc
+    gc.collect()
+    assert not [
+        warning for warning in recwarn
+        if issubclass(warning.category, RuntimeWarning)
+        and "was never awaited" in str(warning.message)
+    ]
+
+
+def test_cleanup_yield_does_not_create_a_child_task(monkeypatch):
+    from api import app
+
+    async def scenario():
+        monkeypatch.setattr(
+            app.asyncio,
+            "create_task",
+            lambda _awaitable: (_ for _ in ()).throw(
+                AssertionError("cleanup yield must not create a child task")
+            ),
+        )
+        assert await app._cleanup_yield() is False
+
+    asyncio.run(scenario())
+
+
+def test_cleanup_yield_remembers_cancellation_until_a_successful_yield(monkeypatch):
+    from api import app
+
+    async def scenario():
+        original_sleep = app.asyncio.sleep
+        attempts = 0
+
+        async def cancel_once(delay):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise asyncio.CancelledError()
+            await original_sleep(delay)
+
+        monkeypatch.setattr(app.asyncio, "sleep", cancel_once)
+        assert await app._cleanup_yield() is True
+        assert attempts == 2
 
     asyncio.run(scenario())
 
