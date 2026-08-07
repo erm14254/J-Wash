@@ -6,6 +6,8 @@ import LensDiff from './Diff.jsx'
 import Editor from './Editor.jsx'
 import { applyGenerationTerminal, frameArchivePinIdentity, generationPinIdentity } from './continuationState.js'
 import { fmtTok } from './tok'
+import { readCapabilityState, isCapabilityRefreshEvent } from './capabilityState.js'
+import { createLatestStatusRefresher, runCapabilityMutation } from './statusState.js'
 
 const GB = 2 ** 30
 
@@ -91,6 +93,8 @@ function TreeNode({ node, childs, depth, activeIds, onSelect }) {
 export default function App() {
   const [models, setModels] = useState([])
   const [status, setStatus] = useState(null)
+  const [statusFresh, setStatusFresh] = useState(false)
+  const statusSessionRef = useRef(null)
   const [selected, setSelected] = useState(null)
   const [dtype, setDtype] = useState('bf16')
   const [quant, setQuant] = useState('')
@@ -266,6 +270,38 @@ export default function App() {
       .then((b) => setConvs(b.conversations))
       .catch(() => {})
 
+  const statusHandlersRef = useRef({})
+  statusHandlersRef.current.apply = (next) => {
+    const changed = statusSessionRef.current != null
+      && statusSessionRef.current !== next.model_session_id
+    statusSessionRef.current = next.model_session_id
+    setStatus(next)
+    setStatusFresh(true)
+    setIvRules(next.interventions || [])
+    setIvScale(next.interventions_scale ?? 1)
+    setIvMode(next.interventions_mode)
+    if (changed) {
+      setEditorPrefill(null)
+    }
+  }
+  statusHandlersRef.current.invalidate = () => {
+    setStatusFresh(false)
+    setEditorPrefill(null)
+  }
+  const refresherRef = useRef(null)
+  if (!refresherRef.current) {
+    refresherRef.current = createLatestStatusRefresher({
+      fetchStatus: () => jsonFetch('/api/status'),
+      applyStatus: (next) => statusHandlersRef.current.apply(next),
+      invalidate: () => statusHandlersRef.current.invalidate(),
+    })
+  }
+  const refreshStatus = () => refresherRef.current().catch(() => null)
+  const invalidateCapabilities = () => refresherRef.current.invalidate()
+  const capabilityMutation = (mutate) => runCapabilityMutation({
+    invalidate: invalidateCapabilities, mutate, refresh: refreshStatus,
+  })
+
   useEffect(() => {
     refreshModels()
     refreshConvs()
@@ -285,7 +321,7 @@ export default function App() {
   // status refresh — normally a 2s poll; in "API monitor" mode it is event-driven
   // instead, refetched only when an API/MCP generation ends (pushed over /ws).
   useEffect(() => {
-    const tick = () => jsonFetch('/api/status').then(setStatus).catch(() => {})
+    const tick = refreshStatus
     tick()
     if (!apiMonitor) {
       const id = setInterval(tick, 2000)
@@ -297,7 +333,8 @@ export default function App() {
     const open = () => {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws'
       ws = new WebSocket(`${proto}://${location.host}/ws`)
-      ws.onmessage = (ev) => { try { if (JSON.parse(ev.data)?.type === 'api_generation') tick() } catch { /* ignore */ } }
+      ws.onopen = tick
+      ws.onmessage = (ev) => { try { if (isCapabilityRefreshEvent(JSON.parse(ev.data))) { invalidateCapabilities(); tick() } } catch { /* ignore */ } }
       ws.onclose = () => { if (!closed) timer = setTimeout(open, 2000) }
     }
     open()
@@ -377,13 +414,6 @@ export default function App() {
     if (tab === 'fit') jsonFetch('/api/registry/local').then((b) => setLocalLenses(b.lenses)).catch(() => {})
   }, [tab, status?.fit?.state])
 
-  useEffect(() => {
-    if (!status) return
-    setIvRules(status.interventions || [])
-    if (status.interventions_scale != null) setIvScale(status.interventions_scale)
-    if (status.interventions_mode != null) setIvMode(status.interventions_mode)
-  }, [status])
-
   // auto-open the token editor when a lens just got loaded
   // (status?.lens, NOT lensMeta: that const is declared further down — TDZ)
   const hadLensRef = useRef(false)
@@ -397,6 +427,21 @@ export default function App() {
   const lensMeta = status?.lens
   const busy = status?.busy
   const streaming = draft !== null
+  const capabilityState = readCapabilityState(status, {
+    fresh: statusFresh,
+    llamaCppConfigured: !!settings?.llamacpp_dir,
+    lensAvailable: !!lensMeta,
+    busy: !!busy,
+    rules: ivRules,
+    transitionPending: !statusFresh,
+  })
+
+  async function changeInterventionMode(next) {
+    await capabilityMutation(() => jsonFetch('/api/interventions', {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: next }),
+    }))
+  }
 
   useEffect(() => {
     // the registry is queryable for the model being LOADED too: pick a lens
@@ -705,11 +750,11 @@ export default function App() {
     setNotice({ kind: 'ok', text: `loading ${selected}...` })
     setLoadingId(selected)
     try {
-      const meta = await jsonFetch('/api/load', {
+      const meta = await capabilityMutation(() => jsonFetch('/api/load', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model_id: selected, dtype, quant: quant || null, device }),
-      })
+      }))
       const note = templateNote(meta)
       setNotice({
         kind: note.warn ? 'err' : 'ok',
@@ -727,7 +772,7 @@ export default function App() {
 
   async function onUnload() {
     try {
-      const r = await jsonFetch('/api/unload', { method: 'POST' })
+      const r = await capabilityMutation(() => jsonFetch('/api/unload', { method: 'POST' }))
       let text = 'nothing to unload'
       if (r.unloaded) {
         // VRAM actually returned = allocated before − reserved after (the rest = CUDA context)
@@ -752,6 +797,7 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ k: +lensForm.k || 8, ...payload }),
       })
+      await refreshStatus()
       const warn = (meta.warnings || []).join(' ; ')
       setNotice({ kind: warn ? 'err' : 'ok', text: warn || `lens loaded (layers ${meta.tapped_layers.join(', ')})` })
     } catch (err) {
@@ -813,6 +859,7 @@ export default function App() {
 
   async function onLensUnload() {
     await jsonFetch('/api/lens/unload', { method: 'POST' }).catch(() => {})
+    await refreshStatus()
   }
 
   function openEditorWith(prefill) {
@@ -1720,6 +1767,8 @@ export default function App() {
                 onHideToken={hideToken}
                 onNotice={(text, kind) => setNotice({ kind: kind || 'err', text })}
                 onEditToken={(id, str, layer) => openEditorWith({ id, str, layer })}
+                editAvailable={capabilityState.actions.addRule}
+                editBlockingReason={capabilityState.editing.blockingDecision?.reason || capabilityState.editing.localReason}
                 maxH={lensViewH}
                 editorOpen={editorOpen}
                 streaming={streaming}
@@ -1774,6 +1823,7 @@ export default function App() {
       </div>
 
       <Editor
+        key={capabilityState.sessionId ?? 'no-session'}
         open={editorOpen}
         onClose={() => setEditorOpen(false)}
         rules={ivRules}
@@ -1788,9 +1838,9 @@ export default function App() {
         onPrefillConsumed={() => setEditorPrefill(null)}
         onRules={setIvRules}
         onScale={setIvScale}
-        onMode={setIvMode}
+        onModeChange={changeInterventionMode}
         onNotice={(text, kind) => setNotice({ kind: kind || 'err', text })}
-        rebaseSupported={status?.loaded?.rebase_supported}
+        capabilityState={capabilityState}
         autoLayerRadius={settings?.auto_layer_radius}
         llamaCppSet={!!settings?.llamacpp_dir}
         ggufState={status?.gguf}

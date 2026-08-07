@@ -117,7 +117,7 @@ function parseLayerSpec(spec) {
   return set.size ? set : null
 }
 
-export default function LensView({ frames, tick, genId, generationRunId, lensMeta, onNotice, onEditToken, hidden, onHideToken, maxH, editorOpen, streaming }) {
+export default function LensView({ frames, tick, genId, generationRunId, lensMeta, onNotice, onEditToken, hidden, onHideToken, maxH, editorOpen, streaming, editAvailable = true, editBlockingReason = null }) {
   const [maskOn, setMaskOn] = useState(true)
   const [view, setView] = useState('agg')
   const [filterInput, setFilterInput] = useState('')
@@ -579,11 +579,13 @@ export default function LensView({ frames, tick, genId, generationRunId, lensMet
             title={transLabel(tid) ? `≈ ${transLabel(tid)}` : undefined}
             onMouseEnter={() => fetchTrans([{ tid, str: String(pinned[tid]) }])}>
             <span onClick={() => togglePin(tid, pinned[tid])}>{fmtTok(pinned[tid])} ✕</span>
-            <span
+            <button type="button"
               className="lv-ablate"
-              title="open the editor with this token prefilled (most-relevant layer pre-selected)"
+              title={editAvailable ? 'open the editor with this token prefilled (most-relevant layer pre-selected)' : editBlockingReason}
+              disabled={!editAvailable}
+              aria-label={editAvailable ? 'prefill token editor' : `token editing unavailable: ${editBlockingReason}`}
               onClick={() => onEditToken?.(+tid, String(pinned[tid]), peakLayerOf(+tid))}
-            > ☢</span>
+            > ☢</button>
           </span>
         ))}
         <span className="fcount" style={{ marginLeft: 'auto' }}>

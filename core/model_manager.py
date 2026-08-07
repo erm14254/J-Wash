@@ -14,6 +14,7 @@ from huggingface_hub import scan_cache_dir, try_to_load_from_cache
 
 import config
 import jlens
+from core import capabilities
 from core.lens_manager import ActivationCatcher
 from core.model_session import GenerationContext, LoadedModelBundle, ModelSessionCoordinator, OperationConflict, OperationType
 
@@ -735,6 +736,13 @@ class ModelManager:
         lens_attempt_resolved = False
         try:
             if ablator is not None:
+                if context is not None and (ablator_snapshot or {}).get("active_rules"):
+                    capabilities.require(
+                        context.capability_profile,
+                        "modes",
+                        (ablator_snapshot or {}).get("mode"),
+                        loaded=True,
+                    )
                 attachment = ablator.attach(jl, snapshot=ablator_snapshot)
             is_gpt_oss = "gpt-oss" in (meta or {}).get("model_id", "").lower()
             template_kwargs = {}

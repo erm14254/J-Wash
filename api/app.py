@@ -971,6 +971,20 @@ def _broadcast_fit(state):
 
 fit_manager.on_progress = _broadcast_fit
 
+
+def _broadcast_capabilities_changed(model_session_id):
+    """Best-effort invalidation only; status remains the authoritative payload."""
+    loop = _loop_holder.get("loop")
+    if loop is None:
+        return
+    payload = json.dumps({"type": "capabilities_changed", "model_session_id": model_session_id})
+    for ws in list(_ws_locks):
+        try:
+            future = asyncio.run_coroutine_threadsafe(_ws_send(ws, payload), loop)
+            future.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+        except Exception:
+            logging.getLogger(__name__).debug("capability notification failed", exc_info=True)
+
 # concurrent HF downloads: one state per repo_id
 _downloads = {}
 _downloads_lock = threading.Lock()
@@ -1148,14 +1162,20 @@ async def api_load(req: LoadRequest):
         raise HTTPException(422, f"invalid quant: {req.quant}")
     if req.device not in _valid_devices():
         raise HTTPException(422, f"invalid device: {req.device}")
+    before_session = manager.coordinator.status_snapshot().model_session_id
     try:
-        return await asyncio.to_thread(
+        result = await asyncio.to_thread(
             manager.load, req.model_id, req.dtype, req.quant, req.device
         )
     except OperationConflict as exc:
         raise _conflict(exc)
     except Exception as exc:
         raise HTTPException(500, str(exc))
+    finally:
+        after_session = manager.coordinator.status_snapshot().model_session_id
+        if after_session != before_session:
+            _broadcast_capabilities_changed(after_session)
+    return result
 
 
 def _make_delete_model_worker(dispatch, model_id, delete_fn):
@@ -1285,10 +1305,15 @@ def api_models_unregister(req: RegisterModelRequest):
 
 @app.post("/api/unload")
 async def api_unload():
+    before_session = manager.coordinator.status_snapshot().model_session_id
     try:
-        return await asyncio.to_thread(manager.unload)
+        result = await asyncio.to_thread(manager.unload)
     except OperationConflict as exc:
         raise _conflict(exc)
+    after_session = manager.coordinator.status_snapshot().model_session_id
+    if after_session != before_session:
+        _broadcast_capabilities_changed(after_session)
+    return result
 
 
 def _make_lens_load_worker(dispatch, token):
@@ -1512,6 +1537,8 @@ def _interventions_patch_resource(token, snap, rule_id, req, needs_dirs):
     bundle = rules = None
     try:
         bundle = _bundle_from_snapshot_or_legacy(snap) if needs_dirs else None
+        if needs_dirs:
+            capabilities.require(bundle.capability_profile, "modes", "standard", loaded=True)
         def mutate():
             return interventions.update(
                 rule_id,
@@ -1539,6 +1566,7 @@ def _interventions_patch_resource(token, snap, rule_id, req, needs_dirs):
 @app.patch("/api/interventions")
 def api_interventions_scale(req: InterventionsScale):
     token = snap = None
+    before_mode = (manager.coordinator.status_snapshot().interventions or {}).get("mode", "standard")
     try:
         token, snap = manager.coordinator.acquire(OperationType.INTERVENTION_UPDATE)
         outcome = _interventions_scale_resource(token, snap, req)
@@ -1548,7 +1576,10 @@ def api_interventions_scale(req: InterventionsScale):
         snap = None
         if token is not None:
             manager.coordinator.release(token)
-    return _raise_route_outcome(outcome)
+    result = _raise_route_outcome(outcome)
+    if req.mode is not None and result.get("mode") != before_mode:
+        _broadcast_capabilities_changed(manager.coordinator.status_snapshot().model_session_id)
+    return result
 
 
 def _interventions_scale_resource(token, snap, req):
@@ -1764,6 +1795,7 @@ def _presets_apply_resource(token, snap, preset):
         bundle = _bundle_from_snapshot_or_legacy(snap)
         if lens_manager.lens is None:
             return _route_http(422, "model and lens required")
+        capabilities.require(bundle.capability_profile, "modes", "standard", loaded=True)
         capabilities.ensure_unquantized(bundle.jl, dict(bundle.meta))
         warnings = []
         if preset.get("model_id") and preset["model_id"] != bundle.meta["model_id"]:
