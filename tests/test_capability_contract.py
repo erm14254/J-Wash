@@ -409,7 +409,7 @@ def test_standard_editing_does_not_require_readthrough_support(monkeypatch):
     iv = Interventions()
     iv._rules = [_existing_rule()]
     monkeypatch.setattr(app, "interventions", iv)
-    monkeypatch.setattr(app.lens_manager, "lens", SimpleNamespace(jacobians={0: {1: torch.ones(8)}}))
+    monkeypatch.setattr(app.lens_manager, "lens", SimpleNamespace(jacobians={0: torch.eye(8)}))
     _install_loaded_bundle(app, monkeypatch, jl=jl, profile=profile)
     token, snap = app.manager.coordinator.acquire(OperationType.INTERVENTION_UPDATE)
     try:

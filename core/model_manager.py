@@ -734,6 +734,7 @@ class ModelManager:
         attachment = None
         ok = False
         lens_attempt_resolved = False
+        gen_id = None
         try:
             if ablator is not None:
                 if context is not None and (ablator_snapshot or {}).get("active_rules"):
@@ -782,7 +783,6 @@ class ModelManager:
                 input_ids = torch.cat([input_ids, final_prefix], dim=1)
 
             read_from = 0
-            gen_id = None
             generation_run_id = uuid.uuid4().hex
             if lens is not None and lens.lens is not None:
                 reader = ActivationCatcher(jl.layers, lens.layers)
