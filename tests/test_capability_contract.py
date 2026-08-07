@@ -399,6 +399,33 @@ def test_cleanup_disable_delete_and_clear_survive_unavailable_profile(monkeypatc
     assert cleared == {"rules": []}
 
 
+@pytest.mark.parametrize("patch,field,expected", [
+    ({"factor": 0.75}, "factor", 0.0),
+    ({"enabled": True}, "enabled", False),
+    ({"enabled": False, "factor": 0.75}, "factor", 0.0),
+])
+def test_effectful_factor_enable_and_combined_patches_require_capability(
+        monkeypatch, patch, field, expected):
+    import api.app as app
+    rule = _existing_rule()
+    if "enabled" in patch and patch["enabled"] is True:
+        rule["enabled"] = False
+    iv = Interventions()
+    iv._rules = [rule]
+    before = iv.state_record()
+    monkeypatch.setattr(app, "interventions", iv)
+    _install_loaded_bundle(app, monkeypatch, profile={"modes": {}})
+    request = dict(factor=None, layers=None, enabled=None, token_id=None,
+                   replacement_id=None, mode=None)
+    request.update(patch)
+    with pytest.raises(app.HTTPException) as exc:
+        app.api_interventions_patch(1, SimpleNamespace(**request))
+    assert exc.value.status_code == 422
+    assert exc.value.detail == capabilities.PUBLIC_REASONS["capability_data_unavailable"]
+    assert iv.state_record() == before
+    assert iv.summary()[0][field] == expected
+
+
 def test_standard_editing_does_not_require_readthrough_support(monkeypatch):
     import api.app as app
     profile = _profile()
@@ -469,3 +496,56 @@ def test_generation_unavailable_profile_only_blocks_actual_active_rules(monkeypa
             app.manager.generate([], {}, threading.Event(), lambda _event: None,
                                  lens=context, ablator=ablator)
         assert ablator.attach_calls == 1
+
+
+@pytest.mark.parametrize("mode,profile,allowed", [
+    ("readthrough", {
+        "declared_quantization": None, "has_packed_read_parameters": False,
+        "modes": {
+            "standard": capabilities.decision(True, "supported"),
+            "readthrough": capabilities.decision(False, "architecture_unsupported"),
+            "exact": capabilities.decision(False, "architecture_unsupported"),
+            "abliteration": capabilities.decision(False, "global_projection_unvalidated"),
+        },
+    }, False),
+    ("standard", {
+        "declared_quantization": None, "has_packed_read_parameters": False,
+        "modes": {
+            "standard": capabilities.decision(True, "supported"),
+            "readthrough": capabilities.decision(False, "architecture_unsupported"),
+            "exact": capabilities.decision(False, "architecture_unsupported"),
+            "abliteration": capabilities.decision(False, "global_projection_unvalidated"),
+        },
+    }, True),
+])
+def test_generation_guard_uses_captured_selected_mode(monkeypatch, mode, profile, allowed):
+    import api.app as app
+    class Seam(RuntimeError): pass
+    class Tokenizer:
+        def apply_chat_template(self, *_args, **_kwargs): raise Seam("normal seam")
+    class Ablator:
+        def __init__(self): self.calls = 0
+        def attach(self, *_args, **_kwargs):
+            self.calls += 1
+            return SimpleNamespace(close=lambda: None)
+    snapshot = {"mode": mode, "active_rules": [_existing_rule()], "rules": [_existing_rule()]}
+    bundle = LoadedModelBundle.from_parts(
+        object(), Tokenizer(), SimpleNamespace(), {"model_id": "m", "quant": None}, profile,
+    )
+    context = GenerationContext(
+        token=object(), model_session_id=9, bundle=bundle, hf_model=object(),
+        tokenizer=bundle.tokenizer, jl=bundle.jl, meta=bundle.meta,
+        capability_profile=bundle.capability_profile, lens=None,
+        intervention_snapshot=snapshot, stop_event=threading.Event(),
+    )
+    ablator = Ablator()
+    if allowed:
+        with pytest.raises(Seam, match="normal seam"):
+            app.manager.generate([], {}, threading.Event(), lambda _event: None,
+                                 lens=context, ablator=ablator)
+        assert ablator.calls == 1
+    else:
+        with pytest.raises(ValueError, match="not been validated"):
+            app.manager.generate([], {}, threading.Event(), lambda _event: None,
+                                 lens=context, ablator=ablator)
+        assert ablator.calls == 0

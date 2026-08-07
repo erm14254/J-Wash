@@ -1518,12 +1518,15 @@ def api_interventions_patch(rule_id: int, req: InterventionPatch):
     needs_dirs = any(
         x is not None for x in (req.layers, req.token_id, req.replacement_id, req.mode)
     )
+    effectful_patch = needs_dirs or req.factor is not None or req.enabled is True
     token = snap = None
     try:
         token, snap = manager.coordinator.acquire(
-            OperationType.INTERVENTION_UPDATE, requires_loaded=True if needs_dirs else None
+            OperationType.INTERVENTION_UPDATE, requires_loaded=True if effectful_patch else None
         )
-        outcome = _interventions_patch_resource(token, snap, rule_id, req, needs_dirs)
+        outcome = _interventions_patch_resource(
+            token, snap, rule_id, req, needs_dirs, effectful_patch
+        )
     except OperationConflict as exc:
         raise _conflict(exc)
     except ModelStateError as exc:
@@ -1535,9 +1538,11 @@ def api_interventions_patch(rule_id: int, req: InterventionPatch):
     return _raise_route_outcome(outcome)
 
 
-def _interventions_patch_resource(token, snap, rule_id, req, needs_dirs):
+def _interventions_patch_resource(token, snap, rule_id, req, needs_dirs, effectful_patch=None):
     bundle = rules = None
-    if needs_dirs:
+    if effectful_patch is None:
+        effectful_patch = needs_dirs
+    if effectful_patch:
         bundle = _bundle_from_snapshot_or_legacy(snap)
         try:
             capabilities.require(bundle.capability_profile, "modes", "standard", loaded=True)
@@ -1571,9 +1576,12 @@ def _interventions_patch_resource(token, snap, rule_id, req, needs_dirs):
 @app.patch("/api/interventions")
 def api_interventions_scale(req: InterventionsScale):
     token = snap = None
-    before_mode = (manager.coordinator.status_snapshot().interventions or {}).get("mode", "standard")
+    prior_mode = "standard"
+    resulting_session_id = None
     try:
         token, snap = manager.coordinator.acquire(OperationType.INTERVENTION_UPDATE)
+        prior_mode = (_coordinated_interventions(snap) or {}).get("mode", "standard")
+        resulting_session_id = snap.model_session_id
         outcome = _interventions_scale_resource(token, snap, req)
     except OperationConflict as exc:
         raise _conflict(exc)
@@ -1582,8 +1590,8 @@ def api_interventions_scale(req: InterventionsScale):
         if token is not None:
             manager.coordinator.release(token)
     result = _raise_route_outcome(outcome)
-    if req.mode is not None and result.get("mode") != before_mode:
-        _broadcast_capabilities_changed(manager.coordinator.status_snapshot().model_session_id)
+    if req.mode is not None and result.get("mode") != prior_mode:
+        _broadcast_capabilities_changed(resulting_session_id)
     return result
 
 

@@ -1,0 +1,41 @@
+export function createEditorMutationState({ setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+  let current = true
+  const timers = new Set()
+  const controllers = new Set()
+
+  function schedule(callback, delay) {
+    const timer = setTimer(() => {
+      timers.delete(timer)
+      if (current) callback()
+    }, delay)
+    timers.add(timer)
+    return timer
+  }
+
+  function cancelTimer(timer) {
+    clearTimer(timer)
+    timers.delete(timer)
+  }
+
+  async function request(factory, publish) {
+    const controller = new AbortController()
+    controllers.add(controller)
+    try {
+      const value = await factory(controller.signal)
+      if (current) publish?.(value)
+      return value
+    } finally {
+      controllers.delete(controller)
+    }
+  }
+
+  function invalidate() {
+    current = false
+    for (const timer of timers) clearTimer(timer)
+    timers.clear()
+    for (const controller of controllers) controller.abort()
+    controllers.clear()
+  }
+
+  return { schedule, cancelTimer, request, invalidate, isCurrent: () => current }
+}

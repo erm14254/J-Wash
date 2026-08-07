@@ -78,3 +78,11 @@ export function readCapabilityState(status, options = {}) {
 export function isCapabilityRefreshEvent(message) {
   return message?.type === 'api_generation' || message?.type === 'capabilities_changed'
 }
+
+export function selectedExportState(capabilityState, exportId) {
+  return { id: exportId, ...capabilityState.formats[exportId] }
+}
+
+export function shouldOpenAdvanced(selectedMode) {
+  return selectedMode === 'exact' || selectedMode === 'abliteration'
+}

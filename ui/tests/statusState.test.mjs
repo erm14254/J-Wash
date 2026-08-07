@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { createLatestStatusRefresher, runCapabilityMutation } from '../src/statusState.js'
+import { createLatestStatusRefresher, runCapabilityMutation, createCapabilityMutationLatch, capabilitySocketOpened, capabilitySocketClosed } from '../src/statusState.js'
 
 const deferred = () => { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b }); return { promise, resolve, reject } }
 
@@ -25,11 +25,53 @@ test('old failure cannot invalidate newer success; latest failure does', async (
 test('mutation always orders invalidate, mutation, refresh', async () => {
   const calls = []
   await runCapabilityMutation({ invalidate: () => calls.push('invalidate'), mutate: async () => calls.push('mutate'), refresh: async () => calls.push('refresh') })
-  assert.deepEqual(calls, ['invalidate', 'mutate', 'refresh'])
+  assert.deepEqual(calls, ['invalidate', 'mutate', 'invalidate', 'refresh'])
 })
 
 test('rejected mutation still refreshes', async () => {
   const calls = []
   await assert.rejects(runCapabilityMutation({ invalidate: () => calls.push('invalidate'), mutate: async () => { calls.push('mutate'); throw new Error('no') }, refresh: async () => calls.push('refresh') }))
-  assert.deepEqual(calls, ['invalidate', 'mutate', 'refresh'])
+  assert.deepEqual(calls, ['invalidate', 'mutate', 'invalidate', 'refresh'])
+})
+
+test('successful mutation with failed reconciliation surfaces refresh failure', async () => {
+  await assert.rejects(runCapabilityMutation({
+    invalidate: () => {}, mutate: async () => 'ok',
+    refresh: async () => { throw new Error('refresh failed') },
+  }), /refresh failed/)
+})
+
+test('mutation failure remains primary when reconciliation also fails', async () => {
+  await assert.rejects(runCapabilityMutation({
+    invalidate: () => {}, mutate: async () => { throw new Error('mutation failed') },
+    refresh: async () => { throw new Error('refresh failed') },
+  }), /mutation failed/)
+})
+
+for (const rejected of [false, true]) test(`mutation barrier survives an incidental old poll (${rejected ? 'rejected' : 'successful'})`, async () => {
+  const mutation = deferred(), reconciliation = deferred(), events = []
+  let pending = false
+  const run = createCapabilityMutationLatch({
+    invalidate: () => events.push('invalidate'),
+    refresh: async () => { events.push('refresh'); return reconciliation.promise },
+    setPending: (value) => { pending = value; events.push(`pending:${value}`) },
+  })
+  const operation = run(() => mutation.promise)
+  assert.equal(pending, true)
+  events.push('old-poll-applied')
+  assert.equal(pending, true, 'accepted pre-mutation poll must not release barrier')
+  rejected ? mutation.reject(new Error('rejected')) : mutation.resolve('ok')
+  await Promise.resolve(); await Promise.resolve()
+  assert.deepEqual(events.slice(0, 5), ['pending:true', 'invalidate', 'old-poll-applied', 'invalidate', 'refresh'])
+  assert.equal(pending, true)
+  reconciliation.resolve('new-status')
+  if (rejected) await assert.rejects(operation, /rejected/); else assert.equal(await operation, 'ok')
+  assert.equal(pending, false)
+})
+
+test('socket open and close invalidate before refresh or reconnect', async () => {
+  const events = []
+  await capabilitySocketOpened({ invalidate: () => events.push('invalidate-open'), refresh: async () => events.push('refresh') })
+  capabilitySocketClosed({ invalidate: () => events.push('invalidate-close'), reconnect: () => events.push('reconnect') })
+  assert.deepEqual(events, ['invalidate-open', 'refresh', 'invalidate-close', 'reconnect'])
 })

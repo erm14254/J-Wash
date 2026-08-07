@@ -17,9 +17,42 @@ export function createLatestStatusRefresher({ fetchStatus, applyStatus, invalida
 
 export async function runCapabilityMutation({ invalidate, mutate, refresh }) {
   invalidate()
+  let value
+  let mutationError
   try {
-    return await mutate()
-  } finally {
-    await refresh()
+    value = await mutate()
+  } catch (error) {
+    mutationError = error
   }
+  invalidate()
+  try {
+    await refresh()
+  } catch (refreshError) {
+    if (!mutationError) throw refreshError
+  }
+  if (mutationError) throw mutationError
+  return value
+}
+
+export function createCapabilityMutationLatch({ invalidate, refresh, setPending }) {
+  let epoch = 0
+  return async function run(mutate) {
+    const ownEpoch = ++epoch
+    setPending(true)
+    try {
+      return await runCapabilityMutation({ invalidate, mutate, refresh })
+    } finally {
+      if (ownEpoch === epoch) setPending(false)
+    }
+  }
+}
+
+export function capabilitySocketOpened({ invalidate, refresh }) {
+  invalidate()
+  return refresh()
+}
+
+export function capabilitySocketClosed({ invalidate, reconnect }) {
+  invalidate()
+  return reconnect()
 }

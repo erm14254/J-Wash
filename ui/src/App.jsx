@@ -7,7 +7,7 @@ import Editor from './Editor.jsx'
 import { applyGenerationTerminal, frameArchivePinIdentity, generationPinIdentity } from './continuationState.js'
 import { fmtTok } from './tok'
 import { readCapabilityState, isCapabilityRefreshEvent } from './capabilityState.js'
-import { createLatestStatusRefresher, runCapabilityMutation } from './statusState.js'
+import { createLatestStatusRefresher, createCapabilityMutationLatch, capabilitySocketOpened, capabilitySocketClosed } from './statusState.js'
 
 const GB = 2 ** 30
 
@@ -94,6 +94,7 @@ export default function App() {
   const [models, setModels] = useState([])
   const [status, setStatus] = useState(null)
   const [statusFresh, setStatusFresh] = useState(false)
+  const [capabilityMutationPending, setCapabilityMutationPending] = useState(false)
   const statusSessionRef = useRef(null)
   const [selected, setSelected] = useState(null)
   const [dtype, setDtype] = useState('bf16')
@@ -193,6 +194,7 @@ export default function App() {
   const [ivMode, setIvMode] = useState('standard')
   const [editorOpen, setEditorOpen] = useState(false)
   const [editorPrefill, setEditorPrefill] = useState(null)
+  const [exportFmt, setExportFmt] = useState('full')
   const [capLayers, setCapLayers] = useState('')
   const [capK, setCapK] = useState('')
 
@@ -296,11 +298,24 @@ export default function App() {
       invalidate: () => statusHandlersRef.current.invalidate(),
     })
   }
-  const refreshStatus = () => refresherRef.current().catch(() => null)
+  const refreshStatusRaw = () => refresherRef.current()
+  const refreshStatus = () => refreshStatusRaw().catch(() => null)
   const invalidateCapabilities = () => refresherRef.current.invalidate()
-  const capabilityMutation = (mutate) => runCapabilityMutation({
-    invalidate: invalidateCapabilities, mutate, refresh: refreshStatus,
-  })
+  const mutationHandlersRef = useRef({})
+  mutationHandlersRef.current = {
+    invalidate: invalidateCapabilities,
+    refresh: refreshStatusRaw,
+    setPending: setCapabilityMutationPending,
+  }
+  const capabilityMutationRef = useRef(null)
+  if (!capabilityMutationRef.current) {
+    capabilityMutationRef.current = createCapabilityMutationLatch({
+      invalidate: () => mutationHandlersRef.current.invalidate(),
+      refresh: () => mutationHandlersRef.current.refresh(),
+      setPending: (pending) => mutationHandlersRef.current.setPending(pending),
+    })
+  }
+  const capabilityMutation = (mutate) => capabilityMutationRef.current(mutate)
 
   useEffect(() => {
     refreshModels()
@@ -333,9 +348,14 @@ export default function App() {
     const open = () => {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws'
       ws = new WebSocket(`${proto}://${location.host}/ws`)
-      ws.onopen = tick
+      ws.onopen = () => capabilitySocketOpened({ invalidate: invalidateCapabilities, refresh: tick })
       ws.onmessage = (ev) => { try { if (isCapabilityRefreshEvent(JSON.parse(ev.data))) { invalidateCapabilities(); tick() } } catch { /* ignore */ } }
-      ws.onclose = () => { if (!closed) timer = setTimeout(open, 2000) }
+      ws.onclose = () => {
+        if (!closed) capabilitySocketClosed({
+          invalidate: invalidateCapabilities,
+          reconnect: () => { timer = setTimeout(open, 2000) },
+        })
+      }
     }
     open()
     return () => { closed = true; clearTimeout(timer); if (ws) ws.close() }
@@ -433,7 +453,7 @@ export default function App() {
     lensAvailable: !!lensMeta,
     busy: !!busy,
     rules: ivRules,
-    transitionPending: !statusFresh,
+    transitionPending: capabilityMutationPending,
   })
 
   async function changeInterventionMode(next) {
@@ -1841,6 +1861,8 @@ export default function App() {
         onModeChange={changeInterventionMode}
         onNotice={(text, kind) => setNotice({ kind: kind || 'err', text })}
         capabilityState={capabilityState}
+        exportFmt={exportFmt}
+        onExportFmtChange={setExportFmt}
         autoLayerRadius={settings?.auto_layer_radius}
         llamaCppSet={!!settings?.llamacpp_dir}
         ggufState={status?.gguf}

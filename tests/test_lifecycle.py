@@ -168,6 +168,11 @@ def test_mode_notification_is_exact_and_scale_or_rejection_emit_none(monkeypatch
     assert result == {"scale": 1.0, "mode": "readthrough"}
     assert events == [coordinator.status_snapshot().model_session_id]
 
+    assert app_module.api_interventions_scale(
+        SimpleNamespace(scale=None, mode="readthrough")
+    ) == {"scale": 1.0, "mode": "readthrough"}
+    assert events == [coordinator.status_snapshot().model_session_id]
+
     assert app_module.api_interventions_scale(SimpleNamespace(scale=2.0, mode=None)) == {
         "scale": 2.0, "mode": "readthrough",
     }
@@ -256,3 +261,38 @@ def test_notification_scheduling_failure_cannot_fail_committed_mode(monkeypatch)
     finally:
         app_module._loop_holder.clear()
         app_module._ws_locks.clear()
+
+
+def test_mode_event_classification_uses_acquired_snapshot(monkeypatch):
+    """A stale pre-acquire Standard observation would suppress this transition."""
+    acquired = SimpleNamespace(
+        model_session_id=22,
+        interventions={"mode": "readthrough", "scale": 1.0, "summary": []},
+    )
+
+    class InterleavedCoordinator:
+        def acquire(self, *_args, **_kwargs):
+            return object(), acquired
+
+        def update_interventions(self, *_args, **_kwargs):
+            return None
+
+        def release(self, _token):
+            return None
+
+        def status_snapshot(self):
+            # Represents A's stale observation before B changed Standard -> Readthrough.
+            return SimpleNamespace(
+                model_session_id=22, lens=None,
+                interventions={"mode": "standard", "scale": 1.0, "summary": []},
+            )
+
+    iv = Interventions()
+    iv._mode = "readthrough"
+    monkeypatch.setattr(app_module.manager, "coordinator", InterleavedCoordinator())
+    monkeypatch.setattr(app_module, "interventions", iv)
+    events = []
+    monkeypatch.setattr(app_module, "_broadcast_capabilities_changed", events.append)
+    result = app_module.api_interventions_scale(SimpleNamespace(scale=None, mode="standard"))
+    assert result == {"scale": 1.0, "mode": "standard"}
+    assert events == [22]
