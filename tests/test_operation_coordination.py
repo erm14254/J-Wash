@@ -1,6 +1,7 @@
 import json
 import asyncio
 import threading
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -1867,6 +1868,217 @@ def test_neighbor_task_transfer_failure_composes_with_helper_teardown():
     bundle = model = tokenizer = jl = handoff = None
     gc.collect()
     assert all(ref() is None for ref in refs)
+
+
+class _LifetimeResource:
+    pass
+
+
+class _LifetimeCoordinator:
+    def __init__(self, holder):
+        self.holder = holder
+        self.owner = None
+        self.releases = 0
+
+    def acquire(self, operation_type, *, include_bundle=True, **_kwargs):
+        if self.owner is not None:
+            raise RuntimeError("owner already installed")
+        token = SimpleNamespace(id=object(), type=operation_type)
+        self.owner = token
+        snapshot = SimpleNamespace(
+            model_session_id=1,
+            bundle=self.holder.bundle if include_bundle else None,
+            interventions={"rules": (), "active_rules": (self.holder.direction,), "scale": 1.0, "mode": "readthrough"},
+        )
+        return token, snapshot
+
+    def release(self, token):
+        if self.owner is not token:
+            return False
+        self.owner = None
+        self.releases += 1
+        return True
+
+    def is_current(self, token):
+        return self.owner is token
+
+    def request_cancel(self, token):
+        return self.owner is token
+
+    def is_cancelled(self, _token):
+        return False
+
+
+def _lifetime_graph():
+    holder = _LifetimeResource()
+    holder.model = _LifetimeResource()
+    holder.tokenizer = _LifetimeResource()
+    holder.jl = _LifetimeResource()
+    holder.lens = _LifetimeResource()
+    holder.direction = _LifetimeResource()
+    holder.bundle = _LifetimeResource()
+    holder.bundle.hf_model = holder.model
+    holder.bundle.tokenizer = holder.tokenizer
+    holder.bundle.jl = holder.jl
+    holder.bundle.meta = {"model_id": "m", "revision": "r"}
+    holder.bundle.capability_profile = {}
+    refs = {
+        name: weakref.ref(getattr(holder, name))
+        for name in ("model", "tokenizer", "jl", "lens", "direction", "bundle")
+    }
+    return holder, refs
+
+
+@pytest.mark.parametrize("case", ["http", "neighbors", "export", "gguf", "pin", "ws"])
+def test_heavy_handoff_release_is_final_model_resource_boundary(case, monkeypatch):
+    import gc
+    import weakref
+    from fastapi import HTTPException
+    from api import app
+    from core.model_session import OperationType
+
+    holder, refs = _lifetime_graph()
+    coordinator = _LifetimeCoordinator(holder)
+    payload_refs = []
+    context_refs = []
+    scope_released = asyncio.Event()
+    allow_reporting = asyncio.Event()
+
+    def fail_dispatch(_handoff, payload=None):
+        if payload is not None:
+            try:
+                payload_refs.append(weakref.ref(payload))
+            except TypeError:
+                pass
+        raise RuntimeError("injected dispatch failure")
+
+    monkeypatch.setattr(app.OperationHandoff, "create_dispatch", fail_dispatch)
+
+    def captured_context(token, snap, stop_event):
+        context = _LifetimeResource()
+        context.token = token
+        context.model_session_id = snap.model_session_id
+        context.bundle = snap.bundle
+        context.hf_model = snap.bundle.hf_model
+        context.tokenizer = snap.bundle.tokenizer
+        context.jl = snap.bundle.jl
+        context.meta = snap.bundle.meta
+        context.capability_profile = snap.bundle.capability_profile
+        context.lens = holder.lens
+        context.intervention_snapshot = {"rules": (holder.direction,)}
+        context.stop_event = stop_event
+        context_refs.append(weakref.ref(context))
+        return context
+
+    monkeypatch.setattr(app, "_captured_generation_context", captured_context)
+
+    def export_preflight(_snap, *_args):
+        return app._route_value(app.PreparedWorkerPayload({
+            "bundle": holder.bundle, "meta": holder.bundle.meta,
+            "rules": (holder.direction,), "source_dir": "source", "scale": 1.0,
+            "kwargs": {}, "export_fn": lambda *_args, **_kwargs: None,
+        }))
+
+    monkeypatch.setattr(app, "_export_preflight_resource", export_preflight)
+    monkeypatch.setattr(app, "_gguf_preflight_resource", export_preflight)
+
+    async def invoke(handoff, stop_event):
+        if case == "http":
+            return await app._prepare_http_generation_handoff(handoff, [], {}, stop_event)
+        if case == "neighbors":
+            return await app._prepare_token_neighbors_handoff(handoff, [1], 1)
+        if case == "export":
+            req = SimpleNamespace(format="layers", name="x")
+            return await app._prepare_export_handoff(handoff, req)
+        if case == "gguf":
+            return await app._prepare_gguf_bake_handoff(handoff, "x/hf")
+        if case == "pin":
+            return await app._prepare_lens_pin_handoff(handoff, 1, "a" * 32, [1])
+        return await app._prepare_ws_worker_handoff(
+            handoff, {"messages": [], "lens": True}, asyncio.get_running_loop(),
+            asyncio.Queue(), threading.Event(),
+        )
+
+    async def predecessor():
+        stop_event = threading.Event()
+        async with app.OperationHandoff.acquire_scope(
+            coordinator, OperationType.GENERATE, stop_event=stop_event,
+        ) as handoff:
+            setup = await invoke(handoff, stop_event)
+            assert setup.status == 500
+            assert setup.task is setup.dispatch is setup.gate is setup.state is None
+        scope_released.set()
+        await allow_reporting.wait()
+        raise HTTPException(setup.status, setup.message) from None
+
+    async def scenario():
+        task = asyncio.create_task(predecessor())
+        await scope_released.wait()
+        assert coordinator.owner is None
+        successor, successor_snapshot = coordinator.acquire(
+            OperationType.UNLOAD, include_bundle=False,
+        )
+        assert successor_snapshot.bundle is None
+        successor_snapshot = None
+        holder.bundle = holder.model = holder.tokenizer = holder.jl = None
+        holder.lens = holder.direction = None
+        gc.collect()
+        assert all(ref() is None for ref in refs.values()), case
+        assert all(ref() is None for ref in payload_refs), case
+        assert all(ref() is None for ref in context_refs), case
+        assert coordinator.owner is successor
+        allow_reporting.set()
+        with pytest.raises(HTTPException) as caught:
+            await task
+        assert caught.value.__context__ is None
+        assert caught.value.__cause__ is None
+        assert coordinator.release(successor)
+        assert coordinator.releases == 2
+
+    asyncio.run(scenario())
+
+
+def test_task_transfer_failure_releases_before_successor_and_drops_payload(monkeypatch):
+    import gc
+    import weakref
+    from api import app
+    from core.model_session import OperationType
+
+    holder, refs = _lifetime_graph()
+    coordinator = _LifetimeCoordinator(holder)
+    dispatch_refs = []
+    original_create_dispatch = app.OperationHandoff.create_dispatch
+
+    def capture_dispatch(handoff, payload=None):
+        dispatch = original_create_dispatch(handoff, payload)
+        dispatch_refs.append(weakref.ref(dispatch))
+        return dispatch
+
+    monkeypatch.setattr(app.OperationHandoff, "create_dispatch", capture_dispatch)
+    monkeypatch.setattr(
+        app.asyncio, "to_thread",
+        lambda _worker: (_ for _ in ()).throw(RuntimeError("task transfer failed")),
+    )
+
+    async def scenario():
+        async with app.OperationHandoff.acquire_scope(
+            coordinator, OperationType.MODEL_READ, stop_event=threading.Event(),
+        ) as handoff:
+            setup = await app._prepare_token_neighbors_handoff(handoff, [1], 1)
+            assert setup.status == 500
+        assert coordinator.owner is None
+        successor, successor_snapshot = coordinator.acquire(OperationType.UNLOAD, include_bundle=False)
+        successor_snapshot = None
+        holder.bundle = holder.model = holder.tokenizer = holder.jl = None
+        holder.lens = holder.direction = None
+        gc.collect()
+        assert all(ref() is None for ref in refs.values())
+        assert all(ref() is None for ref in dispatch_refs)
+        assert not app._deferred_worker_tasks
+        assert coordinator.release(successor)
+        assert coordinator.releases == 2
+
+    asyncio.run(scenario())
 
 
 def test_marker_tail_recognizes_alternate_decoded_prefixes_without_full_history():
