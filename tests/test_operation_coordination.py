@@ -1774,16 +1774,24 @@ def test_dispatched_routes_use_one_preacquisition_handoff():
     from api import app
 
     routes = (
-        app.api_delete_model, app.api_lens_load, app.api_edit_export,
-        app.api_edit_export_gguf, app.api_generate_sync, app.api_token_neighbors,
-        app.api_lens_pin, app._setup_ws_worker,
+        (app.api_delete_model, app._prepare_delete_model_handoff),
+        (app.api_lens_load, app._prepare_lens_load_handoff),
+        (app.api_edit_export, app._prepare_export_handoff),
+        (app.api_edit_export_gguf, app._prepare_gguf_bake_handoff),
+        (app.api_generate_sync, app._prepare_http_generation_handoff),
+        (app.api_token_neighbors, app._prepare_token_neighbors_handoff),
+        (app.api_lens_pin, app._prepare_lens_pin_handoff),
+        (app._setup_ws_worker, app._prepare_ws_worker_handoff),
     )
-    for route in routes:
+    for route, helper in routes:
         source = inspect.getsource(route)
+        helper_source = inspect.getsource(helper)
         assert "OperationHandoff.acquire_scope(" in source, route.__name__
         assert "handoff.acquire(" not in source, route.__name__
         assert "async with handoff.awaiter_scope()" not in source, route.__name__
-        assert ".create_dispatch(" in source, route.__name__
+        assert ".create_dispatch(" in helper_source, helper.__name__
+        assert ".create_thread_task(" in helper_source, helper.__name__
+        assert "finally:" in helper_source, helper.__name__
         assert "manager.coordinator.acquire(" not in source, route.__name__
         assert "manager.coordinator.release(" not in source, route.__name__
         assert "_handoff_thread_worker" not in source, route.__name__
