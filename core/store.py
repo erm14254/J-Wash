@@ -1049,6 +1049,15 @@ class Store:
                 next(iter(run_ids))
                 if archive_version == 3 and pin_publication_state in {"pending", "published"} else None
             ),
+            # Immutable Store-internal causality for idempotent publication
+            # compensation. These are never surfaced as usable pin identity.
+            "pin_publication_attempt_gen_id": (
+                next(iter(numeric_gen_ids))
+                if archive_version == 3 and len(numeric_gen_ids) == 1 else None
+            ),
+            "pin_publication_attempt_run_id": (
+                next(iter(run_ids)) if archive_version == 3 else None
+            ),
             "layers": [int(l) for l in layers],
             "frames": packed,
             "vocab": {str(t): s for t, s in vocab.items()},
@@ -1089,15 +1098,24 @@ class Store:
             old_file = row["frames_file"]
             data = msgpack.unpackb((FRAMES_DIR / old_file).read_bytes(), strict_map_key=False)
             current_pin_state = data.get("pin_publication_state")
-            allowed_source = (
+            attempt_gen_id = data.get("pin_publication_attempt_gen_id")
+            attempt_run_id = data.get("pin_publication_attempt_run_id")
+            exact_attempt = (
+                attempt_run_id == generation_run_id
+                and (gen_id is None or attempt_gen_id == gen_id)
+            )
+            allowed_transition = (
                 current_pin_state == "pending"
+                or current_pin_state == state
                 or state == "unavailable" and current_pin_state == "published"
             )
+            allowed_source = (
+                data.get("version") == 3
+                and exact_attempt
+                and allowed_transition
+            )
             if (
-                data.get("version") != 3
-                or not allowed_source
-                or data.get("pin_generation_run_id") != generation_run_id
-                or (gen_id is not None and data.get("pin_gen_id") != gen_id)
+                not allowed_source
             ):
                 self._rollback_or_discard(conn)
                 return self._mutation_outcome(

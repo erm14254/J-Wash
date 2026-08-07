@@ -539,11 +539,18 @@ class LensManager:
             or self._provisional_gen_store.get(stored_receipt.gen_id) is not store
         ):
             raise ValueError("generation publication receipt identity changed")
-        return stored_receipt, store
+        return pending
 
     def commit_gen_publication(self, receipt):
         """Commit prepared publication, evicting only after durable approval."""
-        receipt, store = self._pending_publication(receipt)
+        pending = self._pending_publication(receipt)
+        receipt, store = pending
+        # Construct the sole outward success value before any destructive
+        # mutation. Receipt consumption below is the linearization point; after
+        # it succeeds the only operation is returning this existing object.
+        result = GenerationPublicationResult(
+            True, receipt.gen_id, receipt.generation_run_id,
+        )
         committed_before = OrderedDict(self.gen_store)
         provisional_before = dict(self._provisional_gen_store)
         try:
@@ -552,25 +559,26 @@ class LensManager:
                 self.gen_store.popitem(last=False)
             if self._provisional_gen_store.pop(receipt.gen_id, None) is not store:
                 raise RuntimeError("provisional generation ownership changed during commit")
-            if self._pending_gen_publications.pop(receipt.nonce, None) != (receipt, store):
+            if self._pending_gen_publications.pop(receipt.nonce, None) is not pending:
                 raise RuntimeError("publication receipt ownership changed during commit")
         except BaseException:
             self.gen_store.clear()
             self.gen_store.update(committed_before)
             self._provisional_gen_store.clear()
             self._provisional_gen_store.update(provisional_before)
-            self._pending_gen_publications[receipt.nonce] = (receipt, store)
+            self._pending_gen_publications[receipt.nonce] = pending
             raise
-        return GenerationPublicationResult(True, receipt.gen_id, receipt.generation_run_id)
+        return result
 
     def rollback_gen_publication(self, receipt):
         """Invalidate one exact prepared publication without touching old runs."""
-        receipt, store = self._pending_publication(receipt)
-        if self._pending_gen_publications.pop(receipt.nonce, None) != (receipt, store):
+        pending = self._pending_publication(receipt)
+        receipt, store = pending
+        if self._pending_gen_publications.pop(receipt.nonce, None) is not pending:
             raise RuntimeError("publication receipt ownership changed during rollback")
         removed = self._provisional_gen_store.pop(receipt.gen_id, None)
         if removed is not store:
-            self._pending_gen_publications[receipt.nonce] = (receipt, store)
+            self._pending_gen_publications[receipt.nonce] = pending
             raise RuntimeError("provisional generation ownership changed during rollback")
         store.clear()
         return True

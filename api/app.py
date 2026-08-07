@@ -3238,6 +3238,28 @@ def _finalize_continuation_frames(new_frames, suffix_start, suffix_end, generati
     return finalized
 
 
+def _resolve_continuation_pin_unavailable_total(
+    message_id, *, expected_version, generation_run_id, gen_id,
+):
+    """Resolve one exact durable pin attempt to unavailable or superseded."""
+    while True:
+        try:
+            outcome = store.finalize_continuation_pin_publication(
+                message_id,
+                expected_version=expected_version,
+                generation_run_id=generation_run_id,
+                gen_id=gen_id,
+                state="unavailable",
+            )
+            state = outcome.state
+        except BaseException:
+            _retry_thread_yield()
+            continue
+        if state in {"committed", "superseded"}:
+            return state
+        _retry_thread_yield()
+
+
 def _persisted_continue(req, message_id, stop_event, emit, gen_context):
     """Persist one continuation while owning its provisional residual capture."""
     msg = store.get_message(message_id)
@@ -3447,12 +3469,19 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
                     lens_binding_id=lens.binding_id,
                 )
                 discard_attempt()
-                unavailable = resolve_durable_state("unavailable")
-                if unavailable.state != "committed":
-                    logging.getLogger(__name__).error(
-                        "could not resolve durable pin state for message %s: %s",
-                        message_id, unavailable.state,
-                    )
+                unavailable_state = _resolve_continuation_pin_unavailable_total(
+                    message_id,
+                    expected_version=durable_version,
+                    generation_run_id=attempt_run_id,
+                    gen_id=attempt_gen_id,
+                )
+                if unavailable_state == "superseded":
+                    frames_acc.clear()
+                    emit({
+                        "type": "error",
+                        "message": "message changed while continuation pin publication was recovering",
+                    })
+                    return
                 terminal.pop("gen_id", None)
                 terminal.pop("generation_run_id", None)
                 terminal["pin_publication_state"] = "unavailable"
@@ -3495,10 +3524,12 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
             except BaseException:
                 attempt_resolved = True
             if durable_committed:
-                try:
-                    resolve_durable_state("unavailable")
-                except BaseException:
-                    pass
+                _resolve_continuation_pin_unavailable_total(
+                    message_id,
+                    expected_version=durable_version,
+                    generation_run_id=attempt_run_id,
+                    gen_id=attempt_gen_id,
+                )
 
 
 async def _watch_stop(ws, stop_event):

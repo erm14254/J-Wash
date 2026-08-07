@@ -2604,6 +2604,112 @@ def test_frame_pin_publication_state_survives_reload_without_version_increment(t
     assert loaded["frames"][0]["generation_run_id"] == run_id
 
 
+def test_unavailable_pin_transition_is_exact_and_idempotent(tmp_path, monkeypatch):
+    import msgpack
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c").value
+    mid, version = s.add_message(cid, None, "assistant", "old", return_version=True).value
+    run_id = "a" * 32
+    frame = _frame(1, "thinking", "0")
+    frame.update(gen=7, generation_run_id=run_id)
+    pending = s.update_message_and_frames_if_unchanged(
+        mid, version, "old plus", {"pin_publication_state": "pending"},
+        frames=[frame], layers=[0], k=1, pin_publication_state="pending",
+    )
+    assert pending.state == "committed"
+    durable_version = pending.observed_version
+    assert s.finalize_continuation_pin_publication(
+        mid, expected_version=durable_version, generation_run_id=run_id,
+        gen_id=7, state="published",
+    ).state == "committed"
+    assert s.finalize_continuation_pin_publication(
+        mid, expected_version=durable_version, generation_run_id=run_id,
+        gen_id=7, state="published",
+    ).state == "committed"
+    assert s.finalize_continuation_pin_publication(
+        mid, expected_version=durable_version, generation_run_id=run_id,
+        gen_id=7, state="unavailable",
+    ).state == "committed"
+    # Lost acknowledgement retry proves the same immutable attempt even though
+    # the usable pair was cleared by the first unavailable transition.
+    assert s.finalize_continuation_pin_publication(
+        mid, expected_version=durable_version, generation_run_id=run_id,
+        gen_id=7, state="unavailable",
+    ).state == "committed"
+    assert s.finalize_continuation_pin_publication(
+        mid, expected_version=durable_version, generation_run_id="b" * 32,
+        gen_id=8, state="unavailable",
+    ).state == "superseded"
+
+    message = s.get_message(mid)
+    raw = msgpack.unpackb(
+        (store_mod.FRAMES_DIR / message["frames_file"]).read_bytes(),
+        strict_map_key=False,
+    )
+    assert raw["pin_publication_attempt_gen_id"] == 7
+    assert raw["pin_publication_attempt_run_id"] == run_id
+    loaded = s.load_frames(mid)
+    assert loaded["pin_publication_state"] == "unavailable"
+    assert loaded["pin_gen_id"] is None
+    assert loaded["pin_generation_run_id"] is None
+    assert "pin_publication_attempt_gen_id" not in loaded
+    assert "pin_publication_attempt_run_id" not in loaded
+
+
+def test_total_unavailable_resolution_retries_faults_and_uncertain_outcomes(monkeypatch):
+    from api import app
+
+    outcomes = [
+        RuntimeError("injected Store fault"),
+        SimpleNamespace(state="not_committed"),
+        SimpleNamespace(state="ambiguous"),
+        SimpleNamespace(state="ambiguous"),
+        SimpleNamespace(state="committed"),
+    ]
+    calls = []
+    yields = []
+
+    class FakeStore:
+        def finalize_continuation_pin_publication(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+    monkeypatch.setattr(app, "store", FakeStore())
+    monkeypatch.setattr(app, "_retry_thread_yield", lambda: yields.append(True))
+    assert app._resolve_continuation_pin_unavailable_total(
+        11, expected_version=4, generation_run_id="c" * 32, gen_id=9,
+    ) == "committed"
+    assert len(calls) == 5
+    assert len(yields) == 4
+    assert all(call[1]["generation_run_id"] == "c" * 32 for call in calls)
+    assert all(call[1]["gen_id"] == 9 for call in calls)
+
+
+def test_total_unavailable_resolution_stops_on_exact_supersession(monkeypatch):
+    from api import app
+
+    calls = 0
+
+    class FakeStore:
+        def finalize_continuation_pin_publication(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return SimpleNamespace(state="superseded")
+
+    monkeypatch.setattr(app, "store", FakeStore())
+    assert app._resolve_continuation_pin_unavailable_total(
+        11, expected_version=4, generation_run_id="d" * 32, gen_id=9,
+    ) == "superseded"
+    assert calls == 1
+
+
 def test_persisted_continue_publication_failure_commits_visualization_without_pin(tmp_path, monkeypatch):
     from api import app
     from core import store as store_mod
@@ -2778,11 +2884,41 @@ def test_generation_publication_prepare_and_eviction_failures_preserve_old_runs(
         lens.commit_gen_publication(receipt)
     assert list(lens.gen_store) == old_ids
     assert attempt in lens._provisional_gen_store
+    assert receipt.nonce in lens._pending_gen_publications
+    assert lens.rollback_gen_publication(receipt)
+    assert list(lens.gen_store) == old_ids
+
+
+def test_generation_publication_result_memory_error_precedes_linearization(monkeypatch):
+    from core import lens_manager as lens_mod
+
+    lens = lens_mod.LensManager()
+    lens.layers = []
+    lens.model_session_id = 1
+    lens.binding_id = 2
+    old_ids = [
+        lens.start_gen(generation_run_id=f"{i:032x}")
+        for i in range(lens_mod.GEN_STORE_MAX)
+    ]
+    attempt = lens.start_gen(generation_run_id="f" * 32, provisional=True)
+    lens.finalize_gen(attempt, retained_thinking=[], publish=False)
+    receipt = lens.begin_gen_publication(attempt)
+
+    def fail_result(*_args, **_kwargs):
+        raise MemoryError("injected success-result allocation failure")
+
+    monkeypatch.setattr(lens_mod, "GenerationPublicationResult", fail_result)
+    with pytest.raises(MemoryError, match="success-result"):
+        lens.commit_gen_publication(receipt)
+    assert list(lens.gen_store) == old_ids
+    assert attempt in lens._provisional_gen_store
+    assert lens._pending_gen_publications[receipt.nonce][0] == receipt
     assert lens.rollback_gen_publication(receipt)
     assert list(lens.gen_store) == old_ids
 
 
 def test_persisted_continue_durable_publish_failure_preserves_full_committed_store(tmp_path, monkeypatch):
+    from collections import OrderedDict
     from api import app
     from core import store as store_mod
     from core.lens_manager import GEN_STORE_MAX, LensGenerationView, LensManager
@@ -2824,6 +2960,12 @@ def test_persisted_continue_durable_publish_failure_preserves_full_committed_sto
 
     lens.rollback_gen_publication = rollback_once
 
+    class FailLocalCommit(OrderedDict):
+        def popitem(self, *args, **kwargs):
+            raise RuntimeError("injected local eviction failure")
+
+    manager.gen_store = FailLocalCommit(manager.gen_store)
+
     def generate(**kwargs):
         attempt = lens.start_gen(generation_run_id=run_id, provisional=True)
         lens.finalize_gen(attempt, retained_thinking=[], publish=False)
@@ -2844,13 +2986,24 @@ def test_persisted_continue_durable_publish_failure_preserves_full_committed_sto
 
     original_finalize = durable_store.finalize_continuation_pin_publication
 
-    def fail_published(*args, **kwargs):
-        if kwargs["state"] == "published":
-            return SimpleNamespace(state="not_committed")
-        return original_finalize(*args, **kwargs)
+    unavailable_calls = 0
+
+    def lose_first_unavailable_ack(*args, **kwargs):
+        nonlocal unavailable_calls
+        outcome = original_finalize(*args, **kwargs)
+        if kwargs["state"] == "unavailable":
+            unavailable_calls += 1
+            if unavailable_calls == 1:
+                assert outcome.state == "committed"
+                assert not any(frame.get("type") == "done" for frame in emitted)
+                return SimpleNamespace(state="ambiguous")
+        return outcome
 
     monkeypatch.setattr(app.manager, "generate", generate)
-    monkeypatch.setattr(durable_store, "finalize_continuation_pin_publication", fail_published)
+    monkeypatch.setattr(
+        durable_store, "finalize_continuation_pin_publication",
+        lose_first_unavailable_ack,
+    )
     emitted = []
     app._persisted_continue(
         {}, mid, threading.Event(), emitted.append,
@@ -2861,6 +3014,7 @@ def test_persisted_continue_durable_publish_failure_preserves_full_committed_sto
     assert manager._provisional_gen_store == {}
     assert manager._pending_gen_publications == {}
     assert rollback_calls == 2
+    assert unavailable_calls == 2
     message = durable_store.get_message(mid)
     assert message["content"] == "old plus"
     assert message["version"] == version + 1
