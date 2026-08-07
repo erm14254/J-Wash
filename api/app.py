@@ -665,6 +665,8 @@ class OperationHandoff:
                     except BaseException:
                         await asyncio.sleep(0)
             factory = args = kwargs = worker = wrapper = task = task_to_drain = None
+            if not self.closed and not self.transferred:
+                cancelled |= await self._close_uninterruptibly()
             if cancelled:
                 raise asyncio.CancelledError() from None
             raise RuntimeError(f"{failure[0]}: {failure[1]}") from None
