@@ -115,12 +115,46 @@ class RouteOutcome:
     message: str | None = None
 
 
+@dataclass(frozen=True)
+class HandoffSetup:
+    task: object | None = None
+    dispatch: object | None = None
+    gate: object | None = None
+    state: object | None = None
+    status: int | None = None
+    kind: str | None = None
+    message: str | None = None
+
+
+def _bounded_failure(exc, fallback="request failed", limit=512):
+    try:
+        kind = getattr(type(exc), "__name__", "BaseException")[:128]
+    except BaseException:
+        kind = "BaseException"
+    try:
+        message = str(exc)
+    except BaseException:
+        message = fallback
+    if not isinstance(message, str):
+        message = fallback
+    message = message[:limit]
+    try:
+        exc.__traceback__ = exc.__context__ = exc.__cause__ = None
+    except BaseException:
+        pass
+    return kind, message
+
+
 def _route_value(value=None):
     return RouteOutcome(value=value)
 
 
 def _route_http(status, message):
-    return RouteOutcome(status=status, message=str(message))
+    try:
+        bounded = str(message)[:512]
+    except BaseException:
+        bounded = "request failed"
+    return RouteOutcome(status=status, message=bounded)
 
 
 def _raise_route_outcome(outcome: RouteOutcome):
@@ -141,13 +175,7 @@ class PreparedWorkerPayload:
 
 
 def _route_exception(status, exc):
-    message = str(exc)
-    try:
-        exc.__traceback__ = None
-        exc.__context__ = None
-        exc.__cause__ = None
-    except Exception:
-        pass
+    _kind, message = _bounded_failure(exc)
     return _route_http(status, message)
 
 def _worker_success(value=None):
@@ -155,15 +183,15 @@ def _worker_success(value=None):
 
 
 def _worker_failure(exc, *, default_status=500, value_status=422):
-    kind = getattr(type(exc), "__name__", "BaseException")[:128]
-    try:
-        message = str(exc)[:512]
-    except BaseException:
-        message = "worker failure could not be formatted"
+    kind, message = _bounded_failure(exc, "worker failure could not be formatted")
     if isinstance(exc, HTTPException):
+        try:
+            detail = str(exc.detail)[:512]
+        except BaseException:
+            detail = "request failed"
         outcome = WorkerOutcome(
             failure_kind="http",
-            failure_message=str(exc.detail),
+            failure_message=detail,
             http_status=exc.status_code,
         )
     else:
@@ -1022,6 +1050,29 @@ def _make_delete_model_worker(dispatch, model_id, delete_fn):
     return worker
 
 
+async def _prepare_delete_model_handoff(handoff, model_id, stop_event, delete_fn):
+    snap = status = payload = dispatch = task = None
+    try:
+        snap = handoff.snapshot
+        status = manager.coordinator.status_snapshot()
+        loaded_model_id = (status.model_meta or {}).get("model_id") if status.model_meta is not None else None
+        if loaded_model_id == model_id:
+            return HandoffSetup(status=409, kind="ModelStateError", message="unload this model before deleting it")
+        dispatch = handoff.create_dispatch()
+        snap = status = payload = None
+        task = await handoff.create_thread_task(
+            _make_delete_model_worker, factory_args=(dispatch, str(model_id), delete_fn),
+        )
+        return HandoffSetup(task=task, dispatch=dispatch)
+    except asyncio.CancelledError:
+        raise
+    except BaseException as exc:
+        kind, message = _bounded_failure(exc, "model deletion setup failed")
+        return HandoffSetup(status=500, kind=kind, message=message)
+    finally:
+        snap = status = payload = dispatch = task = None
+
+
 @app.post("/api/models/delete")
 async def api_delete_model(req: DeleteModelRequest):
     from core.model_manager import delete_model
@@ -1031,19 +1082,14 @@ async def api_delete_model(req: DeleteModelRequest):
             manager.coordinator, OperationType.MODEL_DELETE,
             stop_event=stop_event, include_bundle=False,
         ) as handoff:
-            snap = handoff.snapshot
-            status = manager.coordinator.status_snapshot()
-            loaded_model_id = (status.model_meta or {}).get("model_id") if status.model_meta is not None else None
-            snap = status = None
-            if loaded_model_id == req.model_id:
-                raise HTTPException(409, "unload this model before deleting it")
-            dispatch = handoff.create_dispatch()
-            task = await handoff.create_thread_task(
-                _make_delete_model_worker,
-                factory_args=(dispatch, str(req.model_id), delete_model),
+            setup = await _prepare_delete_model_handoff(
+                handoff, str(req.model_id), stop_event, delete_model,
             )
     except OperationConflict as exc:
         raise _conflict(exc)
+    if setup.status is not None:
+        raise HTTPException(setup.status, setup.message or "model deletion setup failed") from None
+    task, dispatch = setup.task, setup.dispatch
     try:
         return _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -1155,31 +1201,51 @@ def _make_lens_load_worker(dispatch, token):
     return worker
 
 
+async def _prepare_lens_load_handoff(handoff, request_values):
+    snap = payload = dispatch = task = None
+    try:
+        snap = handoff.snapshot
+        payload = dict(request_values)
+        try:
+            dispatch = handoff.create_dispatch(payload)
+        finally:
+            payload = None
+        snap = None
+        task = await handoff.create_thread_task(
+            _make_lens_load_worker, factory_args=(dispatch, handoff.token),
+        )
+        return HandoffSetup(task=task, dispatch=dispatch)
+    except asyncio.CancelledError:
+        raise
+    except BaseException as exc:
+        kind, message = _bounded_failure(exc, "lens setup failed")
+        return HandoffSetup(status=500, kind=kind, message=message)
+    finally:
+        snap = payload = dispatch = task = None
+
+
 @app.post("/api/lens/load")
 async def api_lens_load(req: LensLoadRequest):
     if not req.repo_id and not req.path:
         raise HTTPException(422, "repo_id or path required")
     stop_event = ThreadingEvent()
+    request_values = {
+        "repo_id": req.repo_id, "filename": req.filename, "revision": req.revision,
+        "path": req.path, "layers": req.layers, "k": req.k,
+    }
     try:
         async with OperationHandoff.acquire_scope(
             manager.coordinator, OperationType.LENS_UPDATE, stop_event=stop_event,
             requires_loaded=True, include_bundle=False,
         ) as handoff:
-            token, snap = handoff.token, handoff.snapshot
-            snap = None
-            payload = {
-                "repo_id": req.repo_id, "filename": req.filename, "revision": req.revision,
-                "path": req.path, "layers": req.layers, "k": req.k,
-            }
-            dispatch = handoff.create_dispatch(payload)
-            payload = None
-            task = await handoff.create_thread_task(
-                _make_lens_load_worker, factory_args=(dispatch, token),
-            )
+            setup = await _prepare_lens_load_handoff(handoff, request_values)
     except OperationConflict as exc:
         raise _conflict(exc)
     except ModelStateError as exc:
         raise HTTPException(422, str(exc))
+    if setup.status is not None:
+        raise HTTPException(setup.status, setup.message or "lens setup failed") from None
+    task, dispatch = setup.task, setup.dispatch
     try:
         return _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -1665,6 +1731,38 @@ def _make_export_worker(dispatch):
     return worker
 
 
+async def _prepare_export_handoff(handoff, req):
+    token = snap = outcome = prepared = payload_seed = publication_gate = payload = dispatch = task = None
+    try:
+        token, snap = handoff.token, handoff.snapshot
+        outcome = _export_preflight_resource(snap, req)
+        snap = None
+        if outcome.status is not None:
+            return HandoffSetup(status=outcome.status, kind="ExportPreflight", message=outcome.message)
+        prepared = outcome.value
+        payload_seed = prepared.take()
+        prepared = outcome = None
+        publication_gate = editing.PublicationGate(
+            lambda: not manager.coordinator.is_cancelled(token) and manager.coordinator.is_current(token)
+        )
+        payload = dict(payload_seed)
+        payload.update(publication_gate=publication_gate, format=req.format, name=req.name)
+        try:
+            dispatch = handoff.create_dispatch(payload)
+        finally:
+            payload = payload_seed = None
+        token = prepared = outcome = None
+        task = await handoff.create_thread_task(_make_export_worker, factory_args=(dispatch,))
+        return HandoffSetup(task=task, dispatch=dispatch, gate=publication_gate)
+    except asyncio.CancelledError:
+        raise
+    except BaseException as exc:
+        kind, message = _bounded_failure(exc, "export setup failed")
+        return HandoffSetup(status=500, kind=kind, message=message)
+    finally:
+        token = snap = outcome = prepared = payload_seed = payload = dispatch = task = publication_gate = None
+
+
 @app.post("/api/edit/export")
 async def api_edit_export(req: ExportRequest):
     req.name = _safe_name(req.name)
@@ -1676,27 +1774,14 @@ async def api_edit_export(req: ExportRequest):
             manager.coordinator, OperationType.EXPORT,
             stop_event=stop_event, requires_loaded=True,
         ) as handoff:
-            token, snap = handoff.token, handoff.snapshot
-            outcome = _export_preflight_resource(snap, req)
-            snap = None
-            if outcome.status is not None:
-                return _raise_route_outcome(outcome)
-            prepared = outcome.value
-            outcome = None
-            payload_seed = prepared.take()
-            prepared = None
-            publication_gate = editing.PublicationGate(
-                lambda: not manager.coordinator.is_cancelled(token) and manager.coordinator.is_current(token)
-            )
-            payload = dict(payload_seed)
-            payload.update(publication_gate=publication_gate, format=req.format, name=req.name)
-            dispatch = handoff.create_dispatch(payload)
-            payload_seed = payload = None
-            task = await handoff.create_thread_task(_make_export_worker, factory_args=(dispatch,))
+            setup = await _prepare_export_handoff(handoff, req)
     except OperationConflict as exc:
         raise _conflict(exc)
     except ModelStateError as exc:
         raise HTTPException(422, str(exc))
+    if setup.status is not None:
+        raise HTTPException(setup.status, setup.message or "export setup failed") from None
+    task, dispatch, publication_gate = setup.task, setup.dispatch, setup.gate
     try:
         return _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -1916,6 +2001,40 @@ def _make_gguf_bake_worker(dispatch):
     return worker
 
 
+async def _prepare_gguf_bake_handoff(handoff, export_name):
+    token = snap = outcome = prepared = payload_seed = publication_gate = payload = dispatch = task = None
+    try:
+        token, snap = handoff.token, handoff.snapshot
+        outcome = _gguf_preflight_resource(snap)
+        snap = None
+        if outcome.status is not None:
+            return HandoffSetup(status=outcome.status, kind="GGUFPreflight", message=outcome.message)
+        prepared = outcome.value
+        payload_seed = prepared.take()
+        prepared = outcome = None
+        publication_gate = editing.PublicationGate(
+            lambda: not manager.coordinator.is_cancelled(token) and manager.coordinator.is_current(token)
+        )
+        payload = dict(payload_seed)
+        payload.update(name=export_name, publication_gate=publication_gate)
+        try:
+            dispatch = handoff.create_dispatch(payload)
+        finally:
+            payload = payload_seed = None
+        token = prepared = outcome = None
+        task = await handoff.create_thread_task(
+            _make_gguf_bake_worker, factory_args=(dispatch,),
+        )
+        return HandoffSetup(task=task, dispatch=dispatch, gate=publication_gate)
+    except asyncio.CancelledError:
+        raise
+    except BaseException as exc:
+        kind, message = _bounded_failure(exc, "GGUF bake setup failed")
+        return HandoffSetup(status=500, kind=kind, message=message)
+    finally:
+        token = snap = outcome = prepared = payload_seed = publication_gate = payload = dispatch = task = None
+
+
 @app.post("/api/edit/export-gguf")
 async def api_edit_export_gguf(req: GGUFExportRequest):
     try:
@@ -1945,28 +2064,16 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
                 manager.coordinator, OperationType.GGUF_BAKE,
                 stop_event=stop_event, requires_loaded=True,
             ) as handoff:
-                token, snap = handoff.token, handoff.snapshot
-                outcome = _gguf_preflight_resource(snap)
-                snap = None
-                if outcome.status is not None:
-                    return _raise_route_outcome(outcome)
-                prepared = outcome.value
-                payload_seed = prepared.take()
-                prepared = outcome = None
-                publication_gate = editing.PublicationGate(
-                    lambda: not manager.coordinator.is_cancelled(token) and manager.coordinator.is_current(token)
-                )
-                payload = dict(payload_seed)
-                payload.update(name="/".join((*name_parts, "hf")), publication_gate=publication_gate)
-                dispatch = handoff.create_dispatch(payload)
-                payload_seed = payload = None
-                task = await handoff.create_thread_task(
-                    _make_gguf_bake_worker, factory_args=(dispatch,),
+                setup = await _prepare_gguf_bake_handoff(
+                    handoff, "/".join((*name_parts, "hf")),
                 )
         except OperationConflict as exc:
             raise _conflict(exc)
         except ModelStateError as exc:
             raise HTTPException(422, "no model loaded (and no cached checkpoint for this name)") from None
+        if setup.status is not None:
+            raise HTTPException(setup.status, setup.message or "GGUF bake setup failed") from None
+        task, dispatch, publication_gate = setup.task, setup.dispatch, setup.gate
         try:
             _raise_worker_outcome(await asyncio.shield(task))
         except asyncio.CancelledError:
@@ -2067,6 +2174,32 @@ def _make_http_generation_worker(dispatch, stop_event, done, token):
     return worker
 
 
+async def _prepare_http_generation_handoff(handoff, messages, sampling, stop_event):
+    token = snap = context = payload = dispatch = task = done = None
+    try:
+        token, snap = handoff.token, handoff.snapshot
+        context = _captured_generation_context(token, snap, stop_event)
+        payload = {"context": context, "messages": list(messages), "sampling": dict(sampling)}
+        try:
+            dispatch = handoff.create_dispatch(payload)
+        finally:
+            payload = None
+        snap = context = None
+        done = {}
+        task = await handoff.create_thread_task(
+            _make_http_generation_worker,
+            factory_args=(dispatch, stop_event, done, token),
+        )
+        return HandoffSetup(task=task, dispatch=dispatch, state=done)
+    except asyncio.CancelledError:
+        raise
+    except BaseException as exc:
+        kind, message = _bounded_failure(exc, "generation setup failed")
+        return HandoffSetup(status=500, kind=kind, message=message)
+    finally:
+        token = snap = context = payload = dispatch = task = done = None
+
+
 @app.post("/api/generate")
 async def api_generate_sync(req: GenerateSyncRequest):
     stop_event = ThreadingEvent()
@@ -2075,20 +2208,16 @@ async def api_generate_sync(req: GenerateSyncRequest):
             manager.coordinator, OperationType.GENERATE,
             stop_event=stop_event, requires_loaded=True,
         ) as handoff:
-            token, snap = handoff.token, handoff.snapshot
-            context = _captured_generation_context(token, snap, stop_event)
-            payload = {"context": context, "messages": list(req.messages), "sampling": dict(req.sampling)}
-            dispatch = handoff.create_dispatch(payload)
-            snap = context = payload = None
-            done = {}
-            task = await handoff.create_thread_task(
-                _make_http_generation_worker,
-                factory_args=(dispatch, stop_event, done, token),
+            setup = await _prepare_http_generation_handoff(
+                handoff, req.messages, req.sampling, stop_event,
             )
     except OperationConflict as exc:
         raise _conflict(exc)
     except ModelStateError as exc:
         raise HTTPException(422, str(exc))
+    if setup.status is not None:
+        raise HTTPException(setup.status, setup.message or "generation setup failed") from None
+    task, dispatch = setup.task, setup.dispatch
     try:
         outcome_value = _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -2125,6 +2254,35 @@ def _make_token_neighbors_worker(dispatch):
     return worker
 
 
+async def _prepare_token_neighbors_handoff(handoff, token_ids, k):
+    snap = bundle = jl = tokenizer = meta_copy = key = payload = dispatch = task = None
+    try:
+        snap = handoff.snapshot
+        bundle = snap.bundle
+        jl, tokenizer = bundle.jl, bundle.tokenizer
+        meta_copy = dict(bundle.meta)
+        key = (snap.model_session_id, meta_copy.get("model_id"), meta_copy.get("revision"))
+        payload = {
+            "bundle": bundle, "key": key, "token_ids": list(token_ids[:64]), "k": k,
+        }
+        try:
+            dispatch = handoff.create_dispatch(payload)
+        finally:
+            payload = None
+        snap = bundle = jl = tokenizer = meta_copy = key = None
+        task = await handoff.create_thread_task(
+            _make_token_neighbors_worker, factory_args=(dispatch,),
+        )
+        return HandoffSetup(task=task, dispatch=dispatch)
+    except asyncio.CancelledError:
+        raise
+    except BaseException as exc:
+        kind, message = _bounded_failure(exc, "token-neighbor setup failed")
+        return HandoffSetup(status=500, kind=kind, message=message)
+    finally:
+        snap = bundle = jl = tokenizer = meta_copy = key = payload = dispatch = task = None
+
+
 @app.post("/api/token-neighbors")
 async def api_token_neighbors(req: NeighborsRequest):
     stop_event = ThreadingEvent()
@@ -2133,16 +2291,8 @@ async def api_token_neighbors(req: NeighborsRequest):
             manager.coordinator, OperationType.MODEL_READ,
             stop_event=stop_event, requires_loaded=True,
         ) as handoff:
-            snap = handoff.snapshot
-            bundle = snap.bundle
-            meta_copy = dict(bundle.meta)
-            key = (snap.model_session_id, meta_copy.get("model_id"), meta_copy.get("revision"))
-            handoff.set_heavy(bundle=bundle, meta_copy=meta_copy, key=key)
-            payload = {"bundle": bundle, "key": key, "token_ids": list(req.token_ids[:64]), "k": req.k}
-            dispatch = handoff.create_dispatch(payload)
-            snap = bundle = meta_copy = key = payload = None
-            task = await handoff.create_thread_task(
-                _make_token_neighbors_worker, factory_args=(dispatch,),
+            setup = await _prepare_token_neighbors_handoff(
+                handoff, req.token_ids, req.k,
             )
     except OperationConflict as exc:
         raise _conflict(exc)
@@ -2153,9 +2303,11 @@ async def api_token_neighbors(req: NeighborsRequest):
     except HTTPException:
         raise
     except BaseException as exc:
-        detail = str(exc)[:512]
-        exc.__traceback__ = exc.__context__ = exc.__cause__ = None
+        _kind, detail = _bounded_failure(exc, "token-neighbor setup failed")
         raise HTTPException(500, detail) from None
+    if setup.status is not None:
+        raise HTTPException(setup.status, setup.message or "token-neighbor setup failed") from None
+    task, dispatch = setup.task, setup.dispatch
     try:
         result = _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -2287,6 +2439,34 @@ def _make_lens_pin_worker(dispatch):
     return worker
 
 
+async def _prepare_lens_pin_handoff(handoff, gen_id, generation_run_id, token_ids):
+    snap = bundle = jl = payload = dispatch = task = None
+    try:
+        snap = handoff.snapshot
+        bundle = snap.bundle
+        jl = bundle.jl
+        payload = {
+            "jl": jl, "gen_id": gen_id, "generation_run_id": generation_run_id,
+            "token_ids": list(token_ids),
+        }
+        try:
+            dispatch = handoff.create_dispatch(payload)
+        finally:
+            payload = None
+        snap = bundle = jl = None
+        task = await handoff.create_thread_task(
+            _make_lens_pin_worker, factory_args=(dispatch,),
+        )
+        return HandoffSetup(task=task, dispatch=dispatch)
+    except asyncio.CancelledError:
+        raise
+    except BaseException as exc:
+        kind, message = _bounded_failure(exc, "lens pin setup failed")
+        return HandoffSetup(status=500, kind=kind, message=message)
+    finally:
+        snap = bundle = jl = payload = dispatch = task = None
+
+
 @app.post("/api/lens/pin")
 async def api_lens_pin(req: PinRequest):
     run_id = req.generation_run_id
@@ -2302,16 +2482,16 @@ async def api_lens_pin(req: PinRequest):
             manager.coordinator, OperationType.MODEL_READ,
             stop_event=stop_event, requires_loaded=True,
         ) as handoff:
-            snap = handoff.snapshot
-            jl = snap.bundle.jl
-            payload = {"jl": jl, "gen_id": req.gen_id, "generation_run_id": req.generation_run_id, "token_ids": list(req.token_ids)}
-            dispatch = handoff.create_dispatch(payload)
-            snap = jl = payload = None
-            task = await handoff.create_thread_task(_make_lens_pin_worker, factory_args=(dispatch,))
+            setup = await _prepare_lens_pin_handoff(
+                handoff, req.gen_id, req.generation_run_id, req.token_ids,
+            )
     except OperationConflict as exc:
         raise _conflict(exc)
     except ModelStateError as exc:
         raise HTTPException(422, str(exc))
+    if setup.status is not None:
+        raise HTTPException(setup.status, setup.message or "lens pin setup failed") from None
+    task, dispatch = setup.task, setup.dispatch
     try:
         return _raise_worker_outcome(await asyncio.shield(task))
     except asyncio.CancelledError:
@@ -3129,44 +3309,58 @@ def _make_ws_generation_worker(dispatch, stop_event, loop, queue):
     return worker
 
 
+async def _prepare_ws_worker_handoff(handoff, req, loop, queue, stop_event):
+    token = snap = context = payload = dispatch = task = None
+    try:
+        token, snap = handoff.token, handoff.snapshot
+        context = _captured_generation_context(token, snap, stop_event)
+        if not req.get("lens"):
+            context = GenerationContext(
+                token=context.token, model_session_id=context.model_session_id, bundle=context.bundle,
+                hf_model=context.hf_model, tokenizer=context.tokenizer, jl=context.jl, meta=context.meta,
+                capability_profile=context.capability_profile, lens=None,
+                intervention_snapshot=context.intervention_snapshot, stop_event=context.stop_event,
+            )
+        payload = {"context": context, "request": dict(req)}
+        try:
+            dispatch = handoff.create_dispatch(payload)
+        finally:
+            payload = None
+        snap = context = None
+        task = await handoff.create_thread_task(
+            _make_ws_generation_worker,
+            factory_args=(dispatch, stop_event, loop, queue),
+        )
+        return HandoffSetup(task=task, dispatch=dispatch)
+    except asyncio.CancelledError:
+        raise
+    except BaseException as exc:
+        kind, message = _bounded_failure(exc, "websocket generation setup failed")
+        return HandoffSetup(status=500, kind=kind, message=message)
+    finally:
+        token = snap = context = payload = dispatch = task = None
+
+
 async def _setup_ws_worker(req):
     loop = asyncio.get_running_loop()
     queue = asyncio.Queue()
     stop_event = ThreadingEvent()
-    token = snap = context = payload = dispatch = task = None
+    setup = None
     try:
         async with OperationHandoff.acquire_scope(
             manager.coordinator, OperationType.GENERATE, stop_event=stop_event, requires_loaded=True,
         ) as active_handoff:
-            token, snap = active_handoff.token, active_handoff.snapshot
-            context = _captured_generation_context(token, snap, stop_event)
-            if not req.get("lens"):
-                context = GenerationContext(
-                    token=context.token, model_session_id=context.model_session_id, bundle=context.bundle,
-                    hf_model=context.hf_model, tokenizer=context.tokenizer, jl=context.jl, meta=context.meta,
-                    capability_profile=context.capability_profile, lens=None,
-                    intervention_snapshot=context.intervention_snapshot, stop_event=context.stop_event,
-                )
-            payload = {"context": context, "request": dict(req)}
-            dispatch = active_handoff.create_dispatch(payload)
-            snap = context = payload = None
-            task = await active_handoff.create_thread_task(
-                _make_ws_generation_worker,
-                factory_args=(dispatch, stop_event, loop, queue),
+            setup = await _prepare_ws_worker_handoff(
+                active_handoff, req, loop, queue, stop_event,
             )
-        return ("ok", task, queue, stop_event, dispatch)
+        if setup.status is not None:
+            return ("error", setup.status, setup.kind, setup.message)
+        return ("ok", setup.task, queue, stop_event, setup.dispatch)
     except asyncio.CancelledError:
-        snap = context = payload = task = None
-        dispatch = None
         raise
     except BaseException as exc:
         status = 409 if isinstance(exc, OperationConflict) else 422 if isinstance(exc, ModelStateError) else 500
-        kind = type(exc).__name__[:128]
-        message = str(exc)[:512]
-        exc.__traceback__ = exc.__context__ = exc.__cause__ = None
-        exc = None
-        snap = context = payload = task = None
-        dispatch = None
+        kind, message = _bounded_failure(exc, "websocket generation setup failed")
         return ("error", status, kind, message)
 
 
@@ -3245,8 +3439,8 @@ async def _finalize_ws_runtime(ws, worker, receiver, waiter, stop_event, dispatc
         try:
             outcome = worker.result()
         except BaseException as exc:
-            raw_failure = f"{type(exc).__name__}: {str(exc)[:384]}"
-            exc.__traceback__ = exc.__context__ = exc.__cause__ = None
+            kind, message = _bounded_failure(exc, "generation worker failed", 384)
+            raw_failure = f"{kind}: {message}"[:512]
     if not terminal_seen:
         if isinstance(outcome, WorkerOutcome) and not outcome.ok:
             failure_message = outcome.failure_message or "generation worker failed"
