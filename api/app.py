@@ -855,45 +855,52 @@ async def _drain_worker_uninterruptibly(task):
 
 async def _await_transferred_worker(task, dispatch, *, on_cancel=None):
     """Await a retained worker and resolve exact ownership before cancellation."""
+    cancelled = False
+    result = None
     try:
-        return await asyncio.shield(task)
+        result = await asyncio.shield(task)
     except asyncio.CancelledError:
+        cancelled = True
         _remember_task_cancellation()
-        if on_cancel is not None:
-            try:
-                on_cancel()
-            except BaseException as exc:
-                _bounded_failure(exc, "publication cancellation failed")
+    if not cancelled:
+        return result
+    result = None
+    if on_cancel is not None:
         try:
-            dispatch.cancel_from_awaiter()
+            on_cancel()
         except BaseException as exc:
-            _bounded_failure(exc, "dispatch cancellation failed")
-        while not task.done():
-            try:
-                await _drain_worker_uninterruptibly(task)
-            except asyncio.CancelledError:
-                _remember_task_cancellation()
-            except BaseException:
-                await _cleanup_yield()
-        while True:
-            try:
-                current = dispatch.coordinator.is_current(dispatch.token)
-            except BaseException:
-                current = True
-            if not current:
-                break
-            if dispatch.claimed:
-                _release_worker_total(dispatch)
-            else:
-                _abort_unclaimed_total(dispatch)
+            _bounded_failure(exc, "publication cancellation failed")
+    try:
+        dispatch.cancel_from_awaiter()
+    except BaseException as exc:
+        _bounded_failure(exc, "dispatch cancellation failed")
+    while not task.done():
+        try:
+            await _drain_worker_uninterruptibly(task)
+        except asyncio.CancelledError:
+            _remember_task_cancellation()
+        except BaseException:
             await _cleanup_yield()
+    while True:
         try:
-            if not task.cancelled():
-                task.exception()
-        except BaseException as exc:
-            _bounded_failure(exc, "worker completion failed")
-        task = dispatch = on_cancel = None
-        raise asyncio.CancelledError() from None
+            current = dispatch.coordinator.is_current(dispatch.token)
+        except BaseException:
+            current = True
+        if not current:
+            break
+        if dispatch.claimed:
+            _release_worker_total(dispatch)
+        else:
+            _abort_unclaimed_total(dispatch)
+        await _cleanup_yield()
+    try:
+        if not task.cancelled():
+            task.exception()
+    except BaseException as exc:
+        _bounded_failure(exc, "worker completion failed")
+    task = dispatch = on_cancel = None
+    raise asyncio.CancelledError() from None
+
 
 def _valid_devices():
     """Accepted devices = "auto" + one cuda:N per GPU actually present.
@@ -3574,7 +3581,9 @@ async def _cancel_task_uninterruptibly(task):
 async def _drain_retained_worker_total(worker, dispatch):
     """Drain a transferred worker and prove its coordinator token is resolved."""
     cancelled = False
-    while not worker.done():
+    first_drain = True
+    while first_drain or not worker.done():
+        first_drain = False
         try:
             await _drain_worker_uninterruptibly(worker)
         except asyncio.CancelledError:

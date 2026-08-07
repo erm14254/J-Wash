@@ -2932,7 +2932,7 @@ def test_await_transferred_worker_unclaimed_cancellation_releases_payload():
         dispatch = WorkerDispatch(coordinator, token, payload={"heavy": object()})
 
         async def worker():
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.01)
             assert dispatch.claim() is False
             return app.WorkerOutcome()
 
