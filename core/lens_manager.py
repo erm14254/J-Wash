@@ -2,6 +2,7 @@ import hashlib
 import itertools
 import json
 import threading
+import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
@@ -494,7 +495,11 @@ class LensManager:
 
         if publish and not already_published:
             receipt = self.begin_gen_publication(gen_id)
-            self.commit_gen_publication(receipt)
+            try:
+                return self.commit_gen_publication(receipt)
+            except BaseException:
+                self.rollback_gen_publication_total(receipt)
+                raise
         return GenerationPublicationResult(
             published=publish or already_published,
             gen_id=int(gen_id),
@@ -582,6 +587,63 @@ class LensManager:
             raise RuntimeError("provisional generation ownership changed during rollback")
         store.clear()
         return True
+
+    @staticmethod
+    def _publication_retry_yield():
+        try:
+            time.sleep(0)
+        except BaseException:
+            pass
+
+    @staticmethod
+    def _store_matches_publication_receipt(store, receipt):
+        return bool(
+            store is not None
+            and store.get("generation_run_id") == receipt.generation_run_id
+            and store.get("model_session_id") == receipt.model_session_id
+            and store.get("lens_binding_id") == receipt.lens_binding_id
+        )
+
+    def rollback_gen_publication_total(self, receipt):
+        """Resolve exact wrapper-owned publication rollback before returning."""
+        while True:
+            try:
+                if self.rollback_gen_publication(receipt):
+                    continue
+            except BaseException:
+                pass
+
+            try:
+                pending = self._pending_gen_publications.get(receipt.nonce)
+                provisional = self._provisional_gen_store.get(receipt.gen_id)
+                committed = self.gen_store.get(receipt.gen_id)
+                provisional_exact = self._store_matches_publication_receipt(
+                    provisional, receipt,
+                )
+                committed_exact = self._store_matches_publication_receipt(
+                    committed, receipt,
+                )
+
+                if pending is None and not provisional_exact and not committed_exact:
+                    return True
+
+                if pending is not None:
+                    if (
+                        pending[0] != receipt
+                        or pending[1] is not provisional
+                        or not provisional_exact
+                    ):
+                        self._publication_retry_yield()
+                        continue
+                elif provisional_exact and not committed_exact:
+                    # Recover an exact orphaned provisional owner only; never
+                    # touch an unrelated entry reusing the numeric ID.
+                    if self._provisional_gen_store.pop(receipt.gen_id, None) is provisional:
+                        provisional.clear()
+                    continue
+            except BaseException:
+                pass
+            self._publication_retry_yield()
 
     def discard_gen(self, gen_id):
         store = self._provisional_gen_store.pop(gen_id, None)

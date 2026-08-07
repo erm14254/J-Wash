@@ -2816,8 +2816,8 @@ def test_finalize_gen_publication_failure_restores_committed_and_provisional_map
     with pytest.raises(RuntimeError, match="injected committed insertion failure"):
         lens.finalize_gen(attempt, publish=True)
     assert list(lens.gen_store) == old_ids
-    assert attempt in lens._provisional_gen_store
-    assert lens.discard_gen(attempt)
+    assert attempt not in lens._provisional_gen_store
+    assert lens._pending_gen_publications == {}
     assert list(lens.gen_store) == old_ids
 
 
@@ -2915,6 +2915,104 @@ def test_generation_publication_result_memory_error_precedes_linearization(monke
     assert lens._pending_gen_publications[receipt.nonce][0] == receipt
     assert lens.rollback_gen_publication(receipt)
     assert list(lens.gen_store) == old_ids
+
+
+def test_finalize_gen_publication_uses_one_prelinearization_result(monkeypatch):
+    from core import lens_manager as lens_mod
+
+    lens = lens_mod.LensManager()
+    lens.layers = []
+    lens.model_session_id = 1
+    lens.binding_id = 2
+    old_ids = [
+        lens.start_gen(generation_run_id=f"{i:032x}")
+        for i in range(1, lens_mod.GEN_STORE_MAX + 1)
+    ]
+    attempt = lens.start_gen(generation_run_id="f" * 32, provisional=True)
+    original_result = lens_mod.GenerationPublicationResult
+    constructed = []
+
+    def construct_once(*args, **kwargs):
+        if constructed:
+            raise MemoryError("injected second result allocation failure")
+        result = original_result(*args, **kwargs)
+        constructed.append(result)
+        return result
+
+    monkeypatch.setattr(lens_mod, "GenerationPublicationResult", construct_once)
+    result = lens.finalize_gen(attempt, retained_thinking=[], publish=True)
+    assert result is constructed[0]
+    assert len(constructed) == 1
+    assert list(lens.gen_store) == old_ids[1:] + [attempt]
+    assert attempt not in lens._provisional_gen_store
+    assert lens._pending_gen_publications == {}
+
+
+@pytest.mark.parametrize("rollback_mode", ["transient", "lost_ack"])
+def test_finalize_gen_failure_totally_rolls_back_owned_receipt(
+    monkeypatch, rollback_mode,
+):
+    from core import lens_manager as lens_mod
+
+    lens = lens_mod.LensManager()
+    lens.layers = []
+    lens.model_session_id = 1
+    lens.binding_id = 2
+    old_ids = [
+        lens.start_gen(generation_run_id=f"{i:032x}")
+        for i in range(1, lens_mod.GEN_STORE_MAX + 1)
+    ]
+    attempt = lens.start_gen(generation_run_id="f" * 32, provisional=True)
+    primary = MemoryError("injected pre-linearization result failure")
+
+    def fail_result(*_args, **_kwargs):
+        raise primary
+
+    original_rollback = lens.rollback_gen_publication
+    rollback_calls = 0
+
+    def faulty_rollback(receipt):
+        nonlocal rollback_calls
+        rollback_calls += 1
+        if rollback_mode == "transient" and rollback_calls <= 2:
+            raise RuntimeError("injected transient rollback failure")
+        result = original_rollback(receipt)
+        if rollback_mode == "lost_ack" and rollback_calls == 1:
+            raise RuntimeError("lost rollback acknowledgement")
+        return result
+
+    monkeypatch.setattr(lens_mod, "GenerationPublicationResult", fail_result)
+    monkeypatch.setattr(lens, "rollback_gen_publication", faulty_rollback)
+    with pytest.raises(MemoryError) as raised:
+        lens.finalize_gen(attempt, retained_thinking=[], publish=True)
+    assert raised.value is primary
+    assert rollback_calls >= (3 if rollback_mode == "transient" else 1)
+    assert list(lens.gen_store) == old_ids
+    assert attempt not in lens.gen_store
+    assert attempt not in lens._provisional_gen_store
+    assert lens._pending_gen_publications == {}
+
+
+def test_total_publication_rollback_does_not_remove_reused_unrelated_identity():
+    from core.lens_manager import LensManager
+
+    lens = LensManager()
+    lens.layers = []
+    lens.model_session_id = 1
+    lens.binding_id = 2
+    attempt = lens.start_gen(generation_run_id="a" * 32, provisional=True)
+    lens.finalize_gen(attempt, retained_thinking=[], publish=False)
+    receipt = lens.begin_gen_publication(attempt)
+    assert lens.rollback_gen_publication(receipt)
+
+    replacement = {
+        "generation_run_id": "b" * 32,
+        "model_session_id": 9,
+        "lens_binding_id": 10,
+    }
+    lens._provisional_gen_store[attempt] = replacement
+    assert lens.rollback_gen_publication_total(receipt)
+    assert lens._provisional_gen_store[attempt] is replacement
 
 
 def test_persisted_continue_durable_publish_failure_preserves_full_committed_store(tmp_path, monkeypatch):
