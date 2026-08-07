@@ -1814,11 +1814,11 @@ def test_neighbor_heavy_helper_failure_does_not_retain_model_graph():
 
     class Handoff:
         token = object()
-        snapshot = SimpleNamespace(bundle=bundle, model_session_id=1)
         def create_dispatch(self, _payload):
             raise RuntimeError("dispatch failed")
 
     handoff = Handoff()
+    handoff.snapshot = SimpleNamespace(bundle=bundle, model_session_id=1)
     setup = asyncio.run(app._prepare_token_neighbors_handoff(handoff, [1], 1))
     assert setup.status == 500
     assert setup.task is setup.dispatch is None
@@ -1851,7 +1851,6 @@ def test_neighbor_task_transfer_failure_composes_with_helper_teardown():
     dispatch = Dispatch()
     class Handoff:
         token = object()
-        snapshot = SimpleNamespace(bundle=bundle, model_session_id=1)
         def create_dispatch(self, payload):
             dispatch.payload = payload
             return dispatch
@@ -1860,6 +1859,7 @@ def test_neighbor_task_transfer_failure_composes_with_helper_teardown():
             raise RuntimeError("task transfer failed")
 
     handoff = Handoff()
+    handoff.snapshot = SimpleNamespace(bundle=bundle, model_session_id=1)
     setup = asyncio.run(app._prepare_token_neighbors_handoff(handoff, [1], 1))
     assert setup.status == 500
     assert dispatch.payload is None
