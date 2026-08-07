@@ -3,6 +3,9 @@ import json
 import os
 import threading
 import time
+import uuid
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -12,6 +15,7 @@ from huggingface_hub import scan_cache_dir, try_to_load_from_cache
 import config
 import jlens
 from core.lens_manager import ActivationCatcher
+from core.model_session import GenerationContext, LoadedModelBundle, ModelSessionCoordinator, OperationConflict, OperationType
 
 SKIP_LOCAL_DIRS = {"vendor", "ui", "data", "hf_cache", "lenses", "core", "api", "scripts"}
 
@@ -19,6 +23,28 @@ SKIP_LOCAL_DIRS = {"vendor", "ui", "data", "hf_cache", "lenses", "core", "api", 
 # right one is their instruct sibling's, which shares the same tokenizer: so we
 # look it up on the Hub before any fallback.
 INSTRUCT_SIBLING_SUFFIXES = ("-Instruct", "-instruct", "-it", "-Chat", "-chat")
+
+
+def _intervention_provenance(snapshot):
+    if not isinstance(snapshot, Mapping):
+        return None
+    def clone_summary(items):
+        out = []
+        for item in items or ():
+            cloned = dict(item)
+            if cloned.get("layers") is not None:
+                cloned["layers"] = list(cloned["layers"])
+            out.append(cloned)
+        return out
+    return {
+        "revision": snapshot.get("revision"),
+        "mode": snapshot.get("mode"),
+        "scale": snapshot.get("scale"),
+        "model_session_id": snapshot.get("model_session_id"),
+        "lens_binding_id": snapshot.get("lens_binding_id"),
+        "summary": clone_summary(snapshot.get("summary")),
+        "active_summary": clone_summary(snapshot.get("active_summary")),
+    }
 
 # End-of-turn markers per model family; added to the stop tokens when they appear
 # in the applied template (useful when a base model is given an instruct template:
@@ -35,6 +61,22 @@ FALLBACK_CHAT_TEMPLATE = (
     "{% endif %}{% endfor %}"
     "{% if add_generation_prompt %}{{ 'Assistant:' }}{% endif %}"
 )
+
+
+@dataclass
+class GenerationAttemptOwner:
+    gen_id: int | None = None
+    generation_run_id: str | None = None
+    model_session_id: int | None = None
+    lens_binding_id: str | None = None
+
+    def record(self, *, gen_id, generation_run_id, model_session_id, lens_binding_id):
+        if self.gen_id is not None:
+            raise RuntimeError("generation attempt owner is already bound")
+        self.gen_id = int(gen_id)
+        self.generation_run_id = str(generation_run_id)
+        self.model_session_id = model_session_id
+        self.lens_binding_id = lens_binding_id
 
 
 def _extract_template(chat_template):
@@ -445,6 +487,37 @@ def _rebase_capability_meta(jl):
     return capabilities.legacy(profile, loaded=True)
 
 
+def _marker_prefix_suffix(text, markers):
+    """Longest non-empty decoded suffix that can still become a marker."""
+    limit = min(len(text), max((len(marker) for marker in markers), default=0))
+    for size in range(limit, 0, -1):
+        suffix = text[-size:]
+        if any(marker.startswith(suffix) and marker != suffix for marker in markers):
+            return suffix
+    return ""
+
+
+# Marker buffering is deliberately independent of the requested generation
+# length. Token count is the bound; a single decoded token may be arbitrarily
+# long while still ending in a live marker prefix.
+FALLBACK_MARKER_TOKEN_LIMIT = 32
+
+
+def _smallest_marker_tail_start(pending, tokenizer, markers):
+    """Return the latest whole-token boundary that may finish a marker."""
+    if not pending:
+        return 0
+    lower = max(0, len(pending) - FALLBACK_MARKER_TOKEN_LIMIT)
+    for index in range(len(pending) - 1, lower - 1, -1):
+        suffix_text = tokenizer.decode(
+            [item["token_id"] for item in pending[index:]],
+            skip_special_tokens=True,
+        )
+        if _marker_prefix_suffix(suffix_text, markers):
+            return index
+    return len(pending)
+
+
 class ModelManager:
     def __init__(self):
         self._lock = threading.Lock()
@@ -453,136 +526,217 @@ class ModelManager:
         self.jl = None
         self.meta = None
         self.capability_profile = None
-        self.busy = None
+        self.coordinator = ModelSessionCoordinator()
+        self.on_model_withdraw = None
+        self.on_model_transition_prepare = None
+        self.on_model_transition_rollback = None
+
+    @property
+    def busy(self):
+        return self.coordinator.busy
+
+    def _sync_from_bundle(self, bundle, *, prepared_meta=None):
+        if bundle is None:
+            self.hf_model = self.tokenizer = self.jl = self.meta = None
+            self.capability_profile = None
+            return
+        self.hf_model = bundle.hf_model
+        self.tokenizer = bundle.tokenizer
+        self.jl = bundle.jl
+        self.meta = prepared_meta
+        self.capability_profile = bundle.capability_profile
+
+    def session_snapshot(self):
+        return self.coordinator.snapshot()
 
     def list_models(self):
         return _local_models() + _registered_models() + _cached_models()
 
     def load(self, model_id, dtype, quant, device):
-        with self._lock:
-            self._unload_locked()
-            self.busy = "loading"
-            hf_model = tokenizer = None
-            try:
-                torch_dtype = torch.bfloat16 if dtype == "bf16" else torch.float16
-                source = resolve_source(model_id)
-                kwargs = {"dtype": torch_dtype}
-                if quant == "int8":
-                    kwargs["quantization_config"] = transformers.BitsAndBytesConfig(
-                        load_in_8bit=True
+        token = None
+        candidate = None
+        hf_model = tokenizer = jl = None
+        published = False
+        try:
+            token, snap = self.coordinator.acquire(OperationType.LOAD, include_bundle=False)
+            expected_session = snap.model_session_id
+            if snap.loaded:
+                intervention_record = None
+                if self.on_model_transition_prepare is not None:
+                    intervention_record = self.on_model_transition_prepare(expected_session + 1)
+                try:
+                    old_bundle, expected_session, _ = self.coordinator.withdraw_loaded(
+                        token, intervention_record=intervention_record
                     )
-                elif quant == "nf4":
-                    kwargs["quantization_config"] = transformers.BitsAndBytesConfig(
-                        load_in_4bit=True,
-                        bnb_4bit_quant_type="nf4",
-                        bnb_4bit_compute_dtype=torch_dtype,
-                        bnb_4bit_use_double_quant=True,
-                    )
-                kwargs["device_map"] = "auto" if device == "auto" else {"": device}
-                # model already present (HF cache or local folder) → load WITHOUT network:
-                # otherwise from_pretrained queries the Hub and fails offline, even if cached.
-                offline_ok = resolve_local_dir(model_id) is not None
-                if offline_ok:
-                    kwargs["local_files_only"] = True
-                tok_kwargs = {"local_files_only": True} if offline_ok else {}
-                started = time.perf_counter()
-                hf_model = transformers.AutoModelForCausalLM.from_pretrained(source, **kwargs)
-                tokenizer = transformers.AutoTokenizer.from_pretrained(source, **tok_kwargs)
-                # "base" models with no chat template: we fetch the real template from
-                # the Hub (instruct sibling with shared tokenizer), generic as a last resort
-                chat_template_source = None
-                if not getattr(tokenizer, "chat_template", None):
-                    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
-                    fetched, src = fetch_chat_template(
-                        model_id, token, revision=_resolve_revision(source)
-                    )
-                    if fetched:
-                        tokenizer.chat_template = fetched
-                        chat_template_source = src
-                    else:
-                        tokenizer.chat_template = FALLBACK_CHAT_TEMPLATE
-                        chat_template_source = "generic"
-                chat_template_fallback = chat_template_source == "generic"
-                hf_model.eval()
-                text_config = hf_model.config.get_text_config()
-                self.hf_model = hf_model
-                self.tokenizer = tokenizer
-                self.jl = jlens.from_hf(hf_model, tokenizer)
-                self.jl._jwash_declared_quant = quant
-                # Cache the authoritative fail-closed editing policy once.  In
-                # particular, global projection remains disabled for every topology.
-                from core.capabilities import build_profile, legacy, normalize_profile
-                self.capability_profile = build_profile(self.jl, quant)
-                capability_meta = legacy(self.capability_profile, loaded=True)
-                normalized_profile = normalize_profile(self.capability_profile)
-                self.meta = {
-                    "model_id": model_id,
-                    "revision": _resolve_revision(source),
-                    "dtype": dtype,
-                    "quant": quant,
-                    "device": device,
-                    "n_layers": text_config.num_hidden_layers,
-                    "d_model": text_config.hidden_size,
-                    "has_packed_read_parameters": (
-                        normalized_profile["has_packed_read_parameters"]
-                        if normalized_profile is not None else False
-                    ),
-                    # Includes legacy rebase_supported = safe readthrough support.
-                    **capability_meta,
-                    "chat_template_source": chat_template_source,
-                    "chat_template_fallback": chat_template_fallback,
-                    "load_seconds": round(time.perf_counter() - started, 1),
-                }
-                return self.meta
-            except Exception:
-                # failure (often OOM): drop any partial allocation and return the
-                # reserved blocks, otherwise they linger until the server restarts
-                self.hf_model = self.tokenizer = self.jl = self.meta = None
-                self.capability_profile = None
-                hf_model = None
-                tokenizer = None
+                except Exception:
+                    if self.on_model_transition_rollback is not None:
+                        self.on_model_transition_rollback()
+                    raise
+                with self._lock:
+                    self._sync_from_bundle(None)
+                del old_bundle
+                if self.on_model_withdraw is not None:
+                    self.on_model_withdraw(expected_session, token)
                 _free_cuda()
-                raise
-            finally:
-                self.busy = None
+            torch_dtype = torch.bfloat16 if dtype == "bf16" else torch.float16
+            source = resolve_source(model_id)
+            kwargs = {"dtype": torch_dtype}
+            if quant == "int8":
+                kwargs["quantization_config"] = transformers.BitsAndBytesConfig(load_in_8bit=True)
+            elif quant == "nf4":
+                kwargs["quantization_config"] = transformers.BitsAndBytesConfig(
+                    load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch_dtype, bnb_4bit_use_double_quant=True,
+                )
+            kwargs["device_map"] = "auto" if device == "auto" else {"": device}
+            offline_ok = resolve_local_dir(model_id) is not None
+            if offline_ok:
+                kwargs["local_files_only"] = True
+            tok_kwargs = {"local_files_only": True} if offline_ok else {}
+            started = time.perf_counter()
+            hf_model = transformers.AutoModelForCausalLM.from_pretrained(source, **kwargs)
+            tokenizer = transformers.AutoTokenizer.from_pretrained(source, **tok_kwargs)
+            chat_template_source = None
+            if not getattr(tokenizer, "chat_template", None):
+                token_env = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+                fetched, src = fetch_chat_template(model_id, token_env, revision=_resolve_revision(source))
+                if fetched:
+                    tokenizer.chat_template = fetched
+                    chat_template_source = src
+                else:
+                    tokenizer.chat_template = FALLBACK_CHAT_TEMPLATE
+                    chat_template_source = "generic"
+            chat_template_fallback = chat_template_source == "generic"
+            hf_model.eval()
+            text_config = hf_model.config.get_text_config()
+            jl = jlens.from_hf(hf_model, tokenizer)
+            jl._jwash_declared_quant = quant
+            from core.capabilities import build_profile, legacy, normalize_profile
+            capability_profile = build_profile(jl, quant)
+            capability_meta = legacy(capability_profile, loaded=True)
+            normalized_profile = normalize_profile(capability_profile)
+            meta = {
+                "model_id": model_id, "revision": _resolve_revision(source),
+                "dtype": dtype, "quant": quant, "device": device,
+                "n_layers": text_config.num_hidden_layers, "d_model": text_config.hidden_size,
+                "has_packed_read_parameters": (normalized_profile["has_packed_read_parameters"] if normalized_profile is not None else False),
+                **capability_meta,
+                "chat_template_source": chat_template_source,
+                "chat_template_fallback": chat_template_fallback,
+                "load_seconds": round(time.perf_counter() - started, 1),
+            }
+            candidate = LoadedModelBundle.from_parts(hf_model, tokenizer, jl, meta, capability_profile)
+            prepared_meta = dict(candidate.meta)
+            result = dict(prepared_meta)
+            self.coordinator.publish_loaded(token, candidate, expected_unloaded_session=expected_session)
+            published = True
+            with self._lock:
+                self._sync_from_bundle(candidate, prepared_meta=prepared_meta)
+            prepared_meta = None
+            candidate = hf_model = tokenizer = jl = None
+            return result
+        except OperationConflict:
+            raise
+        except Exception as exc:
+            failure_message = str(exc)
+            try:
+                exc.__traceback__ = None
+                exc.__context__ = None
+                exc.__cause__ = None
+            except Exception:
+                pass
+            if not published:
+                candidate = None
+                hf_model = tokenizer = jl = None
+                _free_cuda()
+            raise RuntimeError(failure_message) from None
+        finally:
+            if token is not None:
+                self.coordinator.release(token)
 
     def unload(self):
-        with self._lock:
-            return self._unload_locked()
+        token = None
+        try:
+            token, _snap = self.coordinator.acquire(OperationType.UNLOAD, include_bundle=False)
+            return self._unload_locked(token=token)
+        finally:
+            if token is not None:
+                self.coordinator.release(token)
 
-    def _unload_locked(self):
-        if self.hf_model is None:
-            self.tokenizer = self.jl = self.meta = None
-            self.capability_profile = None
-            return {"unloaded": False, "vram_allocated": _torch_allocated()}
-        before = _torch_allocated()
-        self.hf_model = None
-        self.tokenizer = None
-        self.jl = None
-        self.meta = None
-        self.capability_profile = None
+    def _unload_locked(self, token=None):
+        try:
+            before = _torch_allocated()
+        except Exception:
+            before = None
+        intervention_record = None
+        if self.coordinator.snapshot(include_bundle=False).loaded and self.on_model_transition_prepare is not None:
+            intervention_record = self.on_model_transition_prepare(self.coordinator.snapshot(include_bundle=False).model_session_id + 1)
+        try:
+            old, session_id, changed = self.coordinator.withdraw_loaded(token, intervention_record=intervention_record)
+        except Exception:
+            if self.on_model_transition_rollback is not None:
+                self.on_model_transition_rollback()
+            raise
+        if not changed:
+            with self._lock:
+                self._sync_from_bundle(None)
+            try:
+                allocated = _torch_allocated()
+            except Exception:
+                allocated = None
+            return {"unloaded": False, "vram_allocated": allocated}
+        with self._lock:
+            self._sync_from_bundle(None)
+        old = None
+        if self.on_model_withdraw is not None:
+            self.on_model_withdraw(session_id, token)
         _free_cuda()
+        try:
+            allocated_after = _torch_allocated()
+        except Exception:
+            allocated_after = None
+        try:
+            reserved_after = _torch_reserved()
+        except Exception:
+            reserved_after = None
         return {
             "unloaded": True,
             "vram_allocated_before": before,
-            "vram_allocated_after": _torch_allocated(),
-            "vram_reserved_after": _torch_reserved(),
+            "vram_allocated_after": allocated_after,
+            "vram_reserved_after": reserved_after,
         }
 
     @torch.no_grad()
     def generate(self, messages, sampling, stop_event, emit, lens=None, ablator=None,
-                 continue_final=False):
+                 continue_final=False, capture_full_input_frames=False,
+                 defer_lens_publication=False, attempt_owner=None):
         """``continue_final=True``: the last message is an assistant reply to
         EXTEND — the template leaves its turn open instead of starting a new
         one, and the model picks up where it stopped."""
-        hf_model, tokenizer = self.hf_model, self.tokenizer
-        self.busy = "generating"
+        if isinstance(lens, GenerationContext):
+            context = lens
+            hf_model, tokenizer = context.hf_model, context.tokenizer
+            jl = context.jl
+            meta = dict(context.meta)
+            lens = context.lens
+            ablator_snapshot = context.intervention_snapshot
+            intervention_provenance = _intervention_provenance(ablator_snapshot)
+            stop_event = context.stop_event
+        else:
+            context = None
+            hf_model, tokenizer = self.hf_model, self.tokenizer
+            jl = self.jl
+            meta = self.meta or {}
+            ablator_snapshot = None
+            intervention_provenance = None
         reader = None
+        attachment = None
         ok = False
+        lens_attempt_resolved = False
         try:
             if ablator is not None:
-                ablator.attach(self.jl)
-            is_gpt_oss = "gpt-oss" in (self.meta or {}).get("model_id", "").lower()
+                attachment = ablator.attach(jl, snapshot=ablator_snapshot)
+            is_gpt_oss = "gpt-oss" in (meta or {}).get("model_id", "").lower()
             template_kwargs = {}
             if is_gpt_oss:
                 # harmony format: the system slot always carries an identity —
@@ -621,10 +775,20 @@ class ModelManager:
 
             read_from = 0
             gen_id = None
+            generation_run_id = uuid.uuid4().hex
             if lens is not None and lens.lens is not None:
-                reader = ActivationCatcher(self.jl.layers, lens.layers)
-                gen_id = lens.start_gen()
-                if len(messages) > 1 and any(m["role"] != "system" for m in messages[:-1]):
+                reader = ActivationCatcher(jl.layers, lens.layers)
+                gen_id = lens.start_gen(
+                    generation_run_id=generation_run_id, provisional=True,
+                )
+                if attempt_owner is not None:
+                    attempt_owner.record(
+                        gen_id=gen_id,
+                        generation_run_id=generation_run_id,
+                        model_session_id=lens.model_session_id,
+                        lens_binding_id=lens.binding_id,
+                    )
+                if not capture_full_input_frames and len(messages) > 1 and any(m["role"] != "system" for m in messages[:-1]):
                     prev = tokenizer.apply_chat_template(
                         messages[:-1],
                         add_generation_prompt=False,
@@ -649,9 +813,10 @@ class ModelManager:
             # turns, so we cut as soon as it reopens one (User: or a new Assistant:)
             stop_seqs = (
                 ["\nUser:", "\nAssistant:"]
-                if (self.meta or {}).get("chat_template_fallback")
+                if (meta or {}).get("chat_template_fallback")
                 else []
             )
+            hidden_special_ids = set(getattr(tokenizer, "all_special_ids", ()) or ())
 
             out = hf_model(input_ids=input_ids, use_cache=True)
             cache = out.past_key_values
@@ -690,38 +855,83 @@ class ModelManager:
                     reader.acts,
                     positions,
                     "reading",
-                    self.jl,
+                    jl,
                     input_ids[0, read_from:].tolist(),
                     gen_id=gen_id,
                 )
                 for frame in reading_frames:
+                    frame["generation_run_id"] = generation_run_id
                     emit(frame)
 
             reply_ids = []
+            reply_positions = []
+            pending = []
+            retained_generation_frames = []
             emitted = ""
+            stop_reason = None
             started = time.perf_counter()
             penalty_ids = input_ids[0].to(logits.device) if repetition_penalty != 1.0 else None
             for _ in range(max_tokens):
+                assert len(pending) <= FALLBACK_MARKER_TOKEN_LIMIT
                 if stop_event.is_set():
                     break
                 next_id = _sample(logits[0].float(), temperature, top_p, top_k, generator,
                                   repetition_penalty, penalty_ids)
                 if next_id in eos_ids:
+                    stop_reason = "eos"
                     break
-                reply_ids.append(next_id)
+                if next_id in hidden_special_ids:
+                    stop_reason = "hidden_special_token"
+                    break
+                absolute_pos = input_ids.shape[1] + len(reply_ids) + len(pending)
+                if len(pending) == FALLBACK_MARKER_TOKEN_LIMIT:
+                    # Conservative overflow policy: the earliest whole token is
+                    # confirmed and flushed before admitting the incoming token.
+                    # Supported role markers cannot require this many tokens;
+                    # importantly, confirmed content is never discarded.
+                    earliest = pending.pop(0)
+                    reply_ids.append(earliest["token_id"])
+                    reply_positions.append(earliest["pos"])
+                    if earliest["frame"] is not None:
+                        if stop_seqs:
+                            retained_generation_frames.append(earliest["frame"])
+                        else:
+                            emit(earliest["frame"])
+                pending.append({"token_id": next_id, "pos": absolute_pos, "frame": None})
+                assert len(pending) <= FALLBACK_MARKER_TOKEN_LIMIT
+                # ``pending`` is kept at a fixed size below; decoding it can
+                # therefore never grow with max_tokens.
+                pending_text = tokenizer.decode(
+                    [item["token_id"] for item in pending], skip_special_tokens=True
+                )
+                matched_marker = next((marker for marker in stop_seqs if pending_text.endswith(marker)), None)
+                if matched_marker is not None:
+                    marker_tokens = len(pending)
+                    for suffix_len in range(1, len(pending) + 1):
+                        suffix_text = tokenizer.decode(
+                            [item["token_id"] for item in pending[-suffix_len:]],
+                            skip_special_tokens=True,
+                        )
+                        if suffix_text.endswith(matched_marker):
+                            marker_tokens = suffix_len
+                            break
+                    del pending[-marker_tokens:]
+                    # Any earlier pending entries are confirmed ordinary text.
+                    for item in pending:
+                        reply_ids.append(item["token_id"])
+                        reply_positions.append(item["pos"])
+                        if item["frame"] is not None:
+                            if stop_seqs:
+                                retained_generation_frames.append(item["frame"])
+                            else:
+                                emit(item["frame"])
+                    pending.clear()
+                    stop_reason = "fallback_stop_sequence"
+                    break
                 if penalty_ids is not None:
                     penalty_ids = torch.cat(
                         [penalty_ids, torch.tensor([next_id], device=penalty_ids.device)]
                     )
-                text = tokenizer.decode(reply_ids, skip_special_tokens=True)
-                stop_hit = next((s for s in stop_seqs if s in text), None)
-                if stop_hit:
-                    text = text[: text.index(stop_hit)]
-                if not text.endswith("�") and len(text) > len(emitted):
-                    emit({"type": "token", "text": text[len(emitted):]})
-                    emitted = text
-                if stop_hit:
-                    break
                 out = hf_model(
                     input_ids=torch.tensor([[next_id]], device=_input_device(hf_model)),
                     past_key_values=cache,
@@ -734,58 +944,163 @@ class ModelManager:
                         reader.acts,
                         [-1],
                         "thinking",
-                        self.jl,
+                        jl,
                         [next_id],
                         gen_id=gen_id,
-                        abs_positions=[input_ids.shape[1] + len(reply_ids) - 1],
+                        abs_positions=[absolute_pos],
                     )[0]
-                    emit(frame)
+                    frame["generation_run_id"] = generation_run_id
+                    pending[-1]["frame"] = frame
+
+                # Keep only the smallest whole-token suffix whose decoded tail
+                # can still become a marker.  A token containing visible text
+                # plus a marker prefix remains wholly undecided.
+                keep_from = _smallest_marker_tail_start(
+                    pending, tokenizer, stop_seqs
+                )
+                # This is a hard safety bound, not a truncation policy: entries
+                # outside it are confirmed and flushed with their frames.
+                keep_from = max(
+                    keep_from, len(pending) - FALLBACK_MARKER_TOKEN_LIMIT
+                )
+                confirmed, pending = pending[:keep_from], pending[keep_from:]
+                assert len(pending) <= FALLBACK_MARKER_TOKEN_LIMIT
+                for item in confirmed:
+                    reply_ids.append(item["token_id"])
+                    reply_positions.append(item["pos"])
+                    if item["frame"] is not None:
+                        if stop_seqs:
+                            retained_generation_frames.append(item["frame"])
+                        else:
+                            emit(item["frame"])
+                if confirmed and not stop_seqs:
+                    delta = tokenizer.decode(
+                        [item["token_id"] for item in confirmed],
+                        skip_special_tokens=True,
+                    )
+                    if delta and not delta.endswith("�"):
+                        emit({"type": "token", "text": delta})
+                        emitted += delta
 
             elapsed = time.perf_counter() - started
-            text = tokenizer.decode(reply_ids, skip_special_tokens=True)
-            for s in stop_seqs:
-                if s in text:
-                    text = text[: text.index(s)]
-                    break
+            # A possible marker prefix is never promoted at cancellation or the
+            # token limit.  Otherwise the bounded tail is confirmed wholesale.
+            pending_text = tokenizer.decode(
+                [item["token_id"] for item in pending], skip_special_tokens=True
+            ) if pending else ""
+            if pending and not _marker_prefix_suffix(pending_text, stop_seqs):
+                for item in pending:
+                    reply_ids.append(item["token_id"])
+                    reply_positions.append(item["pos"])
+                    if item["frame"] is not None:
+                        if stop_seqs:
+                            retained_generation_frames.append(item["frame"])
+                        else:
+                            emit(item["frame"])
+            pending.clear()
+            durable_reply_ids = tuple(int(token_id) for token_id in reply_ids)
+            durable_reply_positions = tuple(int(position) for position in reply_positions)
+            if len(durable_reply_positions) != len(durable_reply_ids):
+                raise RuntimeError("retained generated token positions are not aligned")
+            if gen_id is not None:
+                lens.finalize_gen(
+                    gen_id,
+                    retained_thinking=tuple(zip(durable_reply_positions, durable_reply_ids)),
+                    publish=not defer_lens_publication,
+                )
+                lens_attempt_resolved = not defer_lens_publication
+            text = tokenizer.decode(durable_reply_ids, skip_special_tokens=True)
+            durable_reply_tokens = len(durable_reply_ids)
+            if stop_seqs:
+                if text:
+                    emit({"type": "token", "text": text})
+                    emitted = text
+            elif not text.endswith("�") and len(text) > len(emitted):
+                emit({"type": "token", "text": text[len(emitted):]})
+                emitted = text
+            if stop_seqs:
+                for frame in sorted(retained_generation_frames, key=lambda item: item["pos"]):
+                    emit(frame)
+                retained_generation_frames.clear()
+            suffix_start_pos = int(input_ids.shape[1])
             emit(
                 {
                     "type": "done",
                     "text": text,
                     "gen_id": gen_id,
+                    "generation_run_id": generation_run_id,
+                    "pin_publication_state": (
+                        "pending" if gen_id is not None and defer_lens_publication
+                        else "published" if gen_id is not None else "unavailable"
+                    ),
+                    "durable_reply_token_ids": list(durable_reply_ids),
+                    "durable_generated_token_count": durable_reply_tokens,
+                    "stop_reason": stop_reason or ("cancelled" if stop_event.is_set() else "max_tokens"),
+                    "generated_token_start_pos": suffix_start_pos,
+                    "generated_token_end_pos": suffix_start_pos + durable_reply_tokens,
+                    "continuation_suffix_start_pos": suffix_start_pos if continue_final else None,
+                    "continuation_suffix_end_pos": (
+                        suffix_start_pos + durable_reply_tokens if continue_final else None
+                    ),
                     "stopped": stop_event.is_set(),
                     "stats": {
-                        "tokens": len(reply_ids),
+                        "tokens": durable_reply_tokens,
                         "seconds": round(elapsed, 2),
-                        "tok_per_s": round(len(reply_ids) / elapsed, 2) if reply_ids and elapsed > 0 else 0.0,
+                        "tok_per_s": round(durable_reply_tokens / elapsed, 2) if durable_reply_tokens and elapsed > 0 else 0.0,
                     },
                     "meta": dict(
-                        self.meta or {},
+                        meta or {},
                         sampling=sampling,
                         lens=dict(lens.meta) if lens is not None and lens.meta else None,
-                        interventions=ablator.summary() if ablator is not None else None,
-                        interventions_scale=ablator.global_scale if ablator is not None else None,
+                        interventions=intervention_provenance["summary"] if intervention_provenance is not None else (ablator.summary() if ablator is not None else None),
+                        interventions_scale=intervention_provenance["scale"] if intervention_provenance is not None else (ablator.global_scale if ablator is not None else None),
+                        interventions_revision=intervention_provenance["revision"] if intervention_provenance is not None else None,
+                        interventions_mode=intervention_provenance["mode"] if intervention_provenance is not None else None,
+                        interventions_model_session_id=intervention_provenance["model_session_id"] if intervention_provenance is not None else None,
+                        interventions_lens_binding_id=intervention_provenance["lens_binding_id"] if intervention_provenance is not None else None,
+                        interventions_active_summary=intervention_provenance["active_summary"] if intervention_provenance is not None else None,
+                        intervention_provenance=intervention_provenance,
+                        model_session_id=context.model_session_id if context is not None else None,
+                        generation_run_id=generation_run_id,
                     ),
                 }
             )
             ok = True
         finally:
-            if ablator is not None:
-                ablator.detach()
+            cleanup_error = None
+            if gen_id is not None and not ok and not lens_attempt_resolved:
+                try:
+                    lens.discard_gen(gen_id)
+                    lens_attempt_resolved = True
+                except Exception as exc:
+                    cleanup_error = cleanup_error or exc
+            if attachment is not None:
+                try:
+                    attachment.close()
+                except Exception as exc:
+                    cleanup_error = cleanup_error or exc
             if reader is not None:
-                reader.close()
-            self.busy = None
+                try:
+                    reader.close()
+                except Exception as exc:
+                    cleanup_error = cleanup_error or exc
             # aborted generation (OOM/error/hard stop): the KV cache and captured
             # activations are now dereferenced — return the blocks
-            if not ok:
-                _free_cuda()
-            elif torch.cuda.is_available():
-                # success path: when the device is nearly full (big model + long
-                # KV cache), the freed cache fragments the reserve and the next
-                # prefill hits costly allocator retries — generation gets slower
-                # with every message. Hand segments back once the reserve crosses
-                # 92 % of the device; a no-op (no sync, no gc) below that.
-                for i in range(torch.cuda.device_count()):
-                    total = torch.cuda.get_device_properties(i).total_memory
-                    if torch.cuda.memory_reserved(i) > 0.92 * total:
-                        with torch.cuda.device(i):
-                            torch.cuda.empty_cache()
+            try:
+                if not ok:
+                    _free_cuda()
+                elif torch.cuda.is_available():
+                    # success path: when the device is nearly full (big model + long
+                    # KV cache), the freed cache fragments the reserve and the next
+                    # prefill hits costly allocator retries — generation gets slower
+                    # with every message. Hand segments back once the reserve crosses
+                    # 92 % of the device; a no-op (no sync, no gc) below that.
+                    for i in range(torch.cuda.device_count()):
+                        total = torch.cuda.get_device_properties(i).total_memory
+                        if torch.cuda.memory_reserved(i) > 0.92 * total:
+                            with torch.cuda.device(i):
+                                torch.cuda.empty_cache()
+            except Exception as exc:
+                cleanup_error = cleanup_error or exc
+            if cleanup_error is not None:
+                raise cleanup_error

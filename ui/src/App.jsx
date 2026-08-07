@@ -4,6 +4,7 @@ import DOMPurify from 'dompurify'
 import LensView from './LensView.jsx'
 import LensDiff from './Diff.jsx'
 import Editor from './Editor.jsx'
+import { applyGenerationTerminal, frameArchivePinIdentity, generationPinIdentity } from './continuationState.js'
 import { fmtTok } from './tok'
 
 const GB = 2 ** 30
@@ -366,7 +367,7 @@ export default function App() {
     jsonFetch(`/api/messages/${mid}/frames`)
       .then((body) => {
         if (body.frames?.length) {
-          setMessages((prev) => prev.map((x) => (x.id === mid ? { ...x, frames: body.frames } : x)))
+          setMessages((prev) => prev.map((x) => (x.id === mid ? { ...x, frames: body.frames, ...frameArchivePinIdentity(body) } : x)))
         }
       })
       .catch(() => {})
@@ -464,42 +465,31 @@ export default function App() {
       framesRef.current = []
       setFramesCount(0)
       setSelectedIdx(null)
-      if (frame.continued && frame.message_id != null) {
-        // continuation: update the extended reply in place (frame.text is the
-        // FULL new content) and reload its merged frames blob
+      if (frame.continuation_noop) {
         continuingIdRef.current = null
         setContinuingId(null)
-        setMessages((prev) => prev.map((m) => (m.id === frame.message_id
-          ? {
-              ...m, content: frame.text, stats: frame.stats,
-              gen_id: frame.gen_id, has_frames: m.has_frames || frames.length > 0,
-              frames: undefined,
-            }
-          : m)))
+        setMessages((prev) => applyGenerationTerminal(prev, frame, frames).messages)
+      } else if (frame.continued && frame.message_id != null) {
+        // Continuation text is the generated suffix; content is the complete
+        // durable assistant value used for the in-place update.
+        continuingIdRef.current = null
+        setContinuingId(null)
+        setMessages((prev) => applyGenerationTerminal(prev, frame, frames).messages)
         framesTriedRef.current.delete(frame.message_id)
         jsonFetch(`/api/messages/${frame.message_id}/frames`)
           .then((body) => {
             if (body.frames?.length) {
               setMessages((prev) => prev.map((x) => (x.id === frame.message_id
-                ? { ...x, frames: body.frames } : x)))
+                ? { ...x, frames: body.frames, ...frameArchivePinIdentity(body) } : x)))
             }
           })
           .catch(() => {})
       } else {
-        setMessages((prev) => [...prev, {
-          id: frame.message_id ?? null,
-          role: 'assistant',
-          content: frame.text,
-          meta: frame.meta,
-          stats: frame.stats,
-          gen_id: frame.gen_id,
-          has_frames: frames.length > 0,
-          frames,
-        }])
+        setMessages((prev) => applyGenerationTerminal(prev, frame, frames).messages)
       }
       draftRef.current = ''
       setDraft(null)
-      if (!frame.text && !frame.continued) {
+      if (!frame.text && !frame.continued && !frame.continuation_noop) {
         setNotice({
           kind: 'err',
           text: 'the model emitted end-of-turn immediately (0 tokens) — strong '
@@ -693,7 +683,7 @@ export default function App() {
     if (m.has_frames && !m.frames?.length && m.id != null) {
       try {
         const body = await jsonFetch(`/api/messages/${m.id}/frames`)
-        setMessages((prev) => prev.map((x, j) => (j === i ? { ...x, frames: body.frames } : x)))
+        setMessages((prev) => prev.map((x, j) => (j === i ? { ...x, frames: body.frames, ...frameArchivePinIdentity(body) } : x)))
       } catch (err) {
         setNotice({ kind: 'err', text: String(err.message || err) })
         return
@@ -845,11 +835,12 @@ export default function App() {
     // gen_id is only known for messages generated THIS page session; after a
     // reload, fall back to the id carried by the persisted frames themselves —
     // the server-side residual store survives a page refresh.
-    const msgGen = idx >= 0
-      ? messages[idx].gen_id ?? messages[idx].frames[messages[idx].frames.length - 1]?.gen ?? null
-      : null
-    const genId = live ? live[live.length - 1]?.gen ?? null : msgGen
-    return { live, idx, genId }
+    const pin = generationPinIdentity(idx >= 0 ? messages[idx] : null)
+    const msgGen = pin.gen_id
+    const genId = live ? null : msgGen
+    const msgRunId = pin.generation_run_id
+    const generationRunId = live ? null : msgRunId
+    return { live, idx, genId, generationRunId }
   }
 
   async function applyCapture() {
@@ -1708,7 +1699,7 @@ export default function App() {
             onClose={() => setDiffSel([])}
           />
         ) : lensMeta && lensOn || messages.some((m) => m.frames?.length) ? (() => {
-          const { live, idx, genId: viewGen } = currentGenView()
+          const { live, idx, genId: viewGen, generationRunId: viewRunId } = currentGenView()
           const viewFrames = live || (idx >= 0 ? messages[idx].frames : [])
           // keep LensView MOUNTED even with no frames (it renders an empty
           // shell): unmounting here would wipe the pinned tokens, e.g. while
@@ -1723,6 +1714,7 @@ export default function App() {
                 frames={viewFrames}
                 tick={`${framesCount}-${messages.length}-${idx}`}
                 genId={viewGen ?? null}
+                generationRunId={viewRunId ?? null}
                 lensMeta={lensMeta}
                 hidden={hidden}
                 onHideToken={hideToken}
@@ -1790,6 +1782,7 @@ export default function App() {
         lensMeta={lensMeta}
         nLayers={status?.loaded?.n_layers}
         genId={currentGenView().genId}
+        generationRunId={currentGenView().generationRunId}
         busy={busy}
         prefill={editorPrefill}
         onPrefillConsumed={() => setEditorPrefill(null)}

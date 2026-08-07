@@ -1,0 +1,3760 @@
+import json
+import asyncio
+import threading
+import weakref
+from types import SimpleNamespace
+
+import pytest
+
+from core.ablation import HookAttachment
+from core.editing import PublicationCancelled, PublicationGate
+from core.model_session import (
+    LoadedModelBundle,
+    ModelSessionCoordinator,
+    OperationConflict,
+    OperationType,
+)
+
+
+class Handle:
+    def __init__(self, seen, name, fail=False):
+        self.seen = seen
+        self.name = name
+        self.fail = fail
+        self.removed = 0
+
+    def remove(self):
+        self.removed += 1
+        self.seen.append(self.name)
+        if self.fail:
+            raise RuntimeError(self.name)
+
+
+def test_generation_versus_unload_conflict_event_driven():
+    c = ModelSessionCoordinator()
+    load, snap = c.acquire(OperationType.LOAD)
+    c.publish_loaded(load, __import__("core.model_session", fromlist=["LoadedModelBundle"]).LoadedModelBundle.from_parts(object(), object(), object(), {}, None), expected_unloaded_session=snap.model_session_id)
+    c.release(load)
+    acquired = threading.Event()
+    release = threading.Event()
+    errors = []
+
+    def worker():
+        token, _ = c.acquire(OperationType.GENERATE, requires_loaded=True)
+        acquired.set()
+        assert release.wait(2), "generation release phase blocked"
+        c.release(token)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    assert acquired.wait(2), "generation acquisition phase blocked"
+    try:
+        c.acquire(OperationType.UNLOAD)
+    except OperationConflict as exc:
+        errors.append(str(exc))
+    release.set()
+    thread.join(2)
+    assert not thread.is_alive(), "generation worker did not terminate after release phase"
+    assert errors and "generate" in errors[0]
+
+
+def test_cancellation_before_and_after_claim():
+    c = ModelSessionCoordinator()
+    token, _ = c.acquire(OperationType.GENERATE)
+    assert c.release(token)
+    assert not c.request_cancel(token)
+
+    token, _ = c.acquire(OperationType.GENERATE)
+    assert c.request_cancel(token)
+    assert c.snapshot().operation.cancellation_requested is True
+    assert c.release(token)
+
+
+def test_hook_attachment_owns_only_its_handles_and_is_idempotent():
+    seen = []
+    a1 = Handle(seen, "a1")
+    a2 = Handle(seen, "a2")
+    b = Handle(seen, "b")
+    attach_a = HookAttachment([a1, a2])
+    attach_b = HookAttachment([b])
+    attach_a.close()
+    attach_a.close()
+    assert seen == ["a1", "a2"]
+    assert b.removed == 0
+    attach_b.close()
+    assert seen == ["a1", "a2", "b"]
+
+
+def test_hook_attachment_attempts_every_removal():
+    seen = []
+    attachment = HookAttachment([Handle(seen, "first", fail=True), Handle(seen, "second")])
+    try:
+        attachment.close()
+    except RuntimeError as exc:
+        assert str(exc) == "first"
+    assert seen == ["first", "second"]
+
+
+def test_generation_cleanup_preserves_coordinator_and_successor_owner():
+    c = ModelSessionCoordinator()
+    before = c
+    token, _ = c.acquire(OperationType.GENERATE)
+    assert c.release(token)
+    successor, _ = c.acquire(OperationType.UNLOAD)
+    # A stale generation finalizer must not clear a successor or replace the coordinator.
+    assert c.release(token) is False
+    assert before is c
+    assert c.snapshot().operation.id == successor.id
+    assert c.release(successor)
+
+
+def test_dispatch_cancellation_before_claim_releases_without_worker_ownership():
+    from core.model_session import WorkerDispatch
+    c = ModelSessionCoordinator()
+    token, _ = c.acquire(OperationType.GENERATE)
+    dispatch = WorkerDispatch(c, token)
+    assert dispatch.cancel_from_awaiter() is True
+    assert dispatch.claim() is False
+    assert c.snapshot().operation is None
+
+
+def test_dispatch_cancellation_after_claim_leaves_release_to_worker():
+    from core.model_session import WorkerDispatch
+    c = ModelSessionCoordinator()
+    token, _ = c.acquire(OperationType.GENERATE)
+    dispatch = WorkerDispatch(c, token)
+    assert dispatch.claim() is True
+    assert dispatch.cancel_from_awaiter() is False
+    assert c.snapshot().operation.id == token.id
+    assert c.snapshot().operation.cancellation_requested is True
+    assert dispatch.release_from_worker() is True
+
+
+def test_operation_handoff_factory_failure_releases_unclaimed_dispatch():
+    from api import app
+    from core.model_session import WorkerDispatch
+
+    async def scenario():
+        c = ModelSessionCoordinator()
+        token, _ = c.acquire(OperationType.GENERATE)
+        stop_event = threading.Event()
+        dispatch = WorkerDispatch(c, token, stop_event)
+        handoff = app.OperationHandoff(c, token, stop_event)
+        handoff.set_dispatch(dispatch)
+        with pytest.raises(RuntimeError):
+            await handoff.create_thread_task(lambda: (_ for _ in ()).throw(RuntimeError("factory")))
+        assert c.snapshot().operation is None
+        successor, _ = c.acquire(OperationType.UNLOAD)
+        assert c.release(successor)
+
+    asyncio.run(scenario())
+
+
+def test_operation_handoff_closes_unsubmitted_to_thread_wrapper(monkeypatch, recwarn):
+    from api import app
+    from core.model_session import WorkerDispatch
+
+    async def scenario():
+        c = ModelSessionCoordinator()
+        token, _ = c.acquire(OperationType.GENERATE)
+        stop_event = threading.Event()
+        dispatch = WorkerDispatch(c, token, stop_event)
+        handoff = app.OperationHandoff(c, token, stop_event)
+        handoff.set_dispatch(dispatch)
+        wrapper_closed = {"value": False}
+
+        class Wrapper:
+            def close(self):
+                wrapper_closed["value"] = True
+
+        monkeypatch.setattr(app.asyncio, "to_thread", lambda worker: Wrapper())
+        def fail_create_task(_wrapper):
+            raise RuntimeError("task creation failed")
+        monkeypatch.setattr(app.asyncio, "create_task", fail_create_task)
+
+        with pytest.raises(RuntimeError):
+            await handoff.create_thread_task(lambda: (lambda: None))
+        assert wrapper_closed["value"]
+        assert c.snapshot().operation is None
+
+    asyncio.run(scenario())
+    import gc
+    gc.collect()
+    assert not [
+        warning for warning in recwarn
+        if issubclass(warning.category, RuntimeWarning)
+        and "was never awaited" in str(warning.message)
+    ]
+
+
+def test_cleanup_yield_does_not_create_a_child_task(monkeypatch):
+    from api import app
+
+    async def scenario():
+        monkeypatch.setattr(
+            app.asyncio,
+            "create_task",
+            lambda _awaitable: (_ for _ in ()).throw(
+                AssertionError("cleanup yield must not create a child task")
+            ),
+        )
+        assert await app._cleanup_yield() is False
+
+    asyncio.run(scenario())
+
+
+def test_cleanup_yield_remembers_cancellation_until_a_successful_yield(monkeypatch):
+    from api import app
+
+    async def scenario():
+        original_sleep = app.asyncio.sleep
+        attempts = 0
+
+        async def cancel_once(delay):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise asyncio.CancelledError()
+            await original_sleep(delay)
+
+        monkeypatch.setattr(app.asyncio, "sleep", cancel_once)
+        assert await app._cleanup_yield() is True
+        assert attempts == 2
+
+    asyncio.run(scenario())
+
+
+def test_handoff_awaiter_scope_closes_on_base_exception():
+    from api import app
+
+    async def scenario():
+        coordinator = ModelSessionCoordinator()
+        handoff = app.OperationHandoff(coordinator, stop_event=threading.Event())
+        handoff.acquire(OperationType.MODEL_DELETE, include_bundle=False)
+        with pytest.raises(KeyboardInterrupt):
+            async with handoff.awaiter_scope():
+                raise KeyboardInterrupt("setup failed")
+        assert handoff.closed
+        assert coordinator.snapshot().operation is None
+        successor, _ = coordinator.acquire(OperationType.MODEL_DELETE, include_bundle=False)
+        coordinator.release(successor)
+
+    asyncio.run(scenario())
+
+
+def test_handoff_acquire_scope_owns_cleanup_before_snapshot_publication():
+    from api import app
+
+    async def scenario():
+        coordinator = ModelSessionCoordinator()
+        with pytest.raises(RuntimeError):
+            async with app.OperationHandoff.acquire_scope(
+                coordinator, OperationType.MODEL_DELETE, include_bundle=False,
+            ) as lease:
+                assert lease.snapshot is not None
+                raise RuntimeError("setup")
+        assert coordinator.snapshot().operation is None
+
+    asyncio.run(scenario())
+
+
+def test_handoff_cleanup_task_creation_failure_falls_back_inline(monkeypatch):
+    from api import app
+
+    async def scenario():
+        coordinator = ModelSessionCoordinator()
+        real_create_task = app.asyncio.create_task
+
+        def fail_once(coro):
+            monkeypatch.setattr(app.asyncio, "create_task", real_create_task)
+            raise RuntimeError("task allocation")
+
+        with pytest.raises(RuntimeError):
+            async with app.OperationHandoff.acquire_scope(
+                coordinator, OperationType.MODEL_DELETE, include_bundle=False,
+            ):
+                monkeypatch.setattr(app.asyncio, "create_task", fail_once)
+                raise RuntimeError("primary")
+        assert coordinator.snapshot().operation is None
+
+    asyncio.run(scenario())
+
+
+def test_ws_setup_conflict_before_scope_target_assignment_is_model_free(monkeypatch):
+    from contextlib import asynccontextmanager
+    from api import app
+
+    @asynccontextmanager
+    async def fail_before_yield(*_args, **_kwargs):
+        raise OperationConflict("busy")
+        yield
+
+    monkeypatch.setattr(app.OperationHandoff, "acquire_scope", fail_before_yield)
+    result = asyncio.run(app._setup_ws_worker({"messages": []}))
+    assert result == ("error", 409, "OperationConflict", "busy")
+
+
+def test_ws_setup_cancellation_before_scope_target_assignment_is_reraised(monkeypatch):
+    from contextlib import asynccontextmanager
+    from api import app
+
+    @asynccontextmanager
+    async def cancel_before_yield(*_args, **_kwargs):
+        raise asyncio.CancelledError()
+        yield
+
+    monkeypatch.setattr(app.OperationHandoff, "acquire_scope", cancel_before_yield)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(app._setup_ws_worker({"messages": []}))
+
+
+def test_worker_drain_closes_unsubmitted_drain_coroutine(monkeypatch):
+    from api import app
+
+    async def scenario():
+        worker = asyncio.create_task(asyncio.sleep(0))
+        captured = {}
+
+        def fail_create_task(coro):
+            captured["coro"] = coro
+            raise MemoryError("drain task allocation failed")
+
+        monkeypatch.setattr(app.asyncio, "create_task", fail_create_task)
+        result = await app._drain_worker_uninterruptibly(worker)
+        assert result == [None]
+        assert captured["coro"].cr_frame is None
+
+    asyncio.run(scenario())
+
+
+def test_ws_finalizer_continues_after_early_cleanup_base_exception(monkeypatch):
+    from api import app
+
+    async def scenario():
+        worker = asyncio.create_task(asyncio.sleep(0, result=app.WorkerOutcome()))
+        await worker
+        phases = []
+
+        async def fail_task_cleanup(_task):
+            phases.append("task_cleanup")
+            raise KeyboardInterrupt("cleanup injection")
+
+        async def record_drain(task):
+            phases.append("worker_drain")
+            return await asyncio.gather(task, return_exceptions=True)
+
+        class Dispatch:
+            def cancel_from_awaiter(self):
+                phases.append("dispatch_cancel")
+
+        monkeypatch.setattr(app, "_cancel_task_uninterruptibly", fail_task_cleanup)
+        monkeypatch.setattr(app, "_drain_worker_uninterruptibly", record_drain)
+        await app._finalize_ws_runtime(
+            object(), worker, object(), object(), threading.Event(), Dispatch(), True,
+        )
+        assert phases.count("task_cleanup") == 2
+        assert phases[-2:] == ["dispatch_cancel", "worker_drain"]
+
+    asyncio.run(scenario())
+
+
+def test_dispatched_routes_use_handoff_scope_and_factory_descriptors():
+    import inspect
+    from api import app
+
+    routes = (
+        app.api_delete_model, app.api_lens_load, app.api_edit_export,
+        app.api_edit_export_gguf, app.api_generate_sync,
+        app.api_token_neighbors, app.api_lens_pin, app._setup_ws_worker,
+    )
+    for route in routes:
+        source = inspect.getsource(route)
+        assert "OperationHandoff.acquire_scope(" in source
+        assert "handoff.acquire(" not in source
+        assert "async with handoff.awaiter_scope()" not in source
+        assert "manager.coordinator.acquire(" not in source
+        assert "manager.coordinator.release(" not in source
+        assert "create_thread_task(lambda" not in source
+
+
+def test_pin_missing_run_identity_is_rejected_before_handoff(monkeypatch):
+    from api import app
+
+    called = False
+
+    def forbidden(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("coordinator acquisition must not occur")
+
+    monkeypatch.setattr(app.manager.coordinator, "acquire", forbidden)
+    req = app.PinRequest(gen_id=1, token_ids=[1], generation_run_id=None)
+    with pytest.raises(app.HTTPException) as raised:
+        asyncio.run(app.api_lens_pin(req))
+    assert raised.value.status_code == 409
+    assert not called
+
+
+@pytest.mark.parametrize("run_id", [None, "", "A" * 32, "0" * 31, "g" * 32, 123])
+def test_pin_malformed_run_identity_is_rejected_before_handoff(monkeypatch, run_id):
+    from api import app
+
+    called = False
+
+    def forbidden(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("coordinator acquisition must not occur")
+
+    monkeypatch.setattr(app.manager.coordinator, "acquire", forbidden)
+    req = app.PinRequest.model_construct(gen_id=1, token_ids=[1], generation_run_id=run_id)
+    with pytest.raises(app.HTTPException) as raised:
+        asyncio.run(app.api_lens_pin(req))
+    assert raised.value.status_code == 409
+    assert not called
+
+
+def test_publication_gate_cancellation_wins_before_rename():
+    published = []
+    gate = PublicationGate(lambda: True)
+    assert gate.cancel() is True
+    try:
+        gate.publish(lambda: published.append("renamed"))
+    except PublicationCancelled:
+        pass
+    assert published == []
+    assert gate.state == "cancelled-before-publication"
+
+
+def test_publication_gate_rename_wins_before_cancellation():
+    published = []
+    gate = PublicationGate(lambda: True)
+    gate.publish(lambda: published.append("renamed"))
+    assert gate.cancel() is False
+    assert published == ["renamed"]
+    assert gate.state == "published"
+
+
+def test_dispatch_payload_cleared_on_cancellation_before_claim():
+    import weakref
+    from core.model_session import WorkerDispatch
+
+    class Payload:
+        pass
+
+    c = ModelSessionCoordinator()
+    token, _ = c.acquire(OperationType.GENERATE)
+    payload = Payload()
+    ref = weakref.ref(payload)
+    dispatch = WorkerDispatch(c, token, payload=payload)
+    del payload
+    assert dispatch.cancel_from_awaiter() is True
+    import gc
+    gc.collect()
+    assert ref() is None
+    assert c.snapshot().operation is None
+
+
+def test_intervention_update_invalid_replace_is_transactional():
+    import pytest
+    from core.ablation import Interventions
+
+    iv = Interventions()
+    iv._rules = [{
+        "id": 1, "token_id": 1, "token": "a", "mode": "scale", "factor": 0.0,
+        "replacement_id": None, "replacement": None, "layers": [0], "enabled": True,
+        "dirs_a": {0: object()}, "dirs_b": None,
+    }]
+    iv._revision = 1
+    before = iv.state_record()
+    with pytest.raises(ValueError, match="replacement_id required"):
+        iv.update(1, mode="replace", lens_manager=type("LM", (), {"lens": object()})(), jl=type("JL", (), {"tokenizer": object(), "layers": [object()], "_lm_head": None})())
+    assert iv.state_record() == before
+
+
+def test_lens_cleanup_clears_real_withdrawn_container_before_cuda_cleanup(monkeypatch):
+    import weakref
+    import gc
+    import core.lens_manager as lens_module
+    from core.lens_manager import LensManager
+
+    class TensorLike:
+        pass
+
+    lens = LensManager()
+    live = TensorLike()
+    lens.lens = TensorLike()
+    lens.mask = live
+    lens._J = TensorLike()
+    old = lens.withdraw()
+    mask_ref = weakref.ref(live)
+    seen = {}
+
+    def fake_empty_cache():
+        seen["during_cuda_keys"] = list(old.keys())
+
+    monkeypatch.setattr(lens_module.torch.cuda, "empty_cache", fake_empty_cache)
+    err = lens.cleanup_withdrawn(old)
+    del live
+    gc.collect()
+    assert err is None
+    assert old == {}
+    assert seen["during_cuda_keys"] == []
+    assert mask_ref() is None
+
+
+def test_model_transition_cleanup_does_not_restore_rules_after_publication_failure(monkeypatch):
+    from api import app
+
+    previous = app.interventions.state_record()
+    try:
+        app.interventions._rules = [{
+            "id": 1, "token_id": 1, "token": "a", "mode": "scale", "factor": 0.0,
+            "replacement_id": None, "replacement": None, "layers": [0], "enabled": True,
+            "dirs_a": {0: object()}, "dirs_b": None,
+        }]
+        app.interventions._revision = 1
+        app.interventions._scale = 2.5
+        app.interventions._mode = "readthrough"
+
+        prepared = app._prepare_model_transition_interventions(42)
+        assert prepared["rules"] == []
+        app._cleanup_model_bound_state(42, token=object())
+        snap = app.interventions.snapshot()
+        assert snap["rules"] == []
+        assert snap["active_rules"] == []
+        assert snap["scale"] == 2.5
+        assert snap["mode"] == "standard"
+    finally:
+        app.interventions.restore_state_record(previous)
+
+
+def test_http_generation_with_coordinated_mappingproxy_intervention(monkeypatch):
+    import asyncio
+    from types import MappingProxyType, SimpleNamespace
+    from api import app
+
+    class Layer:
+        def __init__(self):
+            self.handles = []
+
+        def register_forward_hook(self, hook):
+            handle = SimpleNamespace(remove=lambda: self.handles.remove(handle))
+            self.handles.append(handle)
+            return handle
+
+    class FakeJL:
+        def __init__(self):
+            self.layers = [Layer()]
+            self._jwash_declared_quant = None
+
+    coordinator = ModelSessionCoordinator()
+    monkeypatch.setattr(app.manager, "coordinator", coordinator)
+    jl = FakeJL()
+    token, snap = coordinator.acquire(OperationType.LOAD)
+    coordinator.publish_loaded(
+        token,
+        LoadedModelBundle.from_parts(object(), object(), jl, {"model_id": "m", "quant": None}, {"ok": True}),
+        expected_unloaded_session=snap.model_session_id,
+    )
+    coordinator.release(token)
+    direction = object()
+    rule = {
+        "id": 1, "token_id": 1, "token": "a", "mode": "scale", "factor": 0.0,
+        "replacement_id": None, "replacement": None, "layers": [0], "enabled": True,
+        "dirs_a": {0: direction}, "dirs_b": None,
+    }
+    coordinator.bootstrap_interventions_for_test({
+        "revision": 7,
+        "model_session_id": coordinator.status_snapshot().model_session_id,
+        "lens_binding_id": None,
+        "scale": 1.0,
+        "mode": "standard",
+        "rules": [rule],
+        "active_rules": [rule],
+        "summary": [rule],
+        "active_summary": [rule],
+    })
+
+    captured = {}
+
+    def fake_generate(_messages, _sampling, _stop_event, emit, lens=None, ablator=None):
+        attachment = ablator.attach(lens.jl, snapshot=lens.intervention_snapshot)
+        captured["snapshot_type"] = type(lens.intervention_snapshot)
+        captured["direction_identity"] = lens.intervention_snapshot["rules"][0]["dirs_a"][0]
+        attachment.close()
+        emit({"type": "done", "text": "ok", "stats": {"tokens": 0}})
+
+    monkeypatch.setattr(app.manager, "generate", fake_generate)
+    result = asyncio.run(app.api_generate_sync(SimpleNamespace(messages=[{"role": "user", "content": "hi"}], sampling={})))
+    assert result["text"] == "ok"
+    assert captured["snapshot_type"] is MappingProxyType
+    assert captured["direction_identity"] is direction
+    assert jl.layers[0].handles == []
+
+
+def test_http_generation_metadata_preserves_captured_intervention_provenance(monkeypatch):
+    import asyncio
+    import torch
+    from types import SimpleNamespace
+    from api import app
+    from core.model_session import LoadedModelBundle, ModelSessionCoordinator, OperationType
+
+    class FakeTokenizer:
+        chat_template = ""
+        unk_token_id = -1
+
+        def apply_chat_template(self, *args, **kwargs):
+            return torch.tensor([[1]])
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "ok" if ids else ""
+
+        def encode(self, *args, **kwargs):
+            return [1]
+
+        def convert_tokens_to_ids(self, _token):
+            return -1
+
+    class FakeModel:
+        generation_config = SimpleNamespace(eos_token_id=2)
+
+        def __init__(self):
+            self.config = SimpleNamespace(get_text_config=lambda: SimpleNamespace(num_hidden_layers=1, hidden_size=4))
+            self.emb = SimpleNamespace(weight=torch.zeros(4, 4))
+
+        def get_input_embeddings(self):
+            return self.emb
+
+        def __call__(self, **kwargs):
+            logits = torch.zeros(1, 1, 5)
+            logits[0, 0, 3] = 10
+            return SimpleNamespace(logits=logits, past_key_values=None)
+
+    class Layer:
+        def register_forward_hook(self, hook):
+            return SimpleNamespace(remove=lambda: None)
+
+    class FakeJL:
+        _jwash_declared_quant = None
+        layers = [Layer()]
+
+    coordinator = ModelSessionCoordinator()
+    monkeypatch.setattr(app.manager, "coordinator", coordinator)
+    monkeypatch.setattr(app.lens_manager, "snapshot_for_generation", lambda: None)
+    token, snap = coordinator.acquire(OperationType.LOAD)
+    coordinator.publish_loaded(
+        token,
+        LoadedModelBundle.from_parts(
+            FakeModel(), FakeTokenizer(), FakeJL(), {"model_id": "fake", "chat_template_fallback": False}, {"ok": True}
+        ),
+        expected_unloaded_session=snap.model_session_id,
+    )
+    coordinator.release(token)
+    session_id = coordinator.status_snapshot().model_session_id
+    coordinator.bootstrap_interventions_for_test({
+        "revision": 9,
+        "model_session_id": session_id,
+        "lens_binding_id": 3,
+        "scale": 2.0,
+        "mode": "readthrough",
+        "rules": [{"id": 1, "token_id": 1, "token": "a", "mode": "scale", "factor": 0.0, "layers": [], "enabled": False}],
+        "active_rules": [],
+        "summary": [{"id": 1, "token_id": 1, "token": "a", "mode": "scale", "factor": 0.0, "layers": [], "enabled": False}],
+        "active_summary": [],
+    })
+
+    result = asyncio.run(app.api_generate_sync(SimpleNamespace(
+        messages=[{"role": "user", "content": "hi"}],
+        sampling={"max_tokens": 1, "temperature": 0, "top_p": 1, "top_k": 0, "seed": -1},
+    )))
+    provenance = result["meta"]["intervention_provenance"]
+    assert provenance["revision"] == 9
+    assert provenance["mode"] == "readthrough"
+    assert provenance["scale"] == 2.0
+    assert provenance["model_session_id"] == session_id
+    assert provenance["lens_binding_id"] == 3
+    assert provenance["summary"][0]["id"] == 1
+    assert provenance["active_summary"] == []
+    assert result["last_generation"]["meta"]["intervention_provenance"] == provenance
+
+
+def test_fallback_generation_emits_authoritative_replacement_character(monkeypatch):
+    import threading
+    import torch
+    from types import SimpleNamespace
+    from api import app
+
+    class Tokenizer:
+        chat_template = ""
+        unk_token_id = -1
+        all_special_ids = ()
+
+        def apply_chat_template(self, *_args, **_kwargs):
+            return torch.tensor([[1]])
+
+        def decode(self, ids, **_kwargs):
+            return "\ufffd" if list(ids) else ""
+
+        def encode(self, *_args, **_kwargs):
+            return [1]
+
+        def convert_tokens_to_ids(self, _token):
+            return -1
+
+    class Model:
+        generation_config = SimpleNamespace(eos_token_id=2)
+
+        def __init__(self):
+            self.config = SimpleNamespace(get_text_config=lambda: SimpleNamespace(num_hidden_layers=1, hidden_size=4))
+            self.emb = SimpleNamespace(weight=torch.zeros(4, 4))
+
+        def get_input_embeddings(self):
+            return self.emb
+
+        def __call__(self, **_kwargs):
+            logits = torch.zeros(1, 1, 5)
+            logits[0, 0, 3] = 10
+            return SimpleNamespace(logits=logits, past_key_values=None)
+
+    monkeypatch.setattr(app.manager, "hf_model", Model())
+    monkeypatch.setattr(app.manager, "tokenizer", Tokenizer())
+    monkeypatch.setattr(app.manager, "jl", SimpleNamespace(layers=[]))
+    monkeypatch.setattr(
+        app.manager, "meta", {"model_id": "fallback", "chat_template_fallback": True}
+    )
+    emitted = []
+    app.manager.generate(
+        [{"role": "user", "content": "hi"}],
+        {"max_tokens": 1, "temperature": 0, "top_p": 1, "top_k": 0, "seed": 1},
+        threading.Event(), emitted.append,
+    )
+
+    tokens = [event["text"] for event in emitted if event["type"] == "token"]
+    done = next(event for event in emitted if event["type"] == "done")
+    assert tokens == ["\ufffd"]
+    assert "".join(tokens) == done["text"] == "\ufffd"
+    assert done["durable_reply_token_ids"] == [3]
+    assert done["durable_generated_token_count"] == 1
+
+
+def test_persisted_continue_records_segment_provenance(monkeypatch):
+    import json
+    import threading
+
+    from types import SimpleNamespace
+    from api import app
+
+    class FakeStore:
+        def __init__(self):
+            self.meta = {
+                "intervention_provenance": {"revision": 1, "mode": "standard", "scale": 1.0},
+                "model_session_id": 1,
+            }
+            self.updated = None
+
+        def get_message(self, message_id):
+            return {
+                "id": message_id,
+                "conversation_id": 99,
+                "parent_id": 1,
+                "role": "assistant",
+                "content": "old",
+                "meta": json.dumps(self.meta),
+                "frames_file": None,
+            }
+
+        def path_to_root(self, message_id):
+            return [{"role": "user", "content": "u"}, {"role": "assistant", "content": "old"}]
+
+        def update_message_and_frames_if_unchanged(
+            self, message_id, expected_version, content, meta=None, **kwargs
+        ):
+            assert expected_version == 0
+            assert kwargs.get("frames") is None
+            self.updated = (message_id, content, meta)
+            return SimpleNamespace(state="committed", entity_id=str(message_id))
+
+        def save_frames(self, *args, **kwargs):
+            raise AssertionError("no lens frames expected")
+
+    continuation_meta = {
+        "intervention_provenance": {
+            "revision": 2,
+            "mode": "readthrough",
+            "scale": 1.5,
+            "model_session_id": 4,
+            "lens_binding_id": 7,
+            "summary": [{"id": 1}],
+            "active_summary": [{"id": 1}],
+        },
+        "model_session_id": 4,
+        "lens": None,
+    }
+
+    def fake_generate(**kwargs):
+        kwargs["emit"]({"type": "done", "text": " new", "stats": {"tokens": 2}, "stopped": False, "meta": continuation_meta})
+
+    fake_store = FakeStore()
+    monkeypatch.setattr(app, "store", fake_store)
+    monkeypatch.setattr(app.manager, "generate", fake_generate)
+    emitted = []
+    context = SimpleNamespace(lens=None, intervention_snapshot={"rules": []})
+
+    app._persisted_continue({}, 10, threading.Event(), emitted.append, context)
+
+    assert fake_store.updated[1] == "old new"
+    saved_meta = fake_store.updated[2]
+    assert saved_meta["intervention_provenance"]["revision"] == 2
+    assert saved_meta["intervention_provenance"]["mode"] == "readthrough"
+    assert saved_meta["intervention_provenance"]["scale"] == 1.5
+    assert saved_meta["continuations"][0]["start_offset"] == 0
+    assert saved_meta["continuations"][0]["end_offset"] == 3
+    assert saved_meta["continuations"][0]["meta"]["intervention_provenance"]["revision"] == 1
+    assert saved_meta["continuations"][-1]["start_offset"] == 3
+    assert saved_meta["continuations"][-1]["end_offset"] == 7
+    assert saved_meta["continuations"][-1]["meta"]["intervention_provenance"]["revision"] == 2
+    assert emitted[-1]["meta"]["intervention_provenance"]["revision"] == 2
+    assert emitted[-1]["text"] == " new"
+    assert emitted[-1]["content"] == "old new"
+    assert emitted[-1]["continued"] is True
+    assert emitted[-1]["continuation_noop"] is False
+
+
+def test_zero_length_continuation_does_not_reattribute_existing_text(monkeypatch):
+    import json
+    import threading
+
+    from types import SimpleNamespace
+    from api import app
+
+    class FakeStore:
+        def __init__(self):
+            self.meta = {"intervention_provenance": {"revision": 1}}
+            self.updated = None
+        def get_message(self, message_id):
+            return {"id": message_id, "conversation_id": 1, "parent_id": None, "role": "assistant", "content": "old", "meta": json.dumps(self.meta), "frames_file": None, "version": 0}
+        def path_to_root(self, message_id):
+            return [{"role": "assistant", "content": "old"}]
+        def update_message_and_frames_if_unchanged(self, message_id, expected_version, content, meta=None, **kwargs):
+            assert expected_version == 0
+            self.updated = (content, meta)
+            return SimpleNamespace(state="committed", entity_id=str(message_id))
+
+    def fake_generate(**kwargs):
+        kwargs["emit"]({"type": "frame", "pos": 1, "gen": 9, "generation_run_id": "b" * 32})
+        kwargs["emit"]({
+            "type": "done", "text": "", "stats": {"tokens": 0}, "stopped": True,
+            "meta": {"intervention_provenance": {"revision": 2}}, "gen_id": 9,
+            "generation_run_id": "b" * 32, "generated_token_start_pos": 1,
+            "generated_token_end_pos": 1, "continuation_suffix_start_pos": 1,
+            "continuation_suffix_end_pos": 1,
+        })
+
+    fake_store = FakeStore()
+    monkeypatch.setattr(app, "store", fake_store)
+    monkeypatch.setattr(app.manager, "generate", fake_generate)
+    emitted = []
+    app._persisted_continue({}, 1, threading.Event(), emitted.append, SimpleNamespace(lens=None, intervention_snapshot={"rules": []}))
+    assert fake_store.updated is None
+    assert emitted[-1]["text"] == ""
+    assert emitted[-1]["content"] == "old"
+    assert emitted[-1]["continued"] is False
+    assert emitted[-1]["continuation_noop"] is True
+    assert [frame["type"] for frame in emitted] == ["done"]
+    for key in (
+        "gen_id", "generation_run_id", "generated_token_start_pos", "generated_token_end_pos",
+        "continuation_suffix_start_pos", "continuation_suffix_end_pos", "stats", "meta",
+    ):
+        assert key not in emitted[-1]
+
+
+def test_lens_generation_provisional_finalize_prunes_and_publishes():
+    import torch
+    from core.lens_manager import LensManager
+
+    lens = LensManager()
+    lens.layers = [0]
+    lens.model_session_id = 4
+    lens.binding_id = 7
+    gen_id = lens.start_gen(generation_run_id="a" * 32, provisional=True)
+    store = lens._provisional_gen_store[gen_id]
+    store["positions"] = [0, 10, 11, 12]
+    store["token_ids"] = [1, 20, 21, 22]
+    store["phases"] = ["reading", "thinking", "thinking", "thinking"]
+    store["residuals"][0] = [torch.arange(8, dtype=torch.float16).reshape(4, 2)]
+
+    assert gen_id not in lens.gen_store
+    lens.finalize_gen(gen_id, retained_thinking=[(10, 20), (12, 22)], publish=False)
+    assert gen_id not in lens.gen_store
+    assert store["positions"] == [0, 10, 12]
+    assert store["token_ids"] == [1, 20, 22]
+    assert store["phases"] == ["reading", "thinking", "thinking"]
+    assert store["residuals"][0][0].tolist() == [[0.0, 1.0], [2.0, 3.0], [6.0, 7.0]]
+
+    publication = lens.finalize_gen(gen_id, publish=True)
+    assert publication.published is True
+    assert publication.gen_id == gen_id
+    assert publication.generation_run_id == "a" * 32
+    repeated = lens.finalize_gen(gen_id, publish=True)
+    assert repeated == publication
+    assert gen_id in lens.gen_store
+    assert gen_id not in lens._provisional_gen_store
+
+
+def test_provisional_generation_does_not_evict_committed_store():
+    from core.lens_manager import GEN_STORE_MAX, LensManager
+
+    lens = LensManager()
+    committed = [lens.start_gen(generation_run_id=f"{index:032x}") for index in range(GEN_STORE_MAX)]
+    attempt = lens.start_gen(generation_run_id="f" * 32, provisional=True)
+    assert list(lens.gen_store) == committed
+    assert attempt not in lens.gen_store
+    with pytest.raises(ValueError, match="unknown generation"):
+        lens.pin_ranks(attempt, [1], SimpleNamespace(), generation_run_id="f" * 32)
+    assert lens.discard_gen(attempt) is True
+    assert lens.discard_gen(attempt) is False
+    assert list(lens.gen_store) == committed
+
+
+def test_preset_save_persists_coordinated_provenance(monkeypatch):
+    from api import app
+    from core.model_session import LoadedModelBundle, ModelSessionCoordinator, OperationType
+
+    coordinator = ModelSessionCoordinator()
+    monkeypatch.setattr(app.manager, "coordinator", coordinator)
+    token, snap = coordinator.acquire(OperationType.LOAD)
+    coordinator.publish_loaded(
+        token,
+        LoadedModelBundle.from_parts(object(), object(), object(), {"model_id": "m", "revision": "r1"}, {"ok": True}),
+        expected_unloaded_session=snap.model_session_id,
+    )
+    coordinator.release(token)
+    session_id = coordinator.status_snapshot().model_session_id
+    coordinator.bootstrap_interventions_for_test({
+        "revision": 12,
+        "model_session_id": session_id,
+        "lens_binding_id": 44,
+        "scale": 1.75,
+        "mode": "readthrough",
+        "rules": [{"id": 1, "token_id": 1, "token": "a", "mode": "scale", "factor": 0.1, "layers": [0], "enabled": True}],
+        "active_rules": [],
+        "summary": [{"id": 1, "token_id": 1, "token": "a", "mode": "scale", "factor": 0.1, "layers": [0], "enabled": True}],
+        "active_summary": [],
+    })
+    captured = {}
+
+    def save_preset(name, rules, model_id, scale=1.0, **provenance):
+        captured.update(name=name, rules=rules, model_id=model_id, scale=scale, **provenance)
+        return dict(captured, schema_version=2)
+
+    monkeypatch.setattr(app.editing, "save_preset", save_preset)
+    result = app.api_presets_save("preset")
+    assert result["schema_version"] == 2
+    assert captured["model_id"] == "m"
+    assert captured["model_revision"] == "r1"
+    assert captured["intervention_mode"] == "readthrough"
+    assert captured["intervention_revision"] == 12
+    assert captured["model_session_id"] == session_id
+    assert captured["lens_binding_id"] == 44
+    assert captured["rules"][0]["id"] == 1
+
+
+def _frame(pos=0, phase="gen", layer_key=0):
+    return {
+        "type": "frame",
+        "phase": phase,
+        "pos": pos,
+        "token_id": 1,
+        "tok": "a",
+        "layers": {
+            layer_key: {
+                "ids": [1], "strs": ["a"], "p": [1.0],
+                "m_ids": [2], "m_strs": ["b"], "m_p": [0.5], "m_rank": [1],
+            }
+        },
+    }
+
+
+def test_store_round_trips_production_frame_phases(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "T", meta={"publication_state": "complete"}).value[0]
+    s.save_frames(mid, [_frame(0, "reading", "0"), _frame(1, "thinking", "0")], [0], 1)
+    loaded = s.load_frames(mid)
+    assert [frame["phase"] for frame in loaded["frames"]] == ["reading", "thinking"]
+    body, _ = s.export(cid, fmt="md", include_frames=True)
+    assert "2 lens frames" in body
+    s._discard_conn()
+    reopened = store_mod.Store()
+    loaded = reopened.load_frames(mid)
+    assert [frame["phase"] for frame in loaded["frames"]] == ["reading", "thinking"]
+
+
+def test_store_accepts_legacy_frame_phases(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "T").value[0]
+    s.save_frames(mid, [_frame(0, "prompt"), _frame(1, "gen")], [0], 1)
+    loaded = s.load_frames(mid)
+    assert [frame["phase"] for frame in loaded["frames"]] == ["prompt", "gen"]
+
+
+def test_store_accepts_multiple_production_string_layer_keys(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "T").value[0]
+    frame = _frame(0, "reading", "0")
+    frame["layers"]["12"] = dict(frame["layers"]["0"])
+    s.save_frames(mid, [frame], [0, 12], 1)
+    loaded = s.load_frames(mid)
+    assert loaded["layers"] == [0, 12]
+    assert set(loaded["frames"][0]["layers"]) == {0, 12}
+
+
+def test_update_message_identical_stale_writer_does_not_reconcile_as_committed(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c").value
+    inserted = s.add_message(cid, None, "assistant", "old", return_version=True).value
+    mid, version = inserted
+    s.update_message(mid, "same", meta={"edited": True}, clear_frames=True, expected_version=version)
+    stale = s.update_message(mid, "same", meta={"edited": True}, clear_frames=True, expected_version=version)
+    assert stale.state == "stale"
+    assert stale.observed_version == version + 1
+
+
+def test_persisted_continue_merges_existing_production_phase_archive(tmp_path, monkeypatch):
+    from api import app
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    monkeypatch.setattr(app, "store", s)
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "T", meta={"publication_state": "complete"}).value[0]
+    lens_meta = {"path": "/lens", "model_id": "m", "model_revision": "r", "fitted_layers_all": [0], "tapped_layers": [0], "k": 1}
+    lens = type("Lens", (), {"layers": [0], "k": 1, "meta": lens_meta})()
+    descriptor = app._frame_descriptor(lens, [0], 1)
+    s.save_frames(mid, [_frame(0, "reading", "0"), _frame(1, "thinking", "0")], [0], 1, frame_descriptor=descriptor)
+    emitted = []
+
+    def generate(**kwargs):
+        run_id = "1" * 32
+        kwargs["emit"]({"type": "frame", **_frame(0, "reading", "0"), "generation_run_id": run_id})
+        kwargs["emit"]({"type": "frame", **_frame(2, "thinking", "0"), "generation_run_id": run_id})
+        kwargs["emit"]({"type": "done", "text": " plus", "meta": {"model_id": "m"}, "stats": {}, "stopped": False, "generation_run_id": run_id, "continuation_suffix_start_pos": 2, "continuation_suffix_end_pos": 3})
+
+    monkeypatch.setattr(app.manager, "generate", generate)
+    context = type("Ctx", (), {"lens": lens, "intervention_snapshot": {"rules": []}})()
+    app._persisted_continue({}, mid, threading.Event(), emitted.append, context)
+    loaded = s.load_frames(mid)
+    assert [frame["phase"] for frame in loaded["frames"]] == ["reading", "thinking"]
+    assert emitted[-1]["type"] == "done"
+
+
+def test_store_versioned_cas_rejects_stale_continuation_after_patch(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "old", meta={"intervention_provenance": {"revision": 1}}).value[0]
+    old_frame = s.save_frames(mid, [_frame(0)], [0], 1).value
+    captured = s.get_message(mid)
+    assert captured["version"] == 1
+    assert (store_mod.FRAMES_DIR / old_frame).exists()
+
+    s.update_message(mid, "edited", meta={"edited": True}, clear_frames=True)
+    assert not (store_mod.FRAMES_DIR / old_frame).exists()
+
+    ok = s.update_message_and_frames_if_unchanged(
+        mid,
+        captured["version"],
+        "old suffix",
+        {"intervention_provenance": {"revision": 2}},
+        frames=[_frame(1)],
+        layers=[0],
+        k=1,
+    )
+    assert ok.state in {"stale", "superseded"}
+    current = s.get_message(mid)
+    assert current["content"] == "edited"
+    assert current["frames_file"] is None
+    assert not list(store_mod.FRAMES_DIR.glob("*.tmp-*"))
+    assert not list(store_mod.FRAMES_DIR.glob("*.msgpack"))
+
+
+def test_store_versioned_frames_commit_uses_unique_file_and_cleans_old_after_commit(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "old", meta={"m": 1}).value[0]
+    old_frame = s.save_frames(mid, [_frame(0)], [0], 1).value
+    captured = s.get_message(mid)
+    assert old_frame.startswith(f"{mid}-v1-")
+
+    ok = s.update_message_and_frames_if_unchanged(
+        mid,
+        captured["version"],
+        "old new",
+        {"m": 2},
+        frames=[_frame(0), _frame(1)],
+        layers=[0],
+        k=1,
+    )
+    assert ok.state == "committed"
+    updated = s.get_message(mid)
+    assert updated["version"] == captured["version"] + 1
+    assert updated["frames_file"] != old_frame
+    assert updated["frames_file"].startswith(f"{mid}-v{updated['version']}-")
+    assert not (store_mod.FRAMES_DIR / old_frame).exists()
+    assert (store_mod.FRAMES_DIR / updated["frames_file"]).exists()
+    assert len(s.load_frames(mid)["frames"]) == 2
+
+
+def test_legacy_continued_message_gets_unknown_base_provenance():
+    from api import app
+
+    meta = app._continuation_metadata(
+        {"continued": True, "intervention_provenance": {"revision": 9}},
+        12,
+        15,
+        {"intervention_provenance": {"revision": 10}},
+        {"tokens": 1},
+        False,
+    )
+    assert meta["continuations"][0] == {
+        "start_offset": 0,
+        "end_offset": 12,
+        "provenance": "legacy_mixed_unknown",
+        "meta": None,
+    }
+    assert meta["continuations"][1]["meta"]["intervention_provenance"]["revision"] == 10
+
+
+def test_preset_lens_descriptor_detects_reused_runtime_binding_id():
+    from api import app
+
+    saved = app._stable_lens_descriptor({
+        "lens_binding_id": 7,
+        "repo_id": "lens-a",
+        "filename": "lens.pt",
+        "revision": "ra",
+        "tapped_layers": [0, 1],
+        "k": 8,
+    })
+    current = app._stable_lens_descriptor({
+        "lens_binding_id": 7,
+        "repo_id": "lens-b",
+        "filename": "lens.pt",
+        "revision": "rb",
+        "tapped_layers": [0, 1],
+        "k": 8,
+    })
+    same_stable_new_runtime = dict(saved, runtime_lens_binding_id=99, runtime_model_session_id=123)
+    assert app._lens_descriptor_mismatch(saved, current)
+    assert not app._lens_descriptor_mismatch(saved, same_stable_new_runtime)
+
+
+def test_preset_lens_descriptor_compares_missing_revision_symmetrically():
+    from api import app
+
+    saved = app._stable_lens_descriptor({
+        "repo_id": "lens-a",
+        "filename": "lens.pt",
+        "revision": None,
+        "tapped_layers": [0],
+        "k": 4,
+    })
+    current = app._stable_lens_descriptor({
+        "repo_id": "lens-a",
+        "filename": "lens.pt",
+        "revision": "rb",
+        "tapped_layers": [0],
+        "k": 4,
+    })
+    assert saved["revision"] is None
+    assert app._lens_descriptor_mismatch(saved, current)
+
+
+def test_store_load_frames_retries_when_old_pointer_is_retired(tmp_path, monkeypatch):
+    from pathlib import Path
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "old", meta={"m": 1}).value[0]
+    old_frame = s.save_frames(mid, [_frame(0)], [0], 1).value
+    captured = s.get_message(mid)
+    original_read_bytes = Path.read_bytes
+    retired = {"done": False}
+
+    def racing_read_bytes(path):
+        if path.name == old_frame and not retired["done"]:
+            retired["done"] = True
+            assert s.update_message_and_frames_if_unchanged(
+                mid, captured["version"], "old new", {"m": 2},
+                frames=[_frame(0), _frame(1)], layers=[0], k=1,
+            ).state == "committed"
+            raise FileNotFoundError(path)
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", racing_read_bytes)
+    loaded = s.load_frames(mid)
+    assert retired["done"]
+    assert len(loaded["frames"]) == 2
+
+
+def test_store_save_frames_detects_stale_initial_attachment(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "old", meta={"m": 1}).value[0]
+    original = s._write_unique_frame_candidate
+
+    def racing_candidate(message_id, expected_version, blob):
+        s.update_message(mid, "edited", meta={"edited": True}, clear_frames=True)
+        return original(message_id, expected_version, blob)
+
+    monkeypatch.setattr(s, "_write_unique_frame_candidate", racing_candidate)
+    outcome = s.save_frames(mid, [_frame(0)], [0], 1)
+    assert outcome.state == "stale"
+    current = s.get_message(mid)
+    assert current["content"] == "edited"
+    assert current["frames_file"] is None
+    assert not list(store_mod.FRAMES_DIR.glob("*.msgpack"))
+
+
+def test_persisted_continue_fails_closed_when_base_frames_cannot_load(monkeypatch):
+    from api import app
+
+    unchanged = {"content": "old", "version": 3, "updated": False}
+    emitted = []
+
+    class FakeStore:
+        def get_message(self, message_id):
+            return {
+                "id": message_id, "conversation_id": 1, "parent_id": None,
+                "role": "assistant", "content": unchanged["content"],
+                "meta": "{}", "frames_file": "base.msgpack", "version": unchanged["version"],
+            }
+        def path_to_root(self, message_id):
+            return [{"role": "assistant", "content": unchanged["content"]}]
+        def load_frames(self, message_id):
+            raise app.FrameStorageError("base corrupt")
+        def update_message_and_frames_if_unchanged(self, *args, **kwargs):
+            unchanged["updated"] = True
+            return SimpleNamespace(state="committed", entity_id="1")
+
+    def generate(**kwargs):
+        kwargs["emit"]({"type": "frame", **_frame(1)})
+        kwargs["emit"]({"type": "done", "text": " new", "meta": {"m": 2}, "stats": {}, "stopped": False})
+
+    monkeypatch.setattr(app, "store", FakeStore())
+    monkeypatch.setattr(app.manager, "generate", generate)
+    context = type("Ctx", (), {"lens": None, "intervention_snapshot": {"rules": []}})()
+    app._persisted_continue({}, 1, threading.Event(), emitted.append, context)
+    assert not unchanged["updated"]
+    assert emitted[-1]["type"] == "error"
+
+
+def test_initial_save_frames_uses_inserted_version_not_later_edit(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c").value
+    inserted = s.add_message(cid, None, "assistant", "T", meta={"publication_state": "frames_pending"}, return_version=True).value
+    mid, version = inserted
+    s.update_message(mid, "E", meta={"edited": True}, clear_frames=True)
+    outcome = s.save_frames(mid, [_frame(0)], [0], 1, expected_version=version, complete_meta={"publication_state": "complete"})
+    assert outcome.state == "stale"
+    current = s.get_message(mid)
+    assert current["content"] == "E"
+    assert current["frames_file"] is None
+    assert not list(store_mod.FRAMES_DIR.glob("*.msgpack"))
+
+
+def test_store_save_frames_rolls_back_failed_commit_before_connection_reuse(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c").value
+    inserted = s.add_message(cid, None, "assistant", "T", meta={"publication_state": "frames_pending"}, return_version=True).value
+    mid, version = inserted
+    real_conn_method = s._conn
+    conn = s._conn()
+    fail_once = {"yes": True}
+
+    class CommitFailProxy:
+        def __getattr__(self, name):
+            return getattr(conn, name)
+        @property
+        def in_transaction(self):
+            return conn.in_transaction
+        def execute(self, *args, **kwargs):
+            return conn.execute(*args, **kwargs)
+        def rollback(self):
+            return conn.rollback()
+        def commit(self):
+            if fail_once["yes"]:
+                fail_once["yes"] = False
+                raise RuntimeError("commit failed")
+            return conn.commit()
+
+    monkeypatch.setattr(s, "_conn", lambda: CommitFailProxy())
+    outcome = s.save_frames(mid, [_frame(0)], [0], 1, expected_version=version, complete_meta={"publication_state": "complete"})
+    assert outcome.state == "not_committed"
+    monkeypatch.setattr(s, "_conn", real_conn_method)
+    s.update_message(mid, "after", meta={"ok": True}, clear_frames=True)
+    current = s.get_message(mid)
+    assert current["content"] == "after"
+    assert current["frames_file"] is None
+
+
+def test_store_candidate_file_fsync_failure_is_actionable(tmp_path, monkeypatch):
+    import errno
+    import os
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c").value
+    inserted = s.add_message(cid, None, "assistant", "T", return_version=True).value
+    mid, version = inserted
+
+    def fail_fsync(fd):
+        raise OSError(errno.ENOSPC, "full")
+
+    monkeypatch.setattr(os, "fsync", fail_fsync)
+    outcome = s.save_frames(mid, [_frame(0)], [0], 1, expected_version=version)
+    assert outcome.state == "not_committed"
+    assert s.get_message(mid)["frames_file"] is None
+    assert not list(store_mod.FRAMES_DIR.glob("*.tmp-*"))
+    assert not list(store_mod.FRAMES_DIR.glob("*.msgpack"))
+
+
+def test_delete_conversation_treats_frame_unlink_as_garbage_cleanup(tmp_path, monkeypatch):
+    from pathlib import Path
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "T").value[0]
+    frame_file = s.save_frames(mid, [_frame(0)], [0], 1).value
+    original_unlink = Path.unlink
+
+    def failing_unlink(path, *args, **kwargs):
+        if path.name == frame_file:
+            raise PermissionError("open reader")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+    s.delete_conversation(cid)
+    with pytest.raises(ValueError):
+        s.get_conversation(cid)
+    assert (store_mod.FRAMES_DIR / frame_file).exists()
+
+
+def test_store_load_frames_corrupt_schema_maps_to_frame_storage_error(tmp_path, monkeypatch):
+    import msgpack
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c").value
+    inserted = s.add_message(cid, None, "assistant", "T", return_version=True).value
+    mid, version = inserted
+    filename, _ = s._write_unique_frame_candidate(mid, version, msgpack.packb({"version": 1, "frames": [{}]}))
+    conn = s._conn()
+    conn.execute("UPDATE messages SET frames_file = ?, version = version + 1 WHERE id = ?", (filename, mid))
+    conn.commit()
+    with pytest.raises(store_mod.FrameStorageError):
+        s.load_frames(mid)
+
+
+def test_mark_frame_publication_failed_uses_exact_version_and_preserves_patch(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c").value
+    inserted = s.add_message(
+        cid, None, "assistant", "T",
+        meta={"publication_state": "frames_pending", "frames_expected": True},
+        return_version=True,
+    ).value
+    mid, version = inserted
+    s.update_message(mid, "E", meta={"edited": True}, clear_frames=True)
+    ok = s.mark_frame_publication_failed(
+        mid,
+        expected_version=version,
+        failure_meta={"publication_state": "frames_publication_failed", "frames_expected": True},
+    )
+    assert ok.state == "superseded"
+    current = s.get_message(mid)
+    assert current["content"] == "E"
+    meta = current["meta"]
+    if isinstance(meta, str):
+        meta = json.loads(meta)
+    assert meta == {"edited": True}
+
+
+def test_mark_frame_publication_failed_marks_pending_without_rewriting_content(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c").value
+    inserted = s.add_message(
+        cid, None, "assistant", "T",
+        meta={"publication_state": "frames_pending", "frames_expected": True},
+        return_version=True,
+    ).value
+    mid, version = inserted
+    ok = s.mark_frame_publication_failed(
+        mid,
+        expected_version=version,
+        failure_meta={
+            "publication_state": "frames_publication_failed",
+            "frames_expected": True,
+            "frames_error_kind": "FrameStorageError",
+            "frames_error": "full",
+        },
+    )
+    assert ok.state == "committed"
+    current = s.get_message(mid)
+    assert current["content"] == "T"
+    assert current["frames_file"] is None
+    assert current["version"] == version + 1
+    meta = current["meta"]
+    if isinstance(meta, str):
+        meta = json.loads(meta)
+    assert meta["publication_state"] == "frames_publication_failed"
+
+
+def test_load_frames_state_taxonomy(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "T").value[0]
+    with pytest.raises(store_mod.FramesNotAttached):
+        s.load_frames(mid)
+    conn = s._conn()
+    conn.execute("UPDATE messages SET frames_file = ?, version = version + 1 WHERE id = ?", ("missing.msgpack", mid))
+    conn.commit()
+    with pytest.raises(store_mod.FrameFileMissing):
+        s.load_frames(mid)
+
+
+def test_load_frames_rejects_semantic_archive_corruption(tmp_path, monkeypatch):
+    import msgpack
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c").value
+
+    cases = [
+        ("invalid-k", {"k": -1}),
+        ("duplicate-layers", {"layers": [0, 0]}),
+        ("invalid-phase", {"frames": [{"phase": "bad"}]}),
+        ("invalid-layer-key", {"frames": [{"layers": {"01": {}}}]}),
+        ("mixed-script-layer-key", {"frames": [{"layers": {"١": {}}}]}),
+        ("bytes-layer-key", {"frames": [{"layers": {b"0": {}}}]}),
+        ("float-layer-key", {"frames": [{"layers": {0.0: {}}}]}),
+        ("bool-layer-key", {"frames": [{"layers": {True: {}}}]}),
+        ("layer-mismatch", {"frames": [{"layers": {"12": {}}}]}),
+        ("duplicate-normalized-layer", {"frames": [{"layers": {0: {}, "0": {}}}]}),
+    ]
+    for name, patch in cases:
+        mid = s.add_message(cid, None, "assistant", name).value[0]
+        blob = msgpack.unpackb(
+            store_mod.Store._pack_frames_blob([_frame(0, "reading")], [0], 1),
+            strict_map_key=False,
+        )
+        for key, value in patch.items():
+            if key == "frames":
+                blob["frames"][0].update(value[0])
+            else:
+                blob[key] = value
+        frame_file = f"{name}.msgpack"
+        store_mod.FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+        (store_mod.FRAMES_DIR / frame_file).write_bytes(msgpack.packb(blob, use_bin_type=True))
+        conn = s._conn()
+        conn.execute("UPDATE messages SET frames_file = ?, version = version + 1 WHERE id = ?", (frame_file, mid))
+        conn.commit()
+        with pytest.raises(store_mod.FrameStorageError):
+            s.load_frames(mid)
+
+
+@pytest.mark.parametrize("run_id", ["__missing__", None, "", "A" * 32, "g" * 32, "1" * 31, 7])
+def test_schema_v3_requires_one_valid_homogeneous_run_id(tmp_path, monkeypatch, run_id):
+    import msgpack
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "T").value[0]
+    frame = _frame(0, "reading", "0")
+    frame["gen"] = 1
+    frame["generation_run_id"] = "1" * 32
+    blob = msgpack.unpackb(store_mod.Store._pack_frames_blob([frame], [0], 1), strict_map_key=False)
+    if run_id == "__missing__":
+        del blob["frames"][0]["generation_run_id"]
+    else:
+        blob["frames"][0]["generation_run_id"] = run_id
+    store_mod.FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+    path = store_mod.FRAMES_DIR / "bad-run.msgpack"
+    path.write_bytes(msgpack.packb(blob, use_bin_type=True))
+    conn = s._conn()
+    conn.execute("UPDATE messages SET frames_file = ?, version = version + 1 WHERE id = ?", (path.name, mid))
+    conn.commit()
+    with pytest.raises(store_mod.FrameStorageError):
+        s.load_frames(mid)
+
+
+def test_persisted_continue_drops_overlapping_reread_frames_and_reloads(tmp_path, monkeypatch):
+    from api import app
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    monkeypatch.setattr(app, "store", s)
+    cid = s.create_conversation("c").value
+    mid = s.add_message(
+        cid,
+        None,
+        "assistant",
+        "old",
+        meta={"publication_state": "complete", "frames_lens_binding_id": 7, "frames_layers": [0], "frames_k": 1},
+    ).value[0]
+    lens_meta = {"path": "/lens", "model_id": "m", "model_revision": "r", "fitted_layers_all": [0], "tapped_layers": [0], "k": 1}
+    lens = type("Lens", (), {"layers": [0], "k": 1, "binding_id": 7, "meta": lens_meta})()
+    descriptor = app._frame_descriptor(lens, [0], 1)
+    old_reading = _frame(0, "reading", "0")
+    old_reading["gen"] = 10
+    old_thinking = _frame(1, "thinking", "0")
+    old_thinking["gen"] = 10
+    stale_tail = _frame(4, "thinking", "0")
+    stale_tail["gen"] = 40
+    s.save_frames(mid, [old_reading, old_thinking, stale_tail], [0], 1, frame_descriptor=descriptor)
+    emitted = []
+
+    def generate_first(**kwargs):
+        assert kwargs["capture_full_input_frames"] is True
+        run_id = "2" * 32
+        kwargs["emit"]({"type": "frame", **_frame(1, "reading", "0"), "generation_run_id": run_id})
+        new_frame = _frame(2, "thinking", "0")
+        new_frame["gen"] = 20
+        new_frame["generation_run_id"] = run_id
+        kwargs["emit"]({"type": "frame", **new_frame})
+        kwargs["emit"]({"type": "done", "text": " plus", "meta": {"model_id": "m"}, "stats": {}, "stopped": False, "generation_run_id": run_id, "continuation_suffix_start_pos": 2, "continuation_suffix_end_pos": 3})
+
+    monkeypatch.setattr(app.manager, "generate", generate_first)
+    context = type("Ctx", (), {"lens": lens, "intervention_snapshot": {"rules": []}})()
+    app._persisted_continue({}, mid, threading.Event(), emitted.append, context)
+    loaded = s.load_frames(mid)
+    assert [frame["pos"] for frame in loaded["frames"]] == [1, 2]
+    assert [frame["phase"] for frame in loaded["frames"]] == ["reading", "thinking"]
+    assert [frame["gen"] for frame in loaded["frames"]] == [None, None]
+
+    def generate_second(**kwargs):
+        run_id = "3" * 32
+        kwargs["emit"]({"type": "frame", **_frame(2, "reading", "0"), "generation_run_id": run_id})
+        kwargs["emit"]({"type": "frame", **_frame(3, "thinking", "0"), "generation_run_id": run_id})
+        kwargs["emit"]({"type": "done", "text": " again", "meta": {"model_id": "m"}, "stats": {}, "stopped": False, "generation_run_id": run_id, "continuation_suffix_start_pos": 3, "continuation_suffix_end_pos": 4})
+
+    monkeypatch.setattr(app.manager, "generate", generate_second)
+    lens.binding_id = 99  # process-local identity is not archive compatibility
+    app._persisted_continue({}, mid, threading.Event(), emitted.append, context)
+    loaded = s.load_frames(mid)
+    assert [frame["pos"] for frame in loaded["frames"]] == [2, 3]
+    body, _ = s.export(cid, fmt="md", include_frames=True)
+    assert "2 lens frames" in body
+
+
+def test_persisted_continue_rejects_incompatible_frame_configuration(tmp_path, monkeypatch):
+    from api import app
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    monkeypatch.setattr(app, "store", s)
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "old", meta={"frames_lens_binding_id": 7}).value[0]
+    original_lens = type("Lens", (), {"layers": [0], "k": 1, "binding_id": 7, "meta": {"path": "/lens", "model_id": "m", "model_revision": "r", "fitted_layers_all": [0], "tapped_layers": [0], "k": 1}})()
+    s.save_frames(mid, [_frame(0, "thinking", "0")], [0], 1, frame_descriptor=app._frame_descriptor(original_lens, [0], 1))
+    before = s.get_message(mid)
+
+    def generate(**kwargs):
+        assert kwargs["capture_full_input_frames"] is True
+        kwargs["emit"]({"type": "frame", **_frame(1, "thinking", "0")})
+        kwargs["emit"]({"type": "done", "text": " plus", "meta": {}, "stats": {}, "stopped": False, "continuation_suffix_start_pos": 1, "continuation_suffix_end_pos": 2})
+
+    monkeypatch.setattr(app.manager, "generate", generate)
+    emitted = []
+    changed_layers = type("Ctx", (), {"lens": type("Lens", (), {"layers": [1], "k": 1, "binding_id": 7, "meta": dict(original_lens.meta, tapped_layers=[1])})(), "intervention_snapshot": {"rules": []}})()
+    app._persisted_continue({}, mid, threading.Event(), emitted.append, changed_layers)
+    after = s.get_message(mid)
+    assert after["content"] == before["content"]
+    assert after["version"] == before["version"]
+    assert emitted[-1]["type"] == "error"
+
+
+def test_pointerless_framed_continuation_replaces_stale_frame_metadata(tmp_path, monkeypatch):
+    from api import app
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    monkeypatch.setattr(app, "store", s)
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "old", meta={
+        "publication_state": "frames_publication_failed",
+        "frames_expected": False,
+        "frames_invalidated": True,
+        "frames_invalidation_reason": "edited",
+        "frames_error_kind": "write",
+        "frames_error": "old failure",
+    }).value[0]
+    lens_meta = {"path": "/lens", "model_id": "m", "model_revision": "r", "fitted_layers_all": [0], "tapped_layers": [0], "k": 1}
+    lens = type("Lens", (), {"layers": [0], "k": 1, "binding_id": 9, "meta": lens_meta})()
+    run_id = "4" * 32
+
+    def generate(**kwargs):
+        kwargs["emit"]({"type": "frame", **_frame(0, "reading", "0"), "generation_run_id": run_id})
+        kwargs["emit"]({"type": "frame", **_frame(1, "thinking", "0"), "generation_run_id": run_id})
+        kwargs["emit"]({
+            "type": "done", "text": " plus", "meta": {}, "stats": {}, "stopped": False,
+            "generation_run_id": run_id,
+            "continuation_suffix_start_pos": 1, "continuation_suffix_end_pos": 2,
+        })
+
+    monkeypatch.setattr(app.manager, "generate", generate)
+    emitted = []
+    context = type("Ctx", (), {"lens": lens, "intervention_snapshot": {"rules": []}})()
+    app._persisted_continue({}, mid, threading.Event(), emitted.append, context)
+
+    current = s.get_message(mid)
+    assert current["frames_file"] is not None
+    meta = current["meta"] if isinstance(current["meta"], dict) else json.loads(current["meta"])
+    assert meta["publication_state"] == "complete"
+    assert meta["frames_expected"] is True
+    for stale in ("frames_invalidated", "frames_invalidation_reason", "frames_error_kind", "frames_error"):
+        assert stale not in meta
+    loaded = s.load_frames(mid)
+    assert loaded["version"] == 3
+    assert [frame["generation_run_id"] for frame in loaded["frames"]] == [None, None]
+
+
+def test_lens_disabled_continuation_invalidates_existing_frames(tmp_path, monkeypatch):
+    from api import app
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    monkeypatch.setattr(app, "store", s)
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "old", meta={"publication_state": "complete"}).value[0]
+    old_file = s.save_frames(mid, [_frame(0, "thinking", "0")], [0], 1).value
+
+    def generate(**kwargs):
+        kwargs["emit"]({"type": "done", "text": " plus", "meta": {}, "stats": {}, "stopped": False})
+
+    monkeypatch.setattr(app.manager, "generate", generate)
+    context = type("Ctx", (), {"lens": None, "intervention_snapshot": {"rules": []}})()
+    emitted = []
+    app._persisted_continue({}, mid, threading.Event(), emitted.append, context)
+    current = s.get_message(mid)
+    assert current["content"] == "old plus"
+    assert current["frames_file"] is None
+    meta = current["meta"] if isinstance(current["meta"], dict) else json.loads(current["meta"])
+    assert meta["frames_invalidated"] is True
+    assert not (store_mod.FRAMES_DIR / old_file).exists()
+
+
+def test_lens_disabled_continuation_fails_closed_on_missing_frames(tmp_path, monkeypatch):
+    from api import app
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    monkeypatch.setattr(app, "store", s)
+    cid = s.create_conversation("c").value
+    mid = s.add_message(cid, None, "assistant", "old").value[0]
+    conn = s._conn()
+    conn.execute("UPDATE messages SET frames_file = ?, version = version + 1 WHERE id = ?", ("missing.msgpack", mid))
+    conn.commit()
+    before = s.get_message(mid)
+
+    def generate(**kwargs):
+        kwargs["emit"]({"type": "done", "text": " plus", "meta": {}, "stats": {}, "stopped": False})
+
+    monkeypatch.setattr(app.manager, "generate", generate)
+    context = type("Ctx", (), {"lens": None, "intervention_snapshot": {"rules": []}})()
+    emitted = []
+    app._persisted_continue({}, mid, threading.Event(), emitted.append, context)
+    after = s.get_message(mid)
+    assert after["content"] == before["content"]
+    assert after["version"] == before["version"]
+    assert emitted[-1]["type"] == "error"
+
+
+def test_frame_candidate_validation_failure_leaves_old_row_unchanged(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c").value
+    inserted = s.add_message(cid, None, "assistant", "old", return_version=True).value
+    mid, version = inserted
+    old = s.get_message(mid)
+    monkeypatch.setattr(s, "_validate_frame_candidate", lambda *args, **kwargs: (_ for _ in ()).throw(store_mod.FrameStorageError("bad candidate")))
+    outcome = s.update_message_and_frames_if_unchanged(mid, version, "new", {}, frames=[_frame(1)], layers=[0], k=1)
+    assert outcome.state == "not_committed"
+    assert s.get_message(mid)["content"] == old["content"]
+    assert s.get_message(mid)["version"] == old["version"]
+    assert not list(store_mod.FRAMES_DIR.glob("*.msgpack"))
+
+
+def test_operation_handoff_can_own_acquisition_before_setup():
+    from api import app
+
+    c = ModelSessionCoordinator()
+    handoff = app.OperationHandoff(c, threading.Event())
+    assert handoff.state is app.HandoffState.NEW
+    token, snap = handoff.acquire(OperationType.GENERATE)
+    assert token is handoff.token
+    assert handoff.state is app.HandoffState.PREPARING
+    assert handoff.heavy["snap"] is snap
+    handoff.clear_heavy()
+    c.release(token)
+
+
+def test_operation_handoff_acquire_rolls_back_snapshot_registration_failure(monkeypatch):
+    from api import app
+    from core.model_session import ModelSessionCoordinator, OperationType
+
+    coordinator = ModelSessionCoordinator()
+    handoff = app.OperationHandoff(coordinator, stop_event=threading.Event())
+    monkeypatch.setattr(handoff, "set_heavy", lambda **_refs: (_ for _ in ()).throw(MemoryError("injected")))
+    with pytest.raises(RuntimeError, match="MemoryError: injected") as raised:
+        handoff.acquire(OperationType.GENERATE)
+    assert raised.value.__context__ is None
+    assert raised.value.__cause__ is None
+    assert coordinator.status_snapshot().operation is None
+    assert handoff.state is app.HandoffState.CLOSED
+
+
+def test_operation_handoff_close_before_dispatch_is_idempotent():
+    from api import app
+    from core.model_session import ModelSessionCoordinator, OperationType
+
+    coordinator = ModelSessionCoordinator()
+    handoff = app.OperationHandoff(coordinator, stop_event=threading.Event())
+    handoff.acquire(OperationType.GENERATE)
+    asyncio.run(handoff.close())
+    asyncio.run(handoff.close())
+    assert coordinator.status_snapshot().operation is None
+    assert handoff.state is app.HandoffState.CLOSED
+
+
+def test_first_party_pin_calls_propagate_generation_run_identity():
+    from pathlib import Path
+
+    root = Path(__file__).parents[1] / "ui" / "src"
+    lens_view = (root / "LensView.jsx").read_text(encoding="utf-8")
+    editor = (root / "Editor.jsx").read_text(encoding="utf-8")
+    app_source = (root / "App.jsx").read_text(encoding="utf-8")
+    assert "generation_run_id: generationRunId" in lens_view
+    assert "generation_run_id: generationRunId" in editor
+    assert "generationRunId={viewRunId" in app_source
+    assert "generationRunId={currentGenView().generationRunId}" in app_source
+
+
+def test_dispatched_routes_use_one_preacquisition_handoff():
+    import inspect
+    from api import app
+
+    routes = (
+        (app.api_delete_model, app._prepare_delete_model_handoff),
+        (app.api_lens_load, app._prepare_lens_load_handoff),
+        (app.api_edit_export, app._prepare_export_handoff),
+        (app.api_edit_export_gguf, app._prepare_gguf_bake_handoff),
+        (app.api_generate_sync, app._prepare_http_generation_handoff),
+        (app.api_token_neighbors, app._prepare_token_neighbors_handoff),
+        (app.api_lens_pin, app._prepare_lens_pin_handoff),
+        (app._setup_ws_worker, app._prepare_ws_worker_handoff),
+    )
+    for route, helper in routes:
+        source = inspect.getsource(route)
+        helper_source = inspect.getsource(helper)
+        assert "OperationHandoff.acquire_scope(" in source, route.__name__
+        assert "handoff.acquire(" not in source, route.__name__
+        assert "async with handoff.awaiter_scope()" not in source, route.__name__
+        assert ".create_dispatch(" in helper_source, helper.__name__
+        assert ".create_thread_task(" in helper_source, helper.__name__
+        assert "finally:" in helper_source, helper.__name__
+        assert "manager.coordinator.acquire(" not in source, route.__name__
+        assert "manager.coordinator.release(" not in source, route.__name__
+        assert "_handoff_thread_worker" not in source, route.__name__
+
+
+def test_neighbor_heavy_helper_failure_does_not_retain_model_graph():
+    import gc
+    import weakref
+    from types import SimpleNamespace
+    from api import app
+
+    class Resource:
+        pass
+
+    model = Resource()
+    tokenizer = Resource()
+    jl = Resource()
+    bundle = SimpleNamespace(hf_model=model, tokenizer=tokenizer, jl=jl, meta={"model_id": "m"})
+    refs = [weakref.ref(value) for value in (model, tokenizer, jl)]
+
+    class Handoff:
+        token = object()
+        def create_dispatch(self, _payload):
+            raise RuntimeError("dispatch failed")
+
+    handoff = Handoff()
+    handoff.snapshot = SimpleNamespace(bundle=bundle, model_session_id=1)
+    setup = asyncio.run(app._prepare_token_neighbors_handoff(handoff, [1], 1))
+    assert setup.status == 500
+    assert setup.task is setup.dispatch is None
+    handoff.snapshot = None
+    bundle = model = tokenizer = jl = handoff = None
+    gc.collect()
+    assert all(ref() is None for ref in refs)
+
+
+def test_neighbor_task_transfer_failure_composes_with_helper_teardown():
+    import gc
+    import weakref
+    from types import SimpleNamespace
+    from api import app
+
+    class Resource:
+        pass
+
+    model = Resource()
+    tokenizer = Resource()
+    jl = Resource()
+    bundle = SimpleNamespace(hf_model=model, tokenizer=tokenizer, jl=jl, meta={"model_id": "m"})
+    refs = [weakref.ref(value) for value in (model, tokenizer, jl)]
+
+    class Dispatch:
+        payload = None
+        def clear_payload(self):
+            self.payload = None
+
+    dispatch = Dispatch()
+    class Handoff:
+        token = object()
+        def create_dispatch(self, payload):
+            dispatch.payload = payload
+            return dispatch
+        async def create_thread_task(self, *_args, **_kwargs):
+            dispatch.clear_payload()
+            raise RuntimeError("task transfer failed")
+
+    handoff = Handoff()
+    handoff.snapshot = SimpleNamespace(bundle=bundle, model_session_id=1)
+    setup = asyncio.run(app._prepare_token_neighbors_handoff(handoff, [1], 1))
+    assert setup.status == 500
+    assert dispatch.payload is None
+    handoff.snapshot = None
+    bundle = model = tokenizer = jl = handoff = None
+    gc.collect()
+    assert all(ref() is None for ref in refs)
+
+
+class _LifetimeResource:
+    pass
+
+
+class _LifetimeCoordinator:
+    def __init__(self, holder):
+        self.holder = holder
+        self.owner = None
+        self.releases = 0
+
+    def acquire(self, operation_type, *, include_bundle=True, **_kwargs):
+        if self.owner is not None:
+            raise RuntimeError("owner already installed")
+        token = SimpleNamespace(id=object(), type=operation_type)
+        self.owner = token
+        snapshot = SimpleNamespace(
+            model_session_id=1,
+            bundle=self.holder.bundle if include_bundle else None,
+            interventions={"rules": (), "active_rules": (self.holder.direction,), "scale": 1.0, "mode": "readthrough"},
+        )
+        return token, snapshot
+
+    def release(self, token):
+        if self.owner is not token:
+            return False
+        self.owner = None
+        self.releases += 1
+        return True
+
+    def is_current(self, token):
+        return self.owner is token
+
+    def request_cancel(self, token):
+        return self.owner is token
+
+    def is_cancelled(self, _token):
+        return False
+
+
+def _lifetime_graph():
+    holder = _LifetimeResource()
+    holder.model = _LifetimeResource()
+    holder.tokenizer = _LifetimeResource()
+    holder.jl = _LifetimeResource()
+    holder.lens = _LifetimeResource()
+    holder.direction = _LifetimeResource()
+    holder.bundle = _LifetimeResource()
+    holder.bundle.hf_model = holder.model
+    holder.bundle.tokenizer = holder.tokenizer
+    holder.bundle.jl = holder.jl
+    holder.bundle.meta = {"model_id": "m", "revision": "r"}
+    holder.bundle.capability_profile = {}
+    refs = {
+        name: weakref.ref(getattr(holder, name))
+        for name in ("model", "tokenizer", "jl", "lens", "direction", "bundle")
+    }
+    return holder, refs
+
+
+@pytest.mark.parametrize("case", ["http", "neighbors", "export", "gguf", "pin", "ws"])
+def test_heavy_handoff_release_is_final_model_resource_boundary(case, monkeypatch):
+    import gc
+    import weakref
+    from fastapi import HTTPException
+    from api import app
+    from core.model_session import OperationType
+
+    holder, refs = _lifetime_graph()
+    coordinator = _LifetimeCoordinator(holder)
+    payload_refs = []
+    context_refs = []
+    scope_released = asyncio.Event()
+    allow_reporting = asyncio.Event()
+
+    def fail_dispatch(_handoff, payload=None):
+        if payload is not None:
+            try:
+                payload_refs.append(weakref.ref(payload))
+            except TypeError:
+                pass
+        raise RuntimeError("injected dispatch failure")
+
+    monkeypatch.setattr(app.OperationHandoff, "create_dispatch", fail_dispatch)
+
+    def captured_context(token, snap, stop_event):
+        context = _LifetimeResource()
+        context.token = token
+        context.model_session_id = snap.model_session_id
+        context.bundle = snap.bundle
+        context.hf_model = snap.bundle.hf_model
+        context.tokenizer = snap.bundle.tokenizer
+        context.jl = snap.bundle.jl
+        context.meta = snap.bundle.meta
+        context.capability_profile = snap.bundle.capability_profile
+        context.lens = holder.lens
+        context.intervention_snapshot = {"rules": (holder.direction,)}
+        context.stop_event = stop_event
+        context_refs.append(weakref.ref(context))
+        return context
+
+    monkeypatch.setattr(app, "_captured_generation_context", captured_context)
+
+    def export_preflight(_snap, *_args):
+        return app._route_value(app.PreparedWorkerPayload({
+            "bundle": holder.bundle, "meta": holder.bundle.meta,
+            "rules": (holder.direction,), "source_dir": "source", "scale": 1.0,
+            "kwargs": {}, "export_fn": lambda *_args, **_kwargs: None,
+        }))
+
+    monkeypatch.setattr(app, "_export_preflight_resource", export_preflight)
+    monkeypatch.setattr(app, "_gguf_preflight_resource", export_preflight)
+
+    async def invoke(handoff, stop_event):
+        if case == "http":
+            return await app._prepare_http_generation_handoff(handoff, [], {}, stop_event)
+        if case == "neighbors":
+            return await app._prepare_token_neighbors_handoff(handoff, [1], 1)
+        if case == "export":
+            req = SimpleNamespace(format="layers", name="x")
+            return await app._prepare_export_handoff(handoff, req)
+        if case == "gguf":
+            return await app._prepare_gguf_bake_handoff(handoff, "x/hf")
+        if case == "pin":
+            return await app._prepare_lens_pin_handoff(handoff, 1, "a" * 32, [1])
+        return await app._prepare_ws_worker_handoff(
+            handoff, {"messages": [], "lens": True}, asyncio.get_running_loop(),
+            asyncio.Queue(), threading.Event(),
+        )
+
+    async def predecessor():
+        stop_event = threading.Event()
+        async with app.OperationHandoff.acquire_scope(
+            coordinator, OperationType.GENERATE, stop_event=stop_event,
+        ) as handoff:
+            setup = await invoke(handoff, stop_event)
+            assert setup.status == 500
+            assert setup.task is setup.dispatch is setup.gate is setup.state is None
+        scope_released.set()
+        await allow_reporting.wait()
+        raise HTTPException(setup.status, setup.message) from None
+
+    async def scenario():
+        task = asyncio.create_task(predecessor())
+        await scope_released.wait()
+        assert coordinator.owner is None
+        successor, successor_snapshot = coordinator.acquire(
+            OperationType.UNLOAD, include_bundle=False,
+        )
+        assert successor_snapshot.bundle is None
+        successor_snapshot = None
+        holder.bundle = holder.model = holder.tokenizer = holder.jl = None
+        holder.lens = holder.direction = None
+        gc.collect()
+        assert all(ref() is None for ref in refs.values()), case
+        assert all(ref() is None for ref in payload_refs), case
+        assert all(ref() is None for ref in context_refs), case
+        assert coordinator.owner is successor
+        allow_reporting.set()
+        with pytest.raises(HTTPException) as caught:
+            await task
+        assert caught.value.__context__ is None
+        assert caught.value.__cause__ is None
+        assert coordinator.release(successor)
+        assert coordinator.releases == 2
+
+    asyncio.run(scenario())
+
+
+def test_task_transfer_failure_releases_before_successor_and_drops_payload(monkeypatch):
+    import gc
+    import weakref
+    from api import app
+    from core.model_session import OperationType
+
+    holder, refs = _lifetime_graph()
+    coordinator = _LifetimeCoordinator(holder)
+    dispatch_refs = []
+    original_create_dispatch = app.OperationHandoff.create_dispatch
+
+    def capture_dispatch(handoff, payload=None):
+        dispatch = original_create_dispatch(handoff, payload)
+        dispatch_refs.append(weakref.ref(dispatch))
+        return dispatch
+
+    monkeypatch.setattr(app.OperationHandoff, "create_dispatch", capture_dispatch)
+    monkeypatch.setattr(
+        app.asyncio, "to_thread",
+        lambda _worker: (_ for _ in ()).throw(RuntimeError("task transfer failed")),
+    )
+
+    async def scenario():
+        async with app.OperationHandoff.acquire_scope(
+            coordinator, OperationType.MODEL_READ, stop_event=threading.Event(),
+        ) as handoff:
+            setup = await app._prepare_token_neighbors_handoff(handoff, [1], 1)
+            assert setup.status == 500
+        assert coordinator.owner is None
+        successor, successor_snapshot = coordinator.acquire(OperationType.UNLOAD, include_bundle=False)
+        successor_snapshot = None
+        holder.bundle = holder.model = holder.tokenizer = holder.jl = None
+        holder.lens = holder.direction = None
+        gc.collect()
+        assert all(ref() is None for ref in refs.values())
+        assert all(ref() is None for ref in dispatch_refs)
+        assert not app._deferred_worker_tasks
+        assert coordinator.release(successor)
+        assert coordinator.releases == 2
+
+    asyncio.run(scenario())
+
+
+def test_marker_tail_recognizes_alternate_decoded_prefixes_without_full_history():
+    from core.model_manager import _marker_prefix_suffix
+
+    markers = ("\nUser:", "\nAssistant:")
+    assert _marker_prefix_suffix("\nUs", markers) == "\nUs"
+    assert _marker_prefix_suffix("ordinary text\nAss", markers) == "\nAss"
+    assert _marker_prefix_suffix("ordinary text", markers) == ""
+    long_text = "x" * 10000 + "\nUser"
+    assert _marker_prefix_suffix(long_text, markers) == "\nUser"
+
+
+def test_marker_tail_keeps_latest_eligible_token_boundary():
+    from core.model_manager import (
+        FALLBACK_MARKER_TOKEN_LIMIT,
+        _smallest_marker_tail_start,
+    )
+
+    class Tokenizer:
+        pieces = {1: "v\nU", 2: "v\nU"}
+
+        def decode(self, ids, **_kwargs):
+            return "".join(self.pieces[token_id] for token_id in ids)
+
+    pending = [
+        {"token_id": 1, "pos": 10, "frame": {"pos": 10}},
+        {"token_id": 2, "pos": 11, "frame": {"pos": 11}},
+    ]
+    assert _smallest_marker_tail_start(
+        pending, Tokenizer(), ("\nUser:", "\nAssistant:")
+    ) == 1
+    assert FALLBACK_MARKER_TOKEN_LIMIT == 32
+
+
+def test_marker_tail_accepts_arbitrarily_long_decoded_token_prefix():
+    from core.model_manager import _smallest_marker_tail_start
+
+    class Tokenizer:
+        def decode(self, ids, **_kwargs):
+            return "".join({1: "x" * 10_000 + "\nU", 2: "ser:"}[token_id] for token_id in ids)
+
+    pending = [{"token_id": 1, "pos": 0, "frame": None}]
+    assert _smallest_marker_tail_start(
+        pending, Tokenizer(), ("\nUser:", "\nAssistant:")
+    ) == 0
+
+
+def test_store_migrates_and_increments_conversation_versions(tmp_path, monkeypatch):
+    import sqlite3
+    from core import store as store_mod
+
+    database = tmp_path / "db.sqlite3"
+    conn = sqlite3.connect(database)
+    conn.execute(
+        "CREATE TABLE conversations (id INTEGER PRIMARY KEY, title TEXT NOT NULL DEFAULT '', "
+        "tags TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(store_mod, "DB_PATH", database)
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    store = store_mod.Store()
+    created = store.create_conversation("versioned")
+    assert created.state == "committed"
+    assert created.observed_version == 1
+    updated = store.update_conversation(created.value, title="twice")
+    assert updated.state == "committed"
+    assert updated.expected_version == 1
+    assert updated.observed_version == 2
+    row = store._conn().execute(
+        "SELECT version, incarnation_id FROM conversations WHERE id = ?", (created.value,)
+    ).fetchone()
+    assert row["version"] == 2
+    assert len(row["incarnation_id"]) == 32
+    assert row["incarnation_id"] == row["incarnation_id"].lower()
+
+
+def test_store_migrates_stable_conversation_incarnation(tmp_path, monkeypatch):
+    import sqlite3
+    from core import store as store_mod
+
+    database = tmp_path / "legacy.sqlite3"
+    conn = sqlite3.connect(database)
+    conn.execute(
+        "CREATE TABLE conversations (id INTEGER PRIMARY KEY, title TEXT NOT NULL DEFAULT '', "
+        "tags TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+    )
+    conn.execute(
+        "INSERT INTO conversations VALUES (7, 'legacy', '[]', '2020-01-01', '2020-01-01')"
+    )
+    conn.commit()
+    conn.close()
+    monkeypatch.setattr(store_mod, "DB_PATH", database)
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+
+    first_store = store_mod.Store()
+    first = first_store._conn().execute(
+        "SELECT incarnation_id FROM conversations WHERE id = 7"
+    ).fetchone()[0]
+    first_store._discard_conn(first_store._conn())
+    second = store_mod.Store()._conn().execute(
+        "SELECT incarnation_id FROM conversations WHERE id = 7"
+    ).fetchone()[0]
+    assert second == first
+    assert len(first) == 32
+    assert all(char in "0123456789abcdef" for char in first)
+
+
+def test_conversation_delete_records_causal_tombstone(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    store = store_mod.Store()
+    created = store.create_conversation("delete")
+    deleted = store.delete_conversation(created.value)
+    assert deleted.state == "committed"
+    assert deleted.expected_version == 1
+    assert deleted.observed_version == 2
+    tombstone = store._conn().execute(
+        "SELECT mutation_id, incarnation_id, deleted_version FROM conversation_tombstones WHERE conversation_id = ?",
+        (created.value,),
+    ).fetchone()
+    assert tombstone["mutation_id"] == deleted.value
+    assert tombstone["deleted_version"] == 2
+    assert len(tombstone["incarnation_id"]) == 32
+
+
+def test_conversation_recreation_preserves_prior_delete_identity(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    store = store_mod.Store()
+    first = store.create_conversation("first")
+    first_row = store._conn().execute(
+        "SELECT incarnation_id FROM conversations WHERE id = ?", (first.value,)
+    ).fetchone()
+    deleted = store.delete_conversation(first.value)
+    second = store.create_conversation("second")
+    second_row = store._conn().execute(
+        "SELECT incarnation_id, version FROM conversations WHERE id = ?", (second.value,)
+    ).fetchone()
+    tombstone = store._conn().execute(
+        "SELECT incarnation_id, mutation_id FROM conversation_tombstones WHERE mutation_id = ?",
+        (deleted.value,),
+    ).fetchone()
+
+    assert second.value == first.value
+    assert second_row["version"] == 1
+    assert second_row["incarnation_id"] != first_row["incarnation_id"]
+    assert tombstone["incarnation_id"] == first_row["incarnation_id"]
+    assert tombstone["mutation_id"] == deleted.value
+
+
+def test_delete_reconciliation_survives_same_id_recreation(tmp_path, monkeypatch):
+    import sqlite3
+    import uuid
+    from core import store as store_mod
+
+    database = tmp_path / "db.sqlite3"
+    monkeypatch.setattr(store_mod, "DB_PATH", database)
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    store = store_mod.Store()
+    created = store.create_conversation("first")
+    original = store._conn().execute(
+        "SELECT incarnation_id FROM conversations WHERE id = ?", (created.value,)
+    ).fetchone()[0]
+    operational = store._conn()
+
+    class CommitThenRecreate:
+        def __getattr__(self, name):
+            return getattr(operational, name)
+
+        @property
+        def in_transaction(self):
+            return operational.in_transaction
+
+        def commit(self):
+            operational.commit()
+            replacement = sqlite3.connect(database)
+            replacement.execute(
+                "INSERT INTO conversations "
+                "(id, title, tags, created_at, updated_at, version, incarnation_id) "
+                "VALUES (?, 'second', '[]', 'later', 'later', 1, ?)",
+                (created.value, uuid.uuid4().hex),
+            )
+            replacement.commit()
+            replacement.close()
+            raise RuntimeError("commit acknowledgement lost")
+
+    monkeypatch.setattr(store, "_conn", lambda: CommitThenRecreate())
+    deleted = store.delete_conversation(created.value)
+    replacement = sqlite3.connect(database).execute(
+        "SELECT incarnation_id FROM conversations WHERE id = ?", (created.value,)
+    ).fetchone()[0]
+    tombstone = sqlite3.connect(database).execute(
+        "SELECT incarnation_id FROM conversation_tombstones WHERE mutation_id = ?", (deleted.value,)
+    ).fetchone()[0]
+
+    assert deleted.state == "committed"
+    assert replacement != original
+    assert tombstone == original
+
+
+def test_competing_delete_and_recreation_is_superseded(tmp_path, monkeypatch):
+    import sqlite3
+    import uuid
+    from core import store as store_mod
+
+    database = tmp_path / "db.sqlite3"
+    monkeypatch.setattr(store_mod, "DB_PATH", database)
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    store = store_mod.Store()
+    created = store.create_conversation("first")
+    original = store._conn().execute(
+        "SELECT incarnation_id FROM conversations WHERE id = ?", (created.value,)
+    ).fetchone()[0]
+    operational = store._conn()
+    competing_mutation = uuid.uuid4().hex
+    replacement_incarnation = uuid.uuid4().hex
+
+    class RollbackThenCompete:
+        def __getattr__(self, name):
+            return getattr(operational, name)
+
+        @property
+        def in_transaction(self):
+            return operational.in_transaction
+
+        def commit(self):
+            operational.rollback()
+            competing = sqlite3.connect(database)
+            competing.execute(
+                "INSERT INTO conversation_tombstones "
+                "(mutation_id, conversation_id, incarnation_id, deleted_version, deleted_at) "
+                "VALUES (?, ?, ?, 2, 'later')",
+                (competing_mutation, created.value, original),
+            )
+            competing.execute("DELETE FROM conversations WHERE id = ?", (created.value,))
+            competing.execute(
+                "INSERT INTO conversations "
+                "(id, title, tags, created_at, updated_at, version, incarnation_id) "
+                "VALUES (?, 'replacement', '[]', 'later', 'later', 1, ?)",
+                (created.value, replacement_incarnation),
+            )
+            competing.commit()
+            competing.close()
+            raise RuntimeError("first delete did not commit")
+
+    monkeypatch.setattr(store, "_conn", lambda: RollbackThenCompete())
+    outcome = store.delete_conversation(created.value)
+    assert outcome.state == "superseded"
+    assert outcome.observed_version == 1
+    assert store_mod.Store()._conn().execute(
+        "SELECT incarnation_id FROM conversations WHERE id = ?", (created.value,)
+    ).fetchone()[0] == replacement_incarnation
+    tombstones = sqlite3.connect(database).execute(
+        "SELECT mutation_id FROM conversation_tombstones WHERE incarnation_id = ?", (original,)
+    ).fetchall()
+    assert [row[0] for row in tombstones] == [competing_mutation]
+
+
+def _commit_then_raise_proxy(conn):
+    class Proxy:
+        def __getattr__(self, name):
+            return getattr(conn, name)
+
+        @property
+        def in_transaction(self):
+            return conn.in_transaction
+
+        def commit(self):
+            conn.commit()
+            raise RuntimeError("commit acknowledgement lost")
+
+    return Proxy()
+
+
+def _assert_primitive_outcome(outcome):
+    from pathlib import Path
+    import sqlite3
+    import types
+
+    assert outcome.state in {"committed", "not_committed", "stale", "superseded", "ambiguous"}
+    for value in vars(outcome).values():
+        assert not isinstance(value, (BaseException, Path, sqlite3.Connection, sqlite3.Cursor, types.TracebackType))
+    assert isinstance(outcome.value, (type(None), bool, int, float, str, tuple))
+
+
+def test_store_create_and_insert_reconcile_commit_acknowledgement_loss(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    store = store_mod.Store()
+    create_conn = store._conn()
+    monkeypatch.setattr(store, "_conn", lambda: _commit_then_raise_proxy(create_conn))
+    created = store.create_conversation("durable")
+    _assert_primitive_outcome(created)
+    assert created.state == "committed"
+    assert created.value == 1
+
+    # The reconciled operational connection was deliberately discarded.
+    monkeypatch.setattr(store, "_conn", store_mod.Store._conn.__get__(store))
+    insert_conn = store._conn()
+    monkeypatch.setattr(store, "_conn", lambda: _commit_then_raise_proxy(insert_conn))
+    inserted = store.add_message(created.value, None, "assistant", "answer")
+    _assert_primitive_outcome(inserted)
+    assert inserted.state == "committed"
+    assert inserted.value == (1, 0)
+
+
+def test_store_create_reports_definite_noncommit(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    store = store_mod.Store()
+    conn = store._conn()
+
+    class FailBeforeCommit:
+        def __getattr__(self, name):
+            return getattr(conn, name)
+
+        @property
+        def in_transaction(self):
+            return conn.in_transaction
+
+        def commit(self):
+            raise RuntimeError("commit rejected")
+
+    monkeypatch.setattr(store, "_conn", lambda: FailBeforeCommit())
+    outcome = store.create_conversation("not durable")
+    _assert_primitive_outcome(outcome)
+    assert outcome.state == "not_committed"
+    assert outcome.entity_id == "1"
+
+
+def test_frame_attachment_and_lens_clear_reconcile_lost_commit_ack(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    store = store_mod.Store()
+    cid = store.create_conversation("c").value
+    mid, version = store.add_message(
+        cid, None, "assistant", "answer", meta={"publication_state": "frames_pending"}
+    ).value
+
+    real_conn_method = store._conn
+    attach_conn = store._conn()
+    monkeypatch.setattr(store, "_conn", lambda: _commit_then_raise_proxy(attach_conn))
+    attached = store.save_frames(
+        mid, [_frame(0)], [0], 1, expected_version=version,
+        complete_meta={"publication_state": "complete"},
+    )
+    _assert_primitive_outcome(attached)
+    assert attached.state == "committed"
+    old_file = attached.value
+    assert (store_mod.FRAMES_DIR / old_file).exists()
+
+    monkeypatch.setattr(store, "_conn", real_conn_method)
+    clear_conn = store._conn()
+    monkeypatch.setattr(store, "_conn", lambda: _commit_then_raise_proxy(clear_conn))
+    cleared = store.update_message_and_frames_if_unchanged(
+        mid, attached.observed_version, "answer plus", {"frames_invalidated": True},
+        clear_frames=True,
+    )
+    _assert_primitive_outcome(cleared)
+    assert cleared.state == "committed"
+    assert not (store_mod.FRAMES_DIR / old_file).exists()
+
+
+def test_dispatched_worker_claim_failure_resolves_unclaimed_owner(monkeypatch):
+    from api import app
+    from core.model_session import ModelSessionCoordinator, OperationType, WorkerDispatch
+
+    coordinator = ModelSessionCoordinator()
+    token, _ = coordinator.acquire(OperationType.MODEL_READ)
+    dispatch = WorkerDispatch(coordinator, token, payload=object())
+    monkeypatch.setattr(dispatch, "claim", lambda: (_ for _ in ()).throw(RuntimeError("claim failed")))
+
+    outcome = app._execute_dispatched_worker(dispatch, lambda value: value)
+    assert outcome.ok is False
+    assert outcome.failure_kind == "RuntimeError"
+    assert not coordinator.is_current(token)
+    assert dispatch.take_payload() is None
+
+
+def test_dispatched_worker_payload_transfer_failure_releases_claimed_owner(monkeypatch):
+    from api import app
+    from core.model_session import ModelSessionCoordinator, OperationType, WorkerDispatch
+
+    coordinator = ModelSessionCoordinator()
+    token, _ = coordinator.acquire(OperationType.MODEL_READ)
+    dispatch = WorkerDispatch(coordinator, token, payload=object())
+    monkeypatch.setattr(dispatch, "take_payload", lambda: (_ for _ in ()).throw(RuntimeError("take failed")))
+
+    outcome = app._execute_dispatched_worker(dispatch, lambda value: value)
+    assert outcome.ok is False
+    assert outcome.failure_message == "take failed"
+    assert not coordinator.is_current(token)
+
+
+def test_dispatched_worker_cancellation_is_fresh_after_release():
+    from api import app
+    from core.model_session import ModelSessionCoordinator, OperationType, WorkerDispatch
+
+    coordinator = ModelSessionCoordinator()
+    token, _ = coordinator.acquire(OperationType.MODEL_READ)
+    dispatch = WorkerDispatch(coordinator, token, payload={})
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        app._execute_dispatched_worker(
+            dispatch, lambda _payload: (_ for _ in ()).throw(asyncio.CancelledError()),
+        )
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+    assert not coordinator.is_current(token)
+
+
+def test_worker_failure_survives_unformattable_exception():
+    from api import app
+
+    class BadString(BaseException):
+        def __str__(self):
+            raise RuntimeError("formatting failed")
+
+    outcome = app._worker_failure(BadString())
+    assert outcome.failure_kind == "BadString"
+    assert outcome.failure_message == "worker failure could not be formatted"
+
+
+def test_frame_pin_publication_state_survives_reload_without_version_increment(tmp_path, monkeypatch):
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c").value
+    mid, version = s.add_message(cid, None, "assistant", "old", return_version=True).value
+    run_id = "a" * 32
+    frame = _frame(1, "thinking", "0")
+    frame.update(gen=7, generation_run_id=run_id)
+    pending = s.update_message_and_frames_if_unchanged(
+        mid, version, "old plus",
+        {"pin_publication_state": "pending", "continuations": [{"pin_publication_state": "pending"}]},
+        frames=[frame], layers=[0], k=1, pin_publication_state="pending",
+    )
+    assert pending.state == "committed"
+    committed_version = pending.observed_version
+    loaded = s.load_frames(mid)
+    assert loaded["pin_publication_state"] == "pending"
+    assert loaded["pin_gen_id"] is None
+    assert loaded["pin_generation_run_id"] is None
+    assert loaded["frames"][0]["gen"] is None
+    assert loaded["frames"][0]["generation_run_id"] is None
+
+    published = s.finalize_continuation_pin_publication(
+        mid, expected_version=committed_version, generation_run_id=run_id,
+        gen_id=7, state="published",
+    )
+    assert published.state == "committed"
+    assert published.observed_version == committed_version
+    assert s.get_message(mid)["version"] == committed_version
+    loaded = s.load_frames(mid)
+    assert loaded["pin_publication_state"] == "published"
+    assert loaded["pin_gen_id"] == 7
+    assert loaded["pin_generation_run_id"] == run_id
+    assert loaded["frames"][0]["gen"] == 7
+    assert loaded["frames"][0]["generation_run_id"] == run_id
+
+
+def test_unavailable_pin_transition_is_exact_and_idempotent(tmp_path, monkeypatch):
+    import msgpack
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    cid = s.create_conversation("c").value
+    mid, version = s.add_message(cid, None, "assistant", "old", return_version=True).value
+    run_id = "a" * 32
+    frame = _frame(1, "thinking", "0")
+    frame.update(gen=7, generation_run_id=run_id)
+    pending = s.update_message_and_frames_if_unchanged(
+        mid, version, "old plus", {"pin_publication_state": "pending"},
+        frames=[frame], layers=[0], k=1, pin_publication_state="pending",
+    )
+    assert pending.state == "committed"
+    durable_version = pending.observed_version
+    assert s.finalize_continuation_pin_publication(
+        mid, expected_version=durable_version, generation_run_id=run_id,
+        gen_id=7, state="published",
+    ).state == "committed"
+    assert s.finalize_continuation_pin_publication(
+        mid, expected_version=durable_version, generation_run_id=run_id,
+        gen_id=7, state="published",
+    ).state == "committed"
+    assert s.finalize_continuation_pin_publication(
+        mid, expected_version=durable_version, generation_run_id=run_id,
+        gen_id=7, state="unavailable",
+    ).state == "committed"
+    # Lost acknowledgement retry proves the same immutable attempt even though
+    # the usable pair was cleared by the first unavailable transition.
+    assert s.finalize_continuation_pin_publication(
+        mid, expected_version=durable_version, generation_run_id=run_id,
+        gen_id=7, state="unavailable",
+    ).state == "committed"
+    assert s.finalize_continuation_pin_publication(
+        mid, expected_version=durable_version, generation_run_id="b" * 32,
+        gen_id=8, state="unavailable",
+    ).state == "superseded"
+
+    message = s.get_message(mid)
+    raw = msgpack.unpackb(
+        (store_mod.FRAMES_DIR / message["frames_file"]).read_bytes(),
+        strict_map_key=False,
+    )
+    assert raw["pin_publication_attempt_gen_id"] == 7
+    assert raw["pin_publication_attempt_run_id"] == run_id
+    loaded = s.load_frames(mid)
+    assert loaded["pin_publication_state"] == "unavailable"
+    assert loaded["pin_gen_id"] is None
+    assert loaded["pin_generation_run_id"] is None
+    assert "pin_publication_attempt_gen_id" not in loaded
+    assert "pin_publication_attempt_run_id" not in loaded
+
+
+def test_total_unavailable_resolution_retries_faults_and_uncertain_outcomes(monkeypatch):
+    from api import app
+
+    outcomes = [
+        RuntimeError("injected Store fault"),
+        SimpleNamespace(state="not_committed"),
+        SimpleNamespace(state="ambiguous"),
+        SimpleNamespace(state="ambiguous"),
+        SimpleNamespace(state="committed"),
+    ]
+    calls = []
+    yields = []
+
+    class FakeStore:
+        def finalize_continuation_pin_publication(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return outcome
+
+    monkeypatch.setattr(app, "store", FakeStore())
+    monkeypatch.setattr(app, "_retry_thread_yield", lambda: yields.append(True))
+    assert app._resolve_continuation_pin_unavailable_total(
+        11, expected_version=4, generation_run_id="c" * 32, gen_id=9,
+    ) == "committed"
+    assert len(calls) == 5
+    assert len(yields) == 4
+    assert all(call[1]["generation_run_id"] == "c" * 32 for call in calls)
+    assert all(call[1]["gen_id"] == 9 for call in calls)
+
+
+def test_total_unavailable_resolution_stops_on_exact_supersession(monkeypatch):
+    from api import app
+
+    calls = 0
+
+    class FakeStore:
+        def finalize_continuation_pin_publication(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return SimpleNamespace(state="superseded")
+
+    monkeypatch.setattr(app, "store", FakeStore())
+    assert app._resolve_continuation_pin_unavailable_total(
+        11, expected_version=4, generation_run_id="d" * 32, gen_id=9,
+    ) == "superseded"
+    assert calls == 1
+
+
+def test_persisted_continue_publication_failure_commits_visualization_without_pin(tmp_path, monkeypatch):
+    from api import app
+    from core import store as store_mod
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    s = store_mod.Store()
+    monkeypatch.setattr(app, "store", s)
+    cid = s.create_conversation("c").value
+    mid, version = s.add_message(cid, None, "assistant", "old", return_version=True).value
+    run_id = "b" * 32
+
+    class FailingLens:
+        layers = [0]
+        k = 1
+        binding_id = 4
+        model_session_id = 3
+        meta = {"path": "/lens", "model_id": "m", "model_revision": "r", "fitted_layers_all": [0], "tapped_layers": [0], "k": 1}
+
+        def __init__(self):
+            self.provisional = {9}
+            self.committed = set()
+
+        def begin_gen_publication(self, gen_id):
+            assert gen_id == 9
+            raise RuntimeError("injected residual publication failure")
+
+        def rollback_gen_publication(self, _receipt):
+            raise AssertionError("no receipt was created")
+
+        def discard_gen(self, gen_id):
+            self.provisional.discard(gen_id)
+            return True
+
+        def unpublish_gen(self, gen_id, **_identity):
+            self.committed.discard(gen_id)
+            return False
+
+    lens = FailingLens()
+
+    def generate(**kwargs):
+        frame = _frame(1, "thinking", "0")
+        frame.update(gen=9, generation_run_id=run_id)
+        kwargs["emit"]({"type": "frame", **frame})
+        kwargs["emit"]({
+            "type": "done", "text": " plus", "meta": {"model_id": "m", "generation_run_id": run_id},
+            "stats": {"tokens": 1}, "stopped": False, "gen_id": 9,
+            "generation_run_id": run_id, "pin_publication_state": "pending",
+            "continuation_suffix_start_pos": 1, "continuation_suffix_end_pos": 2,
+        })
+
+    monkeypatch.setattr(app.manager, "generate", generate)
+    emitted = []
+    context = SimpleNamespace(lens=lens, intervention_snapshot={"rules": []})
+    app._persisted_continue({}, mid, threading.Event(), emitted.append, context)
+
+    message = s.get_message(mid)
+    assert message["content"] == "old plus"
+    assert message["version"] == version + 1
+    metadata = json.loads(message["meta"])
+    assert metadata["pin_publication_state"] == "unavailable"
+    assert "pin_gen_id" not in metadata
+    assert "pin_generation_run_id" not in metadata
+    loaded = s.load_frames(mid)
+    assert loaded["pin_publication_state"] == "unavailable"
+    assert loaded["pin_gen_id"] is None
+    assert loaded["pin_generation_run_id"] is None
+    assert loaded["frames"][0]["gen"] is None
+    assert loaded["frames"][0]["generation_run_id"] is None
+    terminal = emitted[-1]
+    assert terminal["type"] == "done"
+    assert terminal["content"] == "old plus"
+    assert terminal["pin_publication_state"] == "unavailable"
+    assert "gen_id" not in terminal
+    assert "generation_run_id" not in terminal
+    assert not lens.provisional
+    assert not lens.committed
+
+
+def test_finalize_gen_publication_failure_restores_committed_and_provisional_maps(monkeypatch):
+    from collections import OrderedDict
+    from core.lens_manager import GEN_STORE_MAX, LensManager
+
+    lens = LensManager()
+    lens.layers = []
+    lens.model_session_id = 1
+    lens.binding_id = 2
+    old_ids = [lens.start_gen(generation_run_id=f"{i:032x}") for i in range(GEN_STORE_MAX)]
+    attempt = lens.start_gen(generation_run_id="f" * 32, provisional=True)
+    lens.finalize_gen(attempt, retained_thinking=[], publish=False)
+
+    class FailOnceOrderedDict(OrderedDict):
+        def __init__(self, values):
+            super().__init__(values)
+            self.failed = False
+
+        def __setitem__(self, key, value):
+            if key == attempt and not self.failed:
+                self.failed = True
+                raise RuntimeError("injected committed insertion failure")
+            return super().__setitem__(key, value)
+
+    lens.gen_store = FailOnceOrderedDict(lens.gen_store)
+    with pytest.raises(RuntimeError, match="injected committed insertion failure"):
+        lens.finalize_gen(attempt, publish=True)
+    assert list(lens.gen_store) == old_ids
+    assert attempt not in lens._provisional_gen_store
+    assert lens._pending_gen_publications == {}
+    assert list(lens.gen_store) == old_ids
+
+
+def test_generation_publication_receipt_delays_capacity_eviction_and_is_exact():
+    from core.lens_manager import GEN_STORE_MAX, LensManager
+
+    lens = LensManager()
+    lens.layers = []
+    lens.model_session_id = 1
+    lens.binding_id = 2
+    old_ids = [lens.start_gen(generation_run_id=f"{i:032x}") for i in range(1, GEN_STORE_MAX + 1)]
+    attempt = lens.start_gen(generation_run_id="f" * 32, provisional=True)
+    lens.finalize_gen(attempt, retained_thinking=[], publish=False)
+
+    receipt = lens.begin_gen_publication(attempt)
+    assert list(lens.gen_store) == old_ids
+    assert attempt in lens._provisional_gen_store
+    assert not lens.has_published_gen(attempt, "f" * 32)
+    assert lens.rollback_gen_publication(receipt)
+    assert list(lens.gen_store) == old_ids
+    assert attempt not in lens._provisional_gen_store
+    with pytest.raises(ValueError, match="stale"):
+        lens.rollback_gen_publication(receipt)
+
+    successful = lens.start_gen(generation_run_id="e" * 32, provisional=True)
+    lens.finalize_gen(successful, retained_thinking=[], publish=False)
+    committed = lens.commit_gen_publication(lens.begin_gen_publication(successful))
+    assert committed.published
+    assert list(lens.gen_store) == old_ids[1:] + [successful]
+    assert len(lens.gen_store) == GEN_STORE_MAX
+
+
+def test_generation_publication_prepare_and_eviction_failures_preserve_old_runs():
+    from collections import OrderedDict
+    from core.lens_manager import GEN_STORE_MAX, LensManager
+
+    lens = LensManager()
+    lens.layers = []
+    lens.model_session_id = 1
+    lens.binding_id = 2
+    old_ids = [lens.start_gen(generation_run_id=f"{i:032x}") for i in range(GEN_STORE_MAX)]
+    attempt = lens.start_gen(generation_run_id="f" * 32, provisional=True)
+    lens.finalize_gen(attempt, retained_thinking=[], publish=False)
+
+    class FailPending(dict):
+        def __setitem__(self, key, value):
+            raise RuntimeError("injected pending insertion failure")
+
+    lens._pending_gen_publications = FailPending()
+    with pytest.raises(RuntimeError, match="pending insertion"):
+        lens.begin_gen_publication(attempt)
+    assert list(lens.gen_store) == old_ids
+    assert attempt in lens._provisional_gen_store
+
+    lens._pending_gen_publications = {}
+    receipt = lens.begin_gen_publication(attempt)
+
+    class FailEviction(OrderedDict):
+        def popitem(self, *args, **kwargs):
+            raise RuntimeError("injected eviction failure")
+
+    lens.gen_store = FailEviction(lens.gen_store)
+    with pytest.raises(RuntimeError, match="eviction failure"):
+        lens.commit_gen_publication(receipt)
+    assert list(lens.gen_store) == old_ids
+    assert attempt in lens._provisional_gen_store
+    assert receipt.nonce in lens._pending_gen_publications
+    assert lens.rollback_gen_publication(receipt)
+    assert list(lens.gen_store) == old_ids
+
+
+def test_generation_publication_result_memory_error_precedes_linearization(monkeypatch):
+    from core import lens_manager as lens_mod
+
+    lens = lens_mod.LensManager()
+    lens.layers = []
+    lens.model_session_id = 1
+    lens.binding_id = 2
+    old_ids = [
+        lens.start_gen(generation_run_id=f"{i:032x}")
+        for i in range(lens_mod.GEN_STORE_MAX)
+    ]
+    attempt = lens.start_gen(generation_run_id="f" * 32, provisional=True)
+    lens.finalize_gen(attempt, retained_thinking=[], publish=False)
+    receipt = lens.begin_gen_publication(attempt)
+
+    def fail_result(*_args, **_kwargs):
+        raise MemoryError("injected success-result allocation failure")
+
+    monkeypatch.setattr(lens_mod, "GenerationPublicationResult", fail_result)
+    with pytest.raises(MemoryError, match="success-result"):
+        lens.commit_gen_publication(receipt)
+    assert list(lens.gen_store) == old_ids
+    assert attempt in lens._provisional_gen_store
+    assert lens._pending_gen_publications[receipt.nonce][0] == receipt
+    assert lens.rollback_gen_publication(receipt)
+    assert list(lens.gen_store) == old_ids
+
+
+def test_finalize_gen_publication_uses_one_prelinearization_result(monkeypatch):
+    from core import lens_manager as lens_mod
+
+    lens = lens_mod.LensManager()
+    lens.layers = []
+    lens.model_session_id = 1
+    lens.binding_id = 2
+    old_ids = [
+        lens.start_gen(generation_run_id=f"{i:032x}")
+        for i in range(1, lens_mod.GEN_STORE_MAX + 1)
+    ]
+    attempt = lens.start_gen(generation_run_id="f" * 32, provisional=True)
+    original_result = lens_mod.GenerationPublicationResult
+    constructed = []
+
+    def construct_once(*args, **kwargs):
+        if constructed:
+            raise MemoryError("injected second result allocation failure")
+        result = original_result(*args, **kwargs)
+        constructed.append(result)
+        return result
+
+    monkeypatch.setattr(lens_mod, "GenerationPublicationResult", construct_once)
+    result = lens.finalize_gen(attempt, retained_thinking=[], publish=True)
+    assert result is constructed[0]
+    assert len(constructed) == 1
+    assert list(lens.gen_store) == old_ids[1:] + [attempt]
+    assert attempt not in lens._provisional_gen_store
+    assert lens._pending_gen_publications == {}
+
+
+@pytest.mark.parametrize("rollback_mode", ["transient", "lost_ack"])
+def test_finalize_gen_failure_totally_rolls_back_owned_receipt(
+    monkeypatch, rollback_mode,
+):
+    from core import lens_manager as lens_mod
+
+    lens = lens_mod.LensManager()
+    lens.layers = []
+    lens.model_session_id = 1
+    lens.binding_id = 2
+    old_ids = [
+        lens.start_gen(generation_run_id=f"{i:032x}")
+        for i in range(1, lens_mod.GEN_STORE_MAX + 1)
+    ]
+    attempt = lens.start_gen(generation_run_id="f" * 32, provisional=True)
+    primary = MemoryError("injected pre-linearization result failure")
+
+    def fail_result(*_args, **_kwargs):
+        raise primary
+
+    original_rollback = lens.rollback_gen_publication
+    rollback_calls = 0
+
+    def faulty_rollback(receipt):
+        nonlocal rollback_calls
+        rollback_calls += 1
+        if rollback_mode == "transient" and rollback_calls <= 2:
+            raise RuntimeError("injected transient rollback failure")
+        result = original_rollback(receipt)
+        if rollback_mode == "lost_ack" and rollback_calls == 1:
+            raise RuntimeError("lost rollback acknowledgement")
+        return result
+
+    monkeypatch.setattr(lens_mod, "GenerationPublicationResult", fail_result)
+    monkeypatch.setattr(lens, "rollback_gen_publication", faulty_rollback)
+    with pytest.raises(MemoryError) as raised:
+        lens.finalize_gen(attempt, retained_thinking=[], publish=True)
+    assert raised.value is primary
+    assert rollback_calls >= (3 if rollback_mode == "transient" else 1)
+    assert list(lens.gen_store) == old_ids
+    assert attempt not in lens.gen_store
+    assert attempt not in lens._provisional_gen_store
+    assert lens._pending_gen_publications == {}
+
+
+def test_total_publication_rollback_does_not_remove_reused_unrelated_identity():
+    from core.lens_manager import LensManager
+
+    lens = LensManager()
+    lens.layers = []
+    lens.model_session_id = 1
+    lens.binding_id = 2
+    attempt = lens.start_gen(generation_run_id="a" * 32, provisional=True)
+    lens.finalize_gen(attempt, retained_thinking=[], publish=False)
+    receipt = lens.begin_gen_publication(attempt)
+    assert lens.rollback_gen_publication(receipt)
+
+    replacement = {
+        "generation_run_id": "b" * 32,
+        "model_session_id": 9,
+        "lens_binding_id": 10,
+    }
+    lens._provisional_gen_store[attempt] = replacement
+    assert lens.rollback_gen_publication_total(receipt)
+    assert lens._provisional_gen_store[attempt] is replacement
+
+
+def test_persisted_continue_durable_publish_failure_preserves_full_committed_store(tmp_path, monkeypatch):
+    from collections import OrderedDict
+    from api import app
+    from core import store as store_mod
+    from core.lens_manager import GEN_STORE_MAX, LensGenerationView, LensManager
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    durable_store = store_mod.Store()
+    monkeypatch.setattr(app, "store", durable_store)
+    cid = durable_store.create_conversation("c").value
+    mid, version = durable_store.add_message(
+        cid, None, "assistant", "old", return_version=True,
+    ).value
+
+    manager = LensManager()
+    manager.layers = [0]
+    manager.model_session_id = 3
+    manager.binding_id = 4
+    manager.lens = SimpleNamespace(meta={})
+    manager.meta = {
+        "path": "/lens", "model_id": "m", "model_revision": "r",
+        "fitted_layers_all": [0], "tapped_layers": [0], "k": 1,
+    }
+    manager.k = 1
+    old_ids = [
+        manager.start_gen(generation_run_id=f"{i:032x}")
+        for i in range(1, GEN_STORE_MAX + 1)
+    ]
+    lens = LensGenerationView(manager)
+    run_id = "b" * 32
+    rollback_calls = 0
+    rollback_publication = lens.rollback_gen_publication
+
+    def rollback_once(receipt):
+        nonlocal rollback_calls
+        rollback_calls += 1
+        if rollback_calls == 1:
+            raise RuntimeError("injected rollback fault")
+        return rollback_publication(receipt)
+
+    lens.rollback_gen_publication = rollback_once
+
+    class FailLocalCommit(OrderedDict):
+        def popitem(self, *args, **kwargs):
+            raise RuntimeError("injected local eviction failure")
+
+    manager.gen_store = FailLocalCommit(manager.gen_store)
+
+    def generate(**kwargs):
+        attempt = lens.start_gen(generation_run_id=run_id, provisional=True)
+        lens.finalize_gen(attempt, retained_thinking=[], publish=False)
+        kwargs["attempt_owner"].record(
+            gen_id=attempt, generation_run_id=run_id,
+            model_session_id=3, lens_binding_id=4,
+        )
+        frame = _frame(1, "thinking", "0")
+        frame.update(gen=attempt, generation_run_id=run_id)
+        kwargs["emit"]({"type": "frame", **frame})
+        kwargs["emit"]({
+            "type": "done", "text": " plus", "gen_id": attempt,
+            "generation_run_id": run_id, "pin_publication_state": "pending",
+            "meta": {}, "stats": {}, "stopped": False,
+            "continuation_suffix_start_pos": 1,
+            "continuation_suffix_end_pos": 2,
+        })
+
+    original_finalize = durable_store.finalize_continuation_pin_publication
+
+    unavailable_calls = 0
+
+    def lose_first_unavailable_ack(*args, **kwargs):
+        nonlocal unavailable_calls
+        outcome = original_finalize(*args, **kwargs)
+        if kwargs["state"] == "unavailable":
+            unavailable_calls += 1
+            if unavailable_calls == 1:
+                assert outcome.state == "committed"
+                assert not any(frame.get("type") == "done" for frame in emitted)
+                return SimpleNamespace(state="ambiguous")
+        return outcome
+
+    monkeypatch.setattr(app.manager, "generate", generate)
+    monkeypatch.setattr(
+        durable_store, "finalize_continuation_pin_publication",
+        lose_first_unavailable_ack,
+    )
+    emitted = []
+    app._persisted_continue(
+        {}, mid, threading.Event(), emitted.append,
+        SimpleNamespace(lens=lens, intervention_snapshot={"rules": []}),
+    )
+
+    assert list(manager.gen_store) == old_ids
+    assert manager._provisional_gen_store == {}
+    assert manager._pending_gen_publications == {}
+    assert rollback_calls == 2
+    assert unavailable_calls == 2
+    message = durable_store.get_message(mid)
+    assert message["content"] == "old plus"
+    assert message["version"] == version + 1
+    archive = durable_store.load_frames(mid)
+    assert archive["pin_publication_state"] == "unavailable"
+    assert archive["pin_gen_id"] is None
+    terminal = emitted[-1]
+    assert terminal["pin_publication_state"] == "unavailable"
+    assert "gen_id" not in terminal
+    assert "generation_run_id" not in terminal
+
+
+@pytest.mark.parametrize("cleanup_stage", ["hook", "reader", "maintenance"])
+def test_persisted_continue_owns_attempt_before_post_done_cleanup_failure(monkeypatch, cleanup_stage):
+    from api import app
+
+    class FakeStore:
+        def get_message(self, message_id):
+            return {
+                "id": message_id, "conversation_id": 1, "role": "assistant",
+                "content": "old", "meta": None, "version": 2, "frames_file": None,
+            }
+
+        def path_to_root(self, _message_id):
+            return [{"role": "assistant", "content": "old"}]
+
+        def update_message_and_frames_if_unchanged(self, *_args, **_kwargs):
+            raise AssertionError("Store must not mutate when generation cleanup fails")
+
+    class FakeLens:
+        layers = [0]
+        k = 1
+        binding_id = 4
+        model_session_id = 3
+        meta = {"model_id": "m"}
+
+        def __init__(self):
+            self.provisional = {9}
+            self.committed = {1, 2, 3, 4}
+
+        def discard_gen(self, gen_id):
+            self.provisional.discard(gen_id)
+            return True
+
+        def unpublish_gen(self, gen_id, **_identity):
+            self.committed.discard(gen_id)
+            return False
+
+    lens = FakeLens()
+
+    def generate(**kwargs):
+        kwargs["attempt_owner"].record(
+            gen_id=9, generation_run_id="a" * 32,
+            model_session_id=3, lens_binding_id=4,
+        )
+        kwargs["emit"]({
+            "type": "done", "text": " plus", "gen_id": 9,
+            "generation_run_id": "a" * 32, "pin_publication_state": "pending",
+        })
+        raise RuntimeError(f"injected {cleanup_stage} cleanup failure")
+
+    monkeypatch.setattr(app, "store", FakeStore())
+    monkeypatch.setattr(app.manager, "generate", generate)
+    emitted = []
+    with pytest.raises(RuntimeError, match=cleanup_stage):
+        app._persisted_continue(
+            {}, 1, threading.Event(), emitted.append,
+            SimpleNamespace(lens=lens, intervention_snapshot={"rules": []}),
+        )
+    assert lens.provisional == set()
+    assert lens.committed == {1, 2, 3, 4}
+    assert emitted == []
+
+
+def test_persisted_continue_unexpected_metadata_failure_discards_provisional(monkeypatch):
+    from api import app
+
+    class FakeStore:
+        def get_message(self, message_id):
+            return {
+                "id": message_id, "conversation_id": 1, "role": "assistant",
+                "content": "old", "meta": "{broken", "version": 2, "frames_file": None,
+            }
+
+        def path_to_root(self, _message_id):
+            return [{"role": "assistant", "content": "old"}]
+
+        def update_message_and_frames_if_unchanged(self, *_args, **_kwargs):
+            raise AssertionError("Store must not mutate after metadata parse failure")
+
+    class FakeLens:
+        layers = [0]
+        k = 1
+        binding_id = 1
+        model_session_id = 1
+        meta = {"model_id": "m"}
+
+        def __init__(self):
+            self.provisional = {8}
+            self.committed = {3}
+
+        def discard_gen(self, gen_id):
+            self.provisional.discard(gen_id)
+            return True
+
+        def unpublish_gen(self, gen_id, **_kwargs):
+            self.committed.discard(gen_id)
+            return False
+
+    lens = FakeLens()
+
+    def generate(**kwargs):
+        kwargs["emit"]({
+            "type": "done", "text": " plus", "gen_id": 8,
+            "generation_run_id": "c" * 32, "pin_publication_state": "pending",
+            "meta": {}, "stats": {}, "stopped": False,
+        })
+
+    monkeypatch.setattr(app, "store", FakeStore())
+    monkeypatch.setattr(app.manager, "generate", generate)
+    with pytest.raises(json.JSONDecodeError):
+        app._persisted_continue(
+            {}, 1, threading.Event(), lambda _frame: None,
+            SimpleNamespace(lens=lens, intervention_snapshot={"rules": []}),
+        )
+    assert lens.provisional == set()
+    assert lens.committed == {3}
+
+
+def test_frame_api_requires_durable_state_and_live_exact_residual_membership(monkeypatch):
+    from api import app
+
+    run_id = "d" * 32
+    archive = {
+        "pin_publication_state": "published", "pin_gen_id": 5,
+        "pin_generation_run_id": run_id,
+        "frames": [{"type": "frame", "gen": 5, "generation_run_id": run_id}],
+    }
+    monkeypatch.setattr(app, "store", SimpleNamespace(load_frames=lambda _mid: archive))
+    membership = SimpleNamespace(has_published_gen=lambda gen_id, candidate: (gen_id, candidate) == (5, run_id))
+    monkeypatch.setattr(app, "lens_manager", membership)
+    visible = app.api_message_frames(1)
+    assert visible["pin_publication_state"] == "published"
+    assert visible["pin_gen_id"] == 5
+    assert visible["frames"][0]["generation_run_id"] == run_id
+
+    membership.has_published_gen = lambda _gen_id, _candidate: False
+    hidden = app.api_message_frames(1)
+    assert hidden["pin_publication_state"] == "unavailable"
+    assert hidden["pin_gen_id"] is None
+    assert hidden["pin_generation_run_id"] is None
+    assert hidden["frames"][0]["gen"] is None
+    assert hidden["frames"][0]["generation_run_id"] is None
+
+
+def test_total_worker_release_retries_false_raise_and_current_faults(monkeypatch):
+    from api import app
+
+    class Coordinator:
+        def __init__(self):
+            self.current = True
+            self.release_calls = 0
+            self.current_calls = 0
+
+        def is_current(self, _token):
+            self.current_calls += 1
+            if self.current_calls == 1:
+                raise RuntimeError("transient current failure")
+            return self.current
+
+    coordinator = Coordinator()
+    outcomes = [RuntimeError("release failed"), False, True]
+
+    class Dispatch:
+        token = object()
+
+        def __init__(self):
+            self.coordinator = coordinator
+
+        def release_from_worker(self):
+            coordinator.release_calls += 1
+            result = outcomes.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            if result:
+                coordinator.current = False
+            return result
+
+    yields = []
+    monkeypatch.setattr(app, "_retry_thread_yield", lambda: yields.append(True))
+    app._release_worker_total(Dispatch())
+    assert coordinator.current is False
+    assert coordinator.release_calls == 3
+    assert yields
+
+
+def test_total_unclaimed_abort_retries_until_payload_and_owner_clear(monkeypatch):
+    from api import app
+
+    class Coordinator:
+        current = True
+        current_calls = 0
+
+        def is_current(self, _token):
+            self.current_calls += 1
+            if self.current_calls == 1:
+                raise RuntimeError("transient current failure")
+            return self.current
+
+    coordinator = Coordinator()
+    outcomes = [RuntimeError("abort failed"), False, True]
+
+    class Dispatch:
+        token = object()
+        claimed = False
+        payload = object()
+
+        def __init__(self):
+            self.coordinator = coordinator
+
+        def abort_unclaimed(self):
+            result = outcomes.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            self.payload = None
+            if result:
+                coordinator.current = False
+            return result
+
+    dispatch = Dispatch()
+    yields = []
+    monkeypatch.setattr(app, "_retry_thread_yield", lambda: yields.append(True))
+    app._abort_unclaimed_total(dispatch)
+    assert coordinator.current is False
+    assert dispatch.payload is None
+    assert yields
+
+
+def test_handoff_registration_failure_retains_token_until_total_release(monkeypatch):
+    from api import app
+    from core.model_session import OperationType
+
+    class Coordinator:
+        def __init__(self):
+            self.owner = None
+            self.release_results = [RuntimeError("release fault"), False, True]
+            self.release_calls = 0
+
+        def acquire(self, operation_type, **_kwargs):
+            assert self.owner is None
+            self.owner = SimpleNamespace(type=operation_type)
+            return self.owner, SimpleNamespace(bundle=object())
+
+        def release(self, token):
+            assert token is self.owner
+            self.release_calls += 1
+            result = self.release_results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            if result:
+                self.owner = None
+            return result
+
+        def is_current(self, token):
+            return self.owner is token
+
+    coordinator = Coordinator()
+    handoff = app.OperationHandoff(coordinator)
+    original = handoff._set_state
+    failed = False
+
+    def fail_registration(state):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise RuntimeError("registration failed")
+        return original(state)
+
+    monkeypatch.setattr(handoff, "_set_state", fail_registration)
+    with pytest.raises(RuntimeError, match="registration failed") as caught:
+        handoff.acquire(OperationType.MODEL_READ)
+    assert coordinator.owner is None
+    assert coordinator.release_calls == 3
+    assert handoff.token is None
+    assert handoff.closed is True
+    assert caught.value.__context__ is None
+    assert caught.value.__cause__ is None
+
+
+def test_await_transferred_worker_claimed_cancellation_waits_for_exact_release():
+    from api import app
+    from core.model_session import ModelSessionCoordinator, OperationType, WorkerDispatch
+
+    async def scenario():
+        coordinator = ModelSessionCoordinator()
+        token, _ = coordinator.acquire(OperationType.MODEL_READ)
+        stop = threading.Event()
+        dispatch = WorkerDispatch(coordinator, token, stop_event=stop, payload={})
+        claimed = asyncio.Event()
+        finish = asyncio.Event()
+
+        async def worker():
+            assert dispatch.claim()
+            dispatch.take_payload()
+            claimed.set()
+            await finish.wait()
+            dispatch.release_from_worker()
+            return app.WorkerOutcome(value="ok")
+
+        retained = asyncio.create_task(worker())
+        await claimed.wait()
+        waiter = asyncio.create_task(app._await_transferred_worker(retained, dispatch))
+        await asyncio.sleep(0)
+        waiter.cancel()
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        assert coordinator.is_current(token)
+        finish.set()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await waiter
+        assert caught.value.__context__ is None
+        assert caught.value.__cause__ is None
+        assert retained.done()
+        assert not coordinator.is_current(token)
+
+    asyncio.run(scenario())
+
+
+def test_await_transferred_worker_unclaimed_cancellation_releases_payload():
+    from api import app
+    from core.model_session import ModelSessionCoordinator, OperationType, WorkerDispatch
+
+    async def scenario():
+        coordinator = ModelSessionCoordinator()
+        token, _ = coordinator.acquire(OperationType.MODEL_READ)
+        dispatch = WorkerDispatch(coordinator, token, payload={"heavy": object()})
+
+        async def worker():
+            await asyncio.sleep(0.01)
+            assert dispatch.claim() is False
+            return app.WorkerOutcome()
+
+        retained = asyncio.create_task(worker())
+        waiter = asyncio.create_task(app._await_transferred_worker(retained, dispatch))
+        await asyncio.sleep(0)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert retained.done()
+        assert dispatch.take_payload() is None
+        assert not coordinator.is_current(token)
+
+    asyncio.run(scenario())
+
+
+def test_ws_terminal_suppresses_drain_diagnostic_error(monkeypatch):
+    from api import app
+
+    async def scenario():
+        worker = asyncio.create_task(asyncio.sleep(0, result=app.WorkerOutcome()))
+        waiter = asyncio.create_task(asyncio.sleep(0))
+        receiver = asyncio.create_task(asyncio.sleep(0))
+        calls = 0
+        sent = []
+
+        async def flaky_drain(task):
+            nonlocal calls
+            if task is worker and calls == 0:
+                calls += 1
+                raise RuntimeError("injected drain failure")
+            return await asyncio.gather(task, return_exceptions=True)
+
+        class Coordinator:
+            def is_current(self, _token):
+                return False
+
+        class Dispatch:
+            coordinator = Coordinator()
+            token = object()
+            claimed = True
+
+            def cancel_from_awaiter(self):
+                return False
+
+        async def send(_ws, payload):
+            sent.append(payload)
+
+        monkeypatch.setattr(app, "_drain_worker_uninterruptibly", flaky_drain)
+        monkeypatch.setattr(app, "_ws_send", send)
+        await app._finalize_ws_runtime(
+            object(), worker, receiver, waiter, threading.Event(), Dispatch(), True,
+        )
+        assert worker.done() and receiver.done() and waiter.done()
+        assert sent == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mode", ["success", "failure", "rollback_failure", "cancelled"])
+def test_lens_load_worker_clears_rollback_resources_before_exact_release(mode, monkeypatch):
+    import gc
+    from api import app
+    from core.model_session import WorkerDispatch
+
+    class Resource:
+        pass
+
+    class FakeLensManager:
+        def __init__(self):
+            self.lens = Resource()
+            self.mask = Resource()
+            self._J = Resource()
+
+        def state_record(self):
+            return {"lens": self.lens, "mask": self.mask, "_J": self._J}
+
+        def restore_state_record(self, state):
+            self.lens, self.mask, self._J = state["lens"], state["mask"], state["_J"]
+            if mode == "rollback_failure":
+                raise KeyboardInterrupt("rollback failed")
+
+        def load(self, *_args, **_kwargs):
+            self.lens, self.mask, self._J = Resource(), Resource(), Resource()
+            if mode == "failure" or mode == "rollback_failure":
+                raise RuntimeError("load failed")
+            if mode == "cancelled":
+                raise asyncio.CancelledError()
+            return {"loaded": True}
+
+    fake_lens = FakeLensManager()
+    refs = [weakref.ref(fake_lens.lens), weakref.ref(fake_lens.mask), weakref.ref(fake_lens._J)]
+
+    class Coordinator:
+        def __init__(self):
+            self.owner = object()
+            self.released_with_dead_predecessor = False
+
+        def update_lens_binding(self, _token, _result):
+            return None
+
+        def release(self, token):
+            assert token is self.owner
+            self.owner = None
+            # Model the admitted successor withdrawing the authoritative state.
+            fake_lens.lens = fake_lens.mask = fake_lens._J = None
+            gc.collect()
+            self.released_with_dead_predecessor = all(ref() is None for ref in refs)
+            return True
+
+        def is_current(self, token):
+            return self.owner is token
+
+        def request_cancel(self, _token):
+            return True
+
+    coordinator = Coordinator()
+    token = coordinator.owner
+    dispatch = WorkerDispatch(coordinator, token, payload={
+        "repo_id": "r", "filename": "f", "revision": "main", "path": None,
+        "layers": [0], "k": 1,
+    })
+    monkeypatch.setattr(app, "lens_manager", fake_lens)
+    monkeypatch.setattr(app.manager, "coordinator", coordinator)
+    worker = app._make_lens_load_worker(dispatch, token)
+    if mode == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            worker()
+    else:
+        outcome = worker()
+        assert isinstance(outcome, app.WorkerOutcome)
+        assert outcome.ok is (mode == "success")
+    assert coordinator.owner is None
+    assert coordinator.released_with_dead_predecessor
+
+
+def test_all_seven_http_worker_routes_use_total_transferred_await():
+    import inspect
+    from api import app
+
+    routes = (
+        app.api_delete_model, app.api_lens_load, app.api_edit_export,
+        app.api_edit_export_gguf, app.api_generate_sync,
+        app.api_token_neighbors, app.api_lens_pin,
+    )
+    for route in routes:
+        source = inspect.getsource(route)
+        assert "_await_transferred_worker(" in source, route.__name__
+        assert "await asyncio.shield(task)" not in source, route.__name__
+
+
+def test_cancel_task_uninterruptibly_survives_repeated_caller_cancellation():
+    from api import app
+
+    async def scenario():
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def resistant():
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release.wait()
+
+        child = asyncio.create_task(resistant())
+        await started.wait()
+        cleanup = asyncio.create_task(app._cancel_task_uninterruptibly(child))
+        await asyncio.sleep(0)
+        cleanup.cancel()
+        await asyncio.sleep(0)
+        cleanup.cancel()
+        await asyncio.sleep(0)
+        assert not cleanup.done()
+        assert not child.done()
+        release.set()
+        observed = await cleanup
+        assert observed is True
+        assert child.done()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("first_result", [RuntimeError("cancel fault"), False])
+def test_cancel_task_uninterruptibly_retries_failed_cancel_request(first_result):
+    from api import app
+
+    class FaultTask:
+        def __init__(self):
+            self.cancel_calls = 0
+            self.finished = False
+
+        def done(self):
+            return self.finished
+
+        def cancel(self):
+            self.cancel_calls += 1
+            if self.cancel_calls == 1:
+                if isinstance(first_result, BaseException):
+                    raise first_result
+                return first_result
+            self.finished = True
+            return True
+
+    async def scenario():
+        task = FaultTask()
+        assert await app._cancel_task_uninterruptibly(task) is False
+        assert task.done()
+        assert task.cancel_calls == 2
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("faulted_child", ["receiver", "waiter"])
+def test_ws_finalizer_retries_receiver_and_waiter_cancel_faults(faulted_child):
+    from api import app
+
+    async def scenario():
+        async def blocked():
+            await asyncio.Event().wait()
+
+        class CancelFaultProxy:
+            def __init__(self, task):
+                self.task = task
+                self.cancel_calls = 0
+
+            def __await__(self):
+                return self.task.__await__()
+
+            def done(self):
+                return self.task.done()
+
+            def result(self):
+                return self.task.result()
+
+            def cancel(self):
+                self.cancel_calls += 1
+                if self.cancel_calls == 1:
+                    raise RuntimeError("injected child cancel fault")
+                return self.task.cancel()
+
+        receiver_task = asyncio.create_task(blocked())
+        waiter_task = asyncio.create_task(blocked())
+        receiver = CancelFaultProxy(receiver_task) if faulted_child == "receiver" else receiver_task
+        waiter = CancelFaultProxy(waiter_task) if faulted_child == "waiter" else waiter_task
+        worker = asyncio.create_task(asyncio.sleep(0, result=app.WorkerOutcome()))
+
+        class Coordinator:
+            def is_current(self, _token):
+                return False
+
+        class Dispatch:
+            coordinator = Coordinator()
+            token = object()
+            claimed = True
+
+            def cancel_from_awaiter(self):
+                return False
+
+        await app._finalize_ws_runtime(
+            object(), worker, receiver, waiter, threading.Event(), Dispatch(), True,
+        )
+        faulted = receiver if faulted_child == "receiver" else waiter
+        assert faulted.cancel_calls == 2
+        assert receiver_task.done() and waiter_task.done() and worker.done()
+
+    asyncio.run(scenario())
+
+
+def test_transferred_worker_cancellation_wins_over_cancel_cleanup_failure(monkeypatch):
+    from api import app
+    from core.model_session import ModelSessionCoordinator, OperationType, WorkerDispatch
+
+    async def scenario():
+        coordinator = ModelSessionCoordinator()
+        token, _ = coordinator.acquire(OperationType.MODEL_READ)
+        dispatch = WorkerDispatch(coordinator, token, payload={})
+        claimed = asyncio.Event()
+        finish = asyncio.Event()
+
+        async def worker():
+            dispatch.claim()
+            dispatch.take_payload()
+            claimed.set()
+            await finish.wait()
+            dispatch.release_from_worker()
+            return app.WorkerOutcome(failure_kind="worker", failure_message="failed", http_status=500)
+
+        retained = asyncio.create_task(worker())
+        await claimed.wait()
+        monkeypatch.setattr(
+            dispatch, "cancel_from_awaiter",
+            lambda: (_ for _ in ()).throw(RuntimeError("cancel cleanup failed")),
+        )
+        waiter = asyncio.create_task(app._await_transferred_worker(retained, dispatch))
+        await asyncio.sleep(0)
+        waiter.cancel()
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        finish.set()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        assert retained.done()
+        assert not coordinator.is_current(token)
+
+    asyncio.run(scenario())

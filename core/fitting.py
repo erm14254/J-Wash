@@ -16,6 +16,8 @@ from core.gpus import gpu_stats
 
 FITS_DIR = config.DATA_DIR / "fits"
 WORKER = config.ROOT / "scripts" / "fit_worker.py"
+FIT_PROCESS_SHUTDOWN_TIMEOUT = 5.0
+FIT_THREAD_JOIN_TIMEOUT = 5.0
 
 # Fit corpus. Any HuggingFace dataset id works as-is: wikitext is the default
 # and keeps a dedicated streamed path, every other id goes through the generic
@@ -185,6 +187,8 @@ class _FitRun:
     helper_error: tuple | None = None
     helper_error_lock: threading.Lock = field(default_factory=threading.Lock)
     heartbeat_thread: threading.Thread | None = None
+    reservation_release: object | None = None
+    cleanup_thread: threading.Thread | None = None
 
 
 class FitManager:
@@ -203,7 +207,7 @@ class FitManager:
     def start(self, *, model_id, source, n_prompts=100, dtype="bf16", quant=None,
               devices=("cuda:0",), name=None, dim_batch=None,
               max_seq_len=128, source_layers=None, model_revision=None,
-              continue_from=None, datasets=(DATASET_WIKITEXT,)):
+              continue_from=None, datasets=(DATASET_WIKITEXT,), reservation_release=None):
         with self._lock:
             if self._active_run is not None:
                 raise ValueError("a fitting is already in progress")
@@ -255,10 +259,26 @@ class FitManager:
                 "params": params,
                 "error": None,
             }
+            started_response = dict(self.state)
             run = _FitRun()
+            run.reservation_release = reservation_release
             self._active_run = run
-        threading.Thread(target=self._run, args=(run, name, params), daemon=True).start()
-        return dict(self.state)
+        try:
+            orchestrator = threading.Thread(target=self._run, args=(run, name, params), daemon=True)
+            orchestrator.start()
+        except Exception:
+            with self._lock:
+                if self._active_run is run:
+                    self._active_run = None
+                self.state = {"state": "error", "error": "failed to start fitting orchestrator"}
+            if reservation_release is not None:
+                try:
+                    reservation_release()
+                except Exception:
+                    pass
+            run.done.set()
+            raise
+        return started_response
 
     def stop(self):
         with self._lock:
@@ -273,8 +293,7 @@ class FitManager:
                 self.state["state"] = "stopping"
         with run.process_lock:
             for proc in run.processes:
-                if proc.poll() is None:
-                    proc.terminate()
+                self._request_process_shutdown(proc, reap=False)
         self._emit()
         return dict(self.state)
 
@@ -297,7 +316,7 @@ class FitManager:
         run.heartbeat_stop.set()
         heartbeat = run.heartbeat_thread
         if heartbeat is not None and heartbeat is not threading.current_thread():
-            heartbeat.join()
+            heartbeat.join(timeout=FIT_THREAD_JOIN_TIMEOUT)
 
     def _record_helper_failure(self, run, source, exc, worker=None):
         """Record a stream-helper failure and unblock run-owned children."""
@@ -332,16 +351,173 @@ class FitManager:
             pass
 
     @staticmethod
-    def _join_run_helpers(run):
-        """Reap children and join helpers without holding the manager lock."""
-        for proc in run.processes:
+    def _bounded_wait(proc, timeout):
+        try:
+            proc.wait(timeout=timeout)
+            return True
+        except TypeError:
+            done = threading.Event()
+            result = {"ok": False}
+
+            def waiter():
+                try:
+                    proc.wait()
+                    result["ok"] = True
+                except Exception:
+                    result["ok"] = False
+                finally:
+                    done.set()
+
+            thread = threading.Thread(target=waiter, daemon=True)
+            thread.start()
+            return done.wait(timeout) and result["ok"]
+        except Exception:
+            return False
+
+
+    @staticmethod
+    def _wait_for_normal_process_exit(run, proc, worker_state=None, *, poll_interval=0.25):
+        """Wait for healthy worker completion without treating time as failure."""
+        while True:
+            if run.cancel.is_set() or run.helper_failure.is_set():
+                return False
             try:
-                proc.wait()
+                if proc.poll() is not None:
+                    return True
+            except Exception:
+                return False
+            if worker_state is not None and worker_state.get("state") == "done":
+                return FitManager._bounded_wait(proc, FIT_PROCESS_SHUTDOWN_TIMEOUT)
+            readers = getattr(run, "reader_threads", ())
+            if readers and all(not reader.is_alive() for reader in readers):
+                return FitManager._bounded_wait(proc, FIT_PROCESS_SHUTDOWN_TIMEOUT)
+            run.cancel.wait(poll_interval)
+
+    @staticmethod
+    def _request_process_shutdown(proc, *, reap=True, timeout=FIT_PROCESS_SHUTDOWN_TIMEOUT):
+        running = True
+        try:
+            running = proc.poll() is None
+        except Exception:
+            running = True
+        if running:
+            try:
+                proc.terminate()
             except Exception:
                 pass
-        for thread in run.helper_threads:
-            if thread is not threading.current_thread():
-                thread.join()
+        if not reap:
+            return False
+        confirmed = FitManager._bounded_wait(proc, timeout)
+        if not confirmed:
+            try:
+                if proc.poll() is None and hasattr(proc, "kill"):
+                    proc.kill()
+            except Exception:
+                pass
+            confirmed = FitManager._bounded_wait(proc, timeout)
+        try:
+            if proc.poll() is None:
+                confirmed = False
+        except Exception:
+            confirmed = False
+        return confirmed
+
+    def _join_run_helpers(self, run, *, timeout=FIT_THREAD_JOIN_TIMEOUT):
+        """Reap children and join helpers without holding the manager lock."""
+        quiesced = True
+        with run.process_lock:
+            processes = list(run.processes)
+        for proc in processes:
+            try:
+                quiesced = self._request_process_shutdown(proc, reap=True) and quiesced
+            except Exception:
+                quiesced = False
+        helpers = list(run.helper_threads)
+        heartbeat = run.heartbeat_thread
+        if heartbeat is not None:
+            helpers.append(heartbeat)
+        for thread in helpers:
+            if thread is not None and thread is not threading.current_thread():
+                try:
+                    thread.join(timeout=timeout)
+                    if thread.is_alive():
+                        quiesced = False
+                except Exception:
+                    quiesced = False
+        return quiesced
+
+    def _finalize_quiesced_run(self, run):
+        with self._lock:
+            if self._active_run is not run:
+                return False
+            if self.state.get("state") in ("running", "loading", "stopping", "cleanup_pending", "reaping"):
+                self.state.update(
+                    state="error",
+                    error=self.state.get("error") or "fit terminated during cleanup",
+                    eta_seconds=None,
+                )
+            self._active_run = None
+        try:
+            self._emit()
+        except Exception:
+            pass
+        release = run.reservation_release
+        if release is not None:
+            try:
+                release()
+            except Exception:
+                pass
+        run.done.set()
+        return True
+
+    def _start_cleanup_reaper(self, run):
+        with self._lock:
+            if self._active_run is not run:
+                return
+            self.state.update(state="cleanup_pending", phase="cleanup", eta_seconds=None)
+        try:
+            self._emit()
+        except Exception:
+            pass
+        if run.cleanup_thread is not None and run.cleanup_thread.is_alive():
+            return
+
+        def reaper():
+            self._cleanup_reaper_loop(run)
+
+        try:
+            thread = threading.Thread(target=reaper, daemon=True)
+            thread.start()
+            run.cleanup_thread = thread
+        except Exception as exc:
+            with self._lock:
+                if self._active_run is run:
+                    self.state.update(
+                        state="cleanup_pending", phase="cleanup",
+                        error=f"cleanup reaper start failed: {exc}", eta_seconds=None,
+                    )
+            try:
+                self._emit()
+            except Exception:
+                pass
+            self._cleanup_reaper_loop(run)
+
+    def _cleanup_reaper_loop(self, run):
+        while True:
+            run.heartbeat_stop.set()
+            if self._join_run_helpers(run):
+                self._finalize_quiesced_run(run)
+                return
+            with self._lock:
+                if self._active_run is not run:
+                    return
+                self.state.update(state="reaping", phase="cleanup", eta_seconds=None)
+            try:
+                self._emit()
+            except Exception:
+                pass
+            if run.done.wait(FIT_PROCESS_SHUTDOWN_TIMEOUT):
+                return
 
     def _helper_exception(self, run):
         with run.helper_error_lock:
@@ -365,12 +541,11 @@ class FitManager:
         with run.process_lock:
             processes = list(run.processes)
         for proc in processes:
-            if proc.poll() is None:
-                self._terminate_after_helper_failure(proc)
+            self._request_process_shutdown(proc, reap=True)
         self._join_run_helpers(run)
         heartbeat = run.heartbeat_thread
         if heartbeat is not None and heartbeat is not threading.current_thread():
-            heartbeat.join()
+            heartbeat.join(timeout=FIT_THREAD_JOIN_TIMEOUT)
 
     def _publish_preferred_failure(self, run, fallback):
         """Publish cancel > first helper failure > orchestration failure."""
@@ -508,9 +683,9 @@ class FitManager:
                     args=(run, proc, worker_state, started),
                     daemon=True,
                 )
+                reader.start()
                 run.helper_threads.append(reader)
                 run.reader_threads.append(reader)
-                reader.start()
             self._check_cancelled(run)
 
             self._check_cancelled(run)
@@ -519,8 +694,8 @@ class FitManager:
                 args=(run, started),
                 daemon=True,
             )
-            run.heartbeat_thread = heartbeat
             heartbeat.start()
+            run.heartbeat_thread = heartbeat
             self._check_cancelled(run)
 
             stderr_tails = [""] * len(run.processes)
@@ -538,23 +713,35 @@ class FitManager:
                 threading.Thread(target=drain_err, args=(i, p), daemon=True)
                 for i, p in enumerate(run.processes)
             ]
-            run.helper_threads.extend(drainers)
             for t in drainers:
                 t.start()
-            for proc in run.processes:
-                proc.wait()
+                run.helper_threads.append(t)
+            for proc, worker_state in zip(run.processes, workers):
+                if not self._wait_for_normal_process_exit(run, proc, worker_state):
+                    if run.cancel.is_set():
+                        raise _FitCancelled()
+                    raise _FitHelperFailed()
             # Popen.wait() does not guarantee that Python reader threads have
             # consumed all bytes buffered in stdout.  Drain stdout to EOF before
             # evaluating failures or allowing merge/publication to begin.
             for reader in run.reader_threads:
-                reader.join()
+                reader.join(timeout=FIT_THREAD_JOIN_TIMEOUT)
+                if reader.is_alive():
+                    raise _FitHelperFailed()
             for t in drainers:
-                t.join()
+                t.join(timeout=FIT_THREAD_JOIN_TIMEOUT)
+                if t.is_alive():
+                    raise _FitHelperFailed()
             # Heartbeat callbacks are helpers too.  They must be fully quiesced
             # before failure selection, worker validation, merge, or output
             # publication; otherwise a callback can fail after the last helper
             # check and allow a successful artifact to be published.
-            self._stop_and_join_heartbeat(run)
+            run.heartbeat_stop.set()
+            heartbeat = run.heartbeat_thread
+            if heartbeat is not None and heartbeat is not threading.current_thread():
+                heartbeat.join(timeout=FIT_THREAD_JOIN_TIMEOUT)
+                if heartbeat.is_alive():
+                    raise _FitHelperFailed()
             self._check_run_viable(run)
             failed = [i for i, p in enumerate(run.processes) if p.returncode != 0]
             if failed:
@@ -636,22 +823,11 @@ class FitManager:
             run.heartbeat_stop.set()
             with run.process_lock:
                 for proc in run.processes:
-                    if proc.poll() is None:
-                        proc.terminate()
-            for proc in run.processes:
-                # ``wait`` is required even when terminate made ``poll`` turn
-                # non-None immediately: the child still needs to be reaped.
-                proc.wait()
-            heartbeat = run.heartbeat_thread
-            if heartbeat is not None and heartbeat is not threading.current_thread():
-                heartbeat.join()
-            for thread in run.helper_threads:
-                if thread is not threading.current_thread():
-                    thread.join()
-            with self._lock:
-                if self._active_run is run:
-                    self._active_run = None
-            run.done.set()
+                    self._request_process_shutdown(proc, reap=False)
+            if self._join_run_helpers(run):
+                self._finalize_quiesced_run(run)
+            else:
+                self._start_cleanup_reaper(run)
 
     def _heartbeat(self, run, started):
         """Emit elapsed-time updates while at least one fit worker is alive."""

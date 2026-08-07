@@ -1,5 +1,7 @@
+import copy
 import itertools
 import threading
+from collections.abc import Mapping
 
 import torch
 
@@ -57,6 +59,46 @@ def abliteration_direction(weight_u, rule):
     return v_a, v_b
 
 
+def clone_intervention_snapshot(snapshot):
+    """Clone a coordinated intervention record for one operation.
+
+    This intentionally avoids generic deepcopy of MappingProxyType records and
+    preserves tensor identities in direction maps.
+    """
+    if snapshot is None:
+        return None
+    if not isinstance(snapshot, Mapping):
+        snapshot = dict(snapshot)
+
+    def clone_rule(rule):
+        cloned = dict(rule)
+        if cloned.get("layers") is not None:
+            cloned["layers"] = list(cloned["layers"])
+        if cloned.get("dirs_a") is not None:
+            cloned["dirs_a"] = dict(cloned["dirs_a"])
+        if cloned.get("dirs_b") is not None:
+            cloned["dirs_b"] = dict(cloned["dirs_b"])
+        return cloned
+
+    def clone_summary_item(item):
+        cloned = dict(item)
+        if cloned.get("layers") is not None:
+            cloned["layers"] = list(cloned["layers"])
+        return cloned
+
+    return {
+        "revision": snapshot.get("revision"),
+        "model_session_id": snapshot.get("model_session_id"),
+        "lens_binding_id": snapshot.get("lens_binding_id"),
+        "scale": snapshot.get("scale", 1.0),
+        "mode": snapshot.get("mode", "standard"),
+        "rules": [clone_rule(rule) for rule in snapshot.get("rules") or ()],
+        "active_rules": [clone_rule(rule) for rule in snapshot.get("active_rules") or ()],
+        "summary": [clone_summary_item(item) for item in snapshot.get("summary") or ()],
+        "active_summary": [clone_summary_item(item) for item in snapshot.get("active_summary") or ()],
+    }
+
+
 # Rule application modes:
 #   standard    — layer-by-layer residual steering (hook on the output of the
 #                 chosen layers). The most expressive live, but no layer write
@@ -75,30 +117,87 @@ def abliteration_direction(weight_u, rule):
 MODES = ("standard", "readthrough", "exact", "abliteration")
 
 
+class HookAttachment:
+    def __init__(self, handles):
+        self._handles = list(handles)
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def close(self):
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            handles, self._handles = self._handles, []
+        first = None
+        for handle in handles:
+            try:
+                handle.remove()
+            except Exception as exc:
+                if first is None:
+                    first = exc
+        if first is not None:
+            raise first
+
+
 class Interventions:
     def __init__(self):
         self._lock = threading.Lock()
         self._counter = itertools.count(1)
         self._rules = []
-        self._handles = []
+        self._handles = []  # non-authoritative legacy inspection only
         self._scale = 1.0
         self._mode = "standard"
+        self._revision = 0
 
     @property
     def active(self):
-        return bool(self._rules)
+        with self._lock:
+            return bool(self._rules)
 
     @property
     def global_scale(self):
-        return self._scale
+        with self._lock:
+            return self._scale
 
     @property
     def mode(self):
-        return self._mode
+        with self._lock:
+            return self._mode
+
+    def _clone_rule_locked(self, rule):
+        cloned = dict(rule)
+        if "layers" in cloned:
+            cloned["layers"] = list(cloned["layers"])
+        if "dirs_a" in cloned and cloned["dirs_a"] is not None:
+            cloned["dirs_a"] = dict(cloned["dirs_a"])
+        if "dirs_b" in cloned and cloned["dirs_b"] is not None:
+            cloned["dirs_b"] = dict(cloned["dirs_b"])
+        return cloned
+
+    def _active_rules_locked(self):
+        return [self._clone_rule_locked(r) for r in self._rules if r["layers"] and r.get("enabled", True)]
+
+    def _summary_locked(self):
+        return [
+            {
+                "id": rule.get("id"),
+                "token_id": rule.get("token_id"),
+                "token": rule.get("token"),
+                "mode": rule.get("mode"),
+                "factor": rule.get("factor"),
+                "replacement_id": rule.get("replacement_id"),
+                "replacement": rule.get("replacement"),
+                "layers": list(rule.get("layers") or []),
+                "enabled": rule.get("enabled", True),
+            }
+            for rule in self._rules
+        ]
 
     def set_scale(self, scale):
         with self._lock:
             self._scale = float(scale)
+            self._revision += 1
             return self._scale
 
     def set_mode(self, mode):
@@ -106,6 +205,7 @@ class Interventions:
             raise ValueError(f"unknown intervention mode: {mode}")
         with self._lock:
             self._mode = mode
+            self._revision += 1
             return self._mode
 
     def set_scale_and_mode(self, *, scale=None, mode=None):
@@ -118,19 +218,46 @@ class Interventions:
                 self._scale = new_scale
             if mode is not None:
                 self._mode = mode
+            if new_scale is not None or mode is not None:
+                self._revision += 1
             return self._scale, self._mode
 
     def state_snapshot(self):
         with self._lock:
             return self._scale, self._mode
 
+    def state_record(self):
+        with self._lock:
+            return {
+                "rules": [self._clone_rule_locked(r) for r in self._rules],
+                "scale": self._scale,
+                "mode": self._mode,
+                "revision": self._revision,
+            }
+
+    def restore_state_record(self, record):
+        with self._lock:
+            self._rules = [self._clone_rule_locked(r) for r in record["rules"]]
+            self._scale = record["scale"]
+            self._mode = record["mode"]
+            self._revision = record["revision"]
+
     def rules_full(self):
-        return list(self._rules)
+        with self._lock:
+            return [self._clone_rule_locked(r) for r in self._rules]
+
+    def clear_for_model_transition(self):
+        with self._lock:
+            self._rules = []
+            self._mode = "standard"
+            self._revision += 1
+            return self._summary_locked()
 
     def active_rules_full(self):
         """Full rules (with directions) actually applied — for export: a disabled
         rule or one without layers must not be baked."""
-        return list(self._active_rules())
+        with self._lock:
+            return self._active_rules_locked()
 
     def _active_rules(self):
         """Rules actually applied: non-empty layers AND not disabled. The
@@ -139,20 +266,8 @@ class Interventions:
         return [r for r in self._rules if r["layers"] and r.get("enabled", True)]
 
     def summary(self):
-        return [
-            {
-                "id": rule["id"],
-                "token_id": rule["token_id"],
-                "token": rule["token"],
-                "mode": rule["mode"],
-                "factor": rule["factor"],
-                "replacement_id": rule["replacement_id"],
-                "replacement": rule["replacement"],
-                "layers": rule["layers"],
-                "enabled": rule.get("enabled", True),
-            }
-            for rule in self._rules
-        ]
+        with self._lock:
+            return self._summary_locked()
 
     def _direction(self, lens, weight, token_id, layers):
         row = weight[token_id].float()
@@ -205,7 +320,8 @@ class Interventions:
                 else None,
             }
             self._rules.append(rule)
-            return self.summary()
+            self._revision += 1
+            return self._summary_locked()
 
     def update(self, rule_id, *, factor=None, layers=None, enabled=None,
                token_id=None, replacement_id=None, mode=None,
@@ -214,83 +330,119 @@ class Interventions:
         if needs_dirs:
             from core.capabilities import ensure_unquantized
             ensure_unquantized(jl)
+            if lens_manager is None or jl is None:
+                raise ValueError("model and lens required to edit the rule")
+            lens = lens_manager.lens
+            if lens is None:
+                raise ValueError("no lens loaded")
+            tokenizer = jl.tokenizer
         with self._lock:
-            for rule in self._rules:
+            for index, rule in enumerate(self._rules):
                 if rule["id"] != rule_id:
                     continue
+                candidate = self._clone_rule_locked(rule)
                 if factor is not None:
-                    rule["factor"] = float(factor)
+                    candidate["factor"] = float(factor)
                 if enabled is not None:
-                    rule["enabled"] = bool(enabled)
+                    candidate["enabled"] = bool(enabled)
                 # token / replacement / mode / layers change the directions →
                 # the lens and model are required to re-resolve them
                 if not needs_dirs:
-                    return self.summary()
-                if lens_manager is None or jl is None:
-                    raise ValueError("model and lens required to edit the rule")
-                lens = lens_manager.lens
-                if lens is None:
-                    raise ValueError("no lens loaded")
-                tokenizer = jl.tokenizer
+                    self._rules[index] = candidate
+                    self._revision += 1
+                    return self._summary_locked()
                 if mode is not None:
                     if mode not in ("scale", "replace"):
                         raise ValueError(f"invalid mode: {mode}")
-                    rule["mode"] = mode
+                    candidate["mode"] = mode
                 if token_id is not None:
-                    rule["token_id"] = int(token_id)
-                    rule["token"] = tokenizer.decode([int(token_id)])
+                    candidate["token_id"] = int(token_id)
+                    candidate["token"] = tokenizer.decode([int(token_id)])
                 if replacement_id is not None:
-                    rule["replacement_id"] = int(replacement_id)
-                    rule["replacement"] = tokenizer.decode([int(replacement_id)])
-                if rule["mode"] == "scale":
-                    rule["replacement_id"] = None
-                    rule["replacement"] = None
-                elif rule["replacement_id"] is None:
+                    candidate["replacement_id"] = int(replacement_id)
+                    candidate["replacement"] = tokenizer.decode([int(replacement_id)])
+                if candidate["mode"] == "scale":
+                    candidate["replacement_id"] = None
+                    candidate["replacement"] = None
+                elif candidate["replacement_id"] is None:
                     raise ValueError("replacement_id required in replace mode")
                 if layers is not None:
                     n_layers = len(jl.layers)
                     # new_layers=[] is valid: rule kept but inactive
-                    rule["layers"] = sorted({int(l) for l in layers if 0 <= int(l) < n_layers})
+                    candidate["layers"] = sorted({int(l) for l in layers if 0 <= int(l) < n_layers})
                 weight = jl._lm_head.weight
-                rule["dirs_a"] = self._direction(lens, weight, rule["token_id"], rule["layers"])
-                rule["dirs_b"] = (
-                    self._direction(lens, weight, rule["replacement_id"], rule["layers"])
-                    if rule["replacement_id"] is not None
+                dirs_a = self._direction(lens, weight, candidate["token_id"], candidate["layers"])
+                dirs_b = (
+                    self._direction(lens, weight, candidate["replacement_id"], candidate["layers"])
+                    if candidate["replacement_id"] is not None
                     else None
                 )
-                return self.summary()
+                candidate["dirs_a"] = dirs_a
+                candidate["dirs_b"] = dirs_b
+                self._rules[index] = candidate
+                self._revision += 1
+                return self._summary_locked()
             raise ValueError(f"unknown rule {rule_id}")
 
     def remove(self, rule_id=None):
         with self._lock:
-            self.detach()
             if rule_id is None:
                 self._rules = []
             else:
                 self._rules = [r for r in self._rules if r["id"] != rule_id]
-            return self.summary()
+            self._revision += 1
+            return self._summary_locked()
 
-    def attach(self, jl):
+    def snapshot(self):
+        with self._lock:
+            return {
+                "revision": self._revision,
+                "scale": self._scale,
+                "mode": self._mode,
+                "rules": [self._clone_rule_locked(r) for r in self._rules],
+                "active_rules": self._active_rules_locked(),
+                "summary": self._summary_locked(),
+                "active_summary": [
+                    {
+                        "id": rule.get("id"),
+                        "token_id": rule.get("token_id"),
+                        "token": rule.get("token"),
+                        "mode": rule.get("mode"),
+                        "factor": rule.get("factor"),
+                        "replacement_id": rule.get("replacement_id"),
+                        "replacement": rule.get("replacement"),
+                        "layers": list(rule.get("layers") or []),
+                        "enabled": rule.get("enabled", True),
+                    }
+                    for rule in self._rules
+                    if rule["layers"] and rule.get("enabled", True)
+                ],
+            }
+
+    def attach(self, jl, *, snapshot=None):
         from core.capabilities import ensure_unquantized, PUBLIC_REASONS
         ensure_unquantized(jl)
-        if self._mode == "abliteration":
+        snap = clone_intervention_snapshot(snapshot) if snapshot is not None else self.snapshot()
+        mode = snap["mode"]
+        if mode == "abliteration":
             raise ValueError(PUBLIC_REASONS["global_projection_unvalidated"])
-        if not self._rules:
-            return
-        if self._mode in ("readthrough", "exact"):
-            self._attach_rebase(jl, exact=self._mode == "exact")
-            return
+        active = [r for r in snap["rules"] if r["layers"] and r.get("enabled", True)]
+        if not active:
+            return HookAttachment([])
+        if mode in ("readthrough", "exact"):
+            return self._attach_rebase(jl, exact=mode == "exact", active=active, scale=snap["scale"])
         by_layer = {}
-        for rule in self._active_rules():
+        for rule in active:
             for layer in rule["layers"]:
-                by_layer.setdefault(layer, []).append(rule)
+                by_layer.setdefault(layer, []).append(dict(rule))
+        scale = snap["scale"]
 
         def make_hook(layer, rules):
+            rules = [dict(r) for r in rules]
             def hook(module, inputs, output):
                 h = output[0] if isinstance(output, tuple) else output
-                g = self._scale
                 for rule in rules:
-                    alpha, beta = effective_coeffs(rule["mode"], rule["factor"], g)
+                    alpha, beta = effective_coeffs(rule["mode"], rule["factor"], scale)
                     vA = rule["dirs_a"][layer].to(h.device, h.dtype)
                     coef = (h * vA).sum(-1, keepdim=True)
                     h = h + alpha * coef * vA
@@ -300,36 +452,40 @@ class Interventions:
                 if isinstance(output, tuple):
                     return (h,) + tuple(output[1:])
                 return h
-
             return hook
 
-        self._handles = [
-            jl.layers[layer].register_forward_hook(make_hook(layer, rules))
-            for layer, rules in by_layer.items()
-        ]
+        handles = []
+        try:
+            for layer, rules in by_layer.items():
+                handles.append(jl.layers[layer].register_forward_hook(make_hook(layer, rules)))
+        except Exception:
+            HookAttachment(handles).close()
+            raise
+        return HookAttachment(handles)
 
     def _attach_abliteration(self, jl):
         from core.capabilities import PUBLIC_REASONS
         raise ValueError(PUBLIC_REASONS["global_projection_unvalidated"])
 
-    def _attach_rebase(self, jl, exact):
+    def _attach_rebase(self, jl, exact, active=None, scale=None):
         # readthrough/exact preview: the SAME transform as the bake (core/rebase),
         # applied by hooks on the OUTPUT of the reading RMSNorms (and, in exact
         # mode, on the downstream writes) — the preview and the exported
         # checkpoint differ only by rounding.
         from core import rebase  # local import (rebase imports effective_coeffs from here)
 
-        active = self._active_rules()
+        active = active if active is not None else self._active_rules()
+        scale = self._scale if scale is None else scale
         if not active:
-            return
+            return HookAttachment([])
         n_layers = len(jl.layers)
         # Model-wide Phase-1 contract: capability does not depend on which rule
         # happens to be last.  This also validates the final norm before any
         # hook registration is attempted.
         inventory = rebase.model_preflight(jl, exact=exact)
-        cums = rebase.cumulative(active, self._scale, n_layers)
+        cums = rebase.cumulative(active, scale, n_layers)
         if not cums:
-            return
+            return HookAttachment([])
 
         def read_hook_for(norm, U, V):
             Ug, Vg = rebase.gamma_pair(norm, U, V)
@@ -379,12 +535,10 @@ class Interventions:
             for module, hook in sites:
                 handles.append(module.register_forward_hook(hook))
         except Exception:
-            for handle in handles:
-                handle.remove()
+            HookAttachment(handles).close()
             raise
-        self._handles = handles
+        return HookAttachment(handles)
 
     def detach(self):
-        for handle in self._handles:
-            handle.remove()
-        self._handles = []
+        # Compatibility shim: operation-local attachments are authoritative.
+        return None

@@ -117,7 +117,7 @@ function parseLayerSpec(spec) {
   return set.size ? set : null
 }
 
-export default function LensView({ frames, tick, genId, lensMeta, onNotice, onEditToken, hidden, onHideToken, maxH, editorOpen, streaming }) {
+export default function LensView({ frames, tick, genId, generationRunId, lensMeta, onNotice, onEditToken, hidden, onHideToken, maxH, editorOpen, streaming }) {
   const [maskOn, setMaskOn] = useState(true)
   const [view, setView] = useState('agg')
   const [filterInput, setFilterInput] = useState('')
@@ -323,7 +323,7 @@ export default function LensView({ frames, tick, genId, lensMeta, onNotice, onEd
     const ids = Object.keys(nextPinned).map(Number)
     setPinned(nextPinned)
     const reqId = ++pinReqRef.current
-    if (!ids.length || genId == null) {
+    if (!ids.length || genId == null || generationRunId == null) {
       setPinData(null)
       return
     }
@@ -331,7 +331,7 @@ export default function LensView({ frames, tick, genId, lensMeta, onNotice, onEd
       const res = await fetch('/api/lens/pin', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ gen_id: genId, token_ids: ids }),
+        body: JSON.stringify({ gen_id: genId, generation_run_id: generationRunId, token_ids: ids }),
       })
       const body = await res.json()
       if (!res.ok) throw new Error(body.detail || res.statusText)
@@ -355,10 +355,10 @@ export default function LensView({ frames, tick, genId, lensMeta, onNotice, onEd
     // the debounce, and the server 409s /api/lens/pin while it generates —
     // when `streaming` flips back to false this effect refires and fetches once
     if (streaming) return
-    if (genId == null || !Object.keys(pinnedRef.current).length) return
+    if (genId == null || generationRunId == null || !Object.keys(pinnedRef.current).length) return
     const t = setTimeout(() => refreshPins(pinnedRef.current), 400)
     return () => clearTimeout(t)
-  }, [genId, tick, streaming])
+  }, [genId, generationRunId, tick, streaming])
 
   function togglePin(tid, str) {
     const next = { ...pinned }

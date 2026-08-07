@@ -222,7 +222,7 @@ def test_packed_exact_is_model_wide_and_live_rejection_is_clean(tiny, layer):
     before = [len(module._forward_hooks) for module in tiny.modules()]
     iv = Interventions(); iv._rules = rules; iv.set_mode("exact")
     with pytest.raises(ValueError, match="exact mode is unavailable for packed"):
-        iv.attach(jl)
+        attachment = iv.attach(jl)
     assert before == [len(module._forward_hooks) for module in tiny.modules()]
     assert iv._handles == []
 
@@ -257,8 +257,9 @@ def test_packed_exact_denies_before_norm_materialization(tiny, layer, monkeypatc
         rebase.build_plan(rules, jl, 1.0, exact=True)
     iv = Interventions(); iv._rules = rules; iv.set_mode("exact")
     with pytest.raises(ValueError, match="exact mode is unavailable for packed"):
-        iv.attach(jl)
-    assert iv._handles == []
+        attachment = iv.attach(jl)
+        attachment.close()
+    assert all(len(module._forward_hooks) == 0 for module in jl._hf_model.modules())
 
 
 def test_qwen_nested_storage_and_hooks_fail_closed(tiny):
@@ -305,7 +306,7 @@ def test_live_registration_failure_rolls_back(tiny, monkeypatch):
     def fail(_hook): raise RuntimeError("injected final registration failure")
     monkeypatch.setattr(jl._final_norm, "register_forward_hook", fail)
     with pytest.raises(RuntimeError, match="injected"):
-        iv.attach(jl)
+        attachment = iv.attach(jl)
     assert before == [len(module._forward_hooks) for module in tiny.modules()]
     assert iv._handles == []
 
@@ -453,7 +454,7 @@ def test_live_read_rejects_instance_overridden_norm(tiny):
     iv = Interventions(); iv._rules = rules; iv.set_mode("readthrough")
     with pytest.raises(ValueError, match="forward provenance"):
         iv.attach(lens(model))
-    assert iv._handles == [] and all(len(module._forward_hooks) == 0 for module in model.modules())
+    assert all(len(module._forward_hooks) == 0 for module in model.modules())
 
 
 def test_exact_writer_forward_override_is_rejected():
@@ -466,8 +467,9 @@ def test_exact_writer_forward_override_is_rejected():
     writer.forward = lambda x: original_forward(x.float()).to(torch.bfloat16)
     iv = Interventions(); iv._rules = rules; iv.set_mode("exact")
     with pytest.raises(ValueError, match="forward provenance"):
-        iv.attach(jl)
-    assert iv._handles == [] and len(writer._forward_hooks) == 0
+        attachment = iv.attach(jl)
+        attachment.close()
+    assert all(len(module._forward_hooks) == 0 for module in jl._hf_model.modules()) and len(writer._forward_hooks) == 0
 
 
 @pytest.mark.parametrize("exact", [False, True])
@@ -489,13 +491,13 @@ def test_dense_live_hooks_match_baked_reader_and_writer_transforms(exact):
         transforms["model.layers.1.self_attn.o_proj.weight"], writer_weight
     )[0] if exact else None)
     iv = Interventions(); iv._rules = rules
-    iv.set_mode("exact" if exact else "readthrough"); iv.attach(jl)
+    iv.set_mode("exact" if exact else "readthrough"); attachment = iv.attach(jl)
     h = torch.randn(2, 3, 8)
     try:
         live_reader = reader(jl.layers[1].input_layernorm(h))
         live_writer = writer(h)
     finally:
-        iv.detach()
+        attachment.close()
     baked_reader = torch.nn.functional.linear(
         jl.layers[1].input_layernorm(h), reader_baked
     )
@@ -527,12 +529,12 @@ def test_real_tiny_llama_live_logits_match_baked_plan(exact):
     iv = Interventions(); iv._rules = rules
     iv.set_mode("exact" if exact else "readthrough")
     ids = torch.tensor([[1, 7, 4, 9]])
-    iv.attach(jl)
+    attachment = iv.attach(jl)
     try:
         with torch.no_grad():
             live_logits = model(ids).logits
     finally:
-        iv.detach()
+        attachment.close()
     with torch.no_grad():
         baked_logits = baked(ids).logits
     torch.testing.assert_close(live_logits, baked_logits, rtol=3e-3, atol=3e-4)

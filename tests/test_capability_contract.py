@@ -7,7 +7,27 @@ import torch
 
 from core import capabilities, editing, rebase
 from core.ablation import Interventions
+from core.model_session import LoadedModelBundle, ModelSessionCoordinator, OperationType
 from helpers import dense_lens
+
+
+def _install_loaded_bundle(app, monkeypatch, *, jl=None, profile=None, meta=None):
+    meta = dict({"model_id": "local", "quant": None}, **(meta or {}))
+    coordinator = ModelSessionCoordinator()
+    monkeypatch.setattr(app.manager, "coordinator", coordinator)
+    hf_model = object()
+    tokenizer = object()
+    jl = jl if jl is not None else object()
+    token, snap = coordinator.acquire(OperationType.LOAD)
+    bundle = LoadedModelBundle.from_parts(hf_model, tokenizer, jl, meta, profile)
+    coordinator.publish_loaded(token, bundle, expected_unloaded_session=snap.model_session_id)
+    coordinator.release(token)
+    monkeypatch.setattr(app.manager, "hf_model", hf_model)
+    monkeypatch.setattr(app.manager, "tokenizer", tokenizer)
+    monkeypatch.setattr(app.manager, "jl", jl)
+    monkeypatch.setattr(app.manager, "meta", meta)
+    monkeypatch.setattr(app.manager, "capability_profile", profile)
+    return bundle
 
 
 def _profile():
@@ -116,7 +136,8 @@ def test_global_projection_is_always_disabled_in_contract_and_deep_paths(
     iv = Interventions()
     iv.set_mode("abliteration")
     with pytest.raises(ValueError, match="temporarily unavailable"):
-        iv.attach(jl)
+        attachment = iv.attach(jl)
+        attachment.close()
     with pytest.raises(ValueError, match="temporarily unavailable"):
         editing.export_abliteration(rules, jl, {"quant": None}, fmt="full",
                                     name="must-not-exist", source_dir=tmp_path)
@@ -140,7 +161,8 @@ def test_declared_quantization_blocks_floating_head_mutations(quant):
     assert iv._rules == before
     iv.set_mode("readthrough")
     with pytest.raises(ValueError, match="quantized"):
-        iv.attach(jl)
+        attachment = iv.attach(jl)
+        attachment.close()
 
 
 def test_quantization_declarations_disagree_fail_closed():
@@ -191,9 +213,7 @@ def test_legacy_fields_are_derived_from_validated_profile():
 
 def test_status_malformed_loaded_profile_is_controlled_and_legacy_matches(monkeypatch):
     import api.app as app
-    monkeypatch.setattr(app.manager, "hf_model", object())
-    monkeypatch.setattr(app.manager, "meta", {"model_id": "broken"})
-    monkeypatch.setattr(app.manager, "capability_profile", {"modes": {}})
+    _install_loaded_bundle(app, monkeypatch, profile={"modes": {}}, meta={"model_id": "broken"})
     monkeypatch.setattr(app, "gpu_stats", lambda: [])
     status = app.api_status()
     assert status["capabilities"]["modes"]["readthrough"]["reason_code"] == (
@@ -208,10 +228,7 @@ def test_global_mode_is_rejected_by_mode_and_export_apis(tmp_path, monkeypatch):
     import api.app as app
     iv = Interventions()
     monkeypatch.setattr(app, "interventions", iv)
-    monkeypatch.setattr(app.manager, "capability_profile", _profile())
-    monkeypatch.setattr(app.manager, "meta", {"model_id": "local", "quant": None})
-    monkeypatch.setattr(app.manager, "hf_model", object())
-    monkeypatch.setattr(app.manager, "jl", dense_lens())
+    _install_loaded_bundle(app, monkeypatch, jl=dense_lens(), profile=_profile())
     with pytest.raises(app.HTTPException) as exc:
         app.api_interventions_scale(SimpleNamespace(scale=2, mode="abliteration"))
     assert exc.value.status_code == 422
@@ -294,8 +311,7 @@ def test_intervention_patch_returns_the_committed_pair(monkeypatch):
     import api.app as app
     iv = Interventions()
     monkeypatch.setattr(app, "interventions", iv)
-    monkeypatch.setattr(app.manager, "meta", {"model_id": "local"})
-    monkeypatch.setattr(app.manager, "capability_profile", _profile())
+    _install_loaded_bundle(app, monkeypatch, profile=_profile())
     response = app.api_interventions_scale(
         SimpleNamespace(scale=2.25, mode="readthrough")
     )

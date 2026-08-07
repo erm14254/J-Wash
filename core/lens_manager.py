@@ -2,7 +2,9 @@ import hashlib
 import itertools
 import json
 import threading
+import time
 from collections import OrderedDict
+from dataclasses import dataclass
 
 import torch
 from jlens.lens import JacobianLens
@@ -10,6 +12,23 @@ from jlens.lens import JacobianLens
 import config
 
 GEN_STORE_MAX = 4
+
+
+@dataclass(frozen=True)
+class GenerationPublicationResult:
+    published: bool
+    gen_id: int
+    generation_run_id: str
+
+
+@dataclass(frozen=True)
+class GenerationPublicationReceipt:
+    nonce: str
+    gen_id: int
+    generation_run_id: str
+    model_session_id: int
+    lens_binding_id: str
+
 
 MASKS_DIR = config.DATA_DIR / "masks"
 
@@ -41,9 +60,14 @@ def _lens_pref_key(source):
 class ActivationCatcher:
     def __init__(self, layers, indices):
         self.acts = {}
-        self._handles = [
-            layers[i].register_forward_hook(self._make(i)) for i in indices
-        ]
+        self._closed = False
+        self._handles = []
+        try:
+            for i in indices:
+                self._handles.append(layers[i].register_forward_hook(self._make(i)))
+        except Exception:
+            self.close()
+            raise
 
     def _make(self, index):
         def hook(module, inputs, output):
@@ -53,9 +77,19 @@ class ActivationCatcher:
         return hook
 
     def close(self):
-        for handle in self._handles:
-            handle.remove()
-        self._handles = []
+        if getattr(self, "_closed", False):
+            return
+        self._closed = True
+        handles, self._handles = self._handles, []
+        first = None
+        for handle in handles:
+            try:
+                handle.remove()
+            except Exception as exc:
+                if first is None:
+                    first = exc
+        if first is not None:
+            raise first
 
 
 def _vocab_fingerprint(tokenizer):
@@ -93,6 +127,57 @@ def display_token_mask(tokenizer, vocab_size):
     return mask
 
 
+class LensGenerationView:
+    def __init__(self, manager):
+        self._manager = manager
+        self.lens = manager.lens
+        self.meta = dict(manager.meta) if manager.meta else None
+        self.layers = list(manager.layers)
+        self.k = manager.k
+        self.mask = manager.mask
+        self._J = manager._J
+        self.binding_id = manager.binding_id
+        self.model_session_id = manager.model_session_id
+
+    def start_gen(self, generation_run_id=None, provisional=False):
+        return self._manager.start_gen(
+            generation_run_id=generation_run_id, provisional=provisional,
+        )
+
+    def finalize_gen(self, gen_id, *, retained_thinking=None, publish=True):
+        return self._manager.finalize_gen(
+            gen_id, retained_thinking=retained_thinking, publish=publish,
+        )
+
+    def begin_gen_publication(self, gen_id):
+        return self._manager.begin_gen_publication(gen_id)
+
+    def commit_gen_publication(self, receipt):
+        return self._manager.commit_gen_publication(receipt)
+
+    def rollback_gen_publication(self, receipt):
+        return self._manager.rollback_gen_publication(receipt)
+
+    def discard_gen(self, gen_id):
+        return self._manager.discard_gen(gen_id)
+
+    def unpublish_gen(self, gen_id, *, generation_run_id, model_session_id, lens_binding_id):
+        return self._manager.unpublish_gen(
+            gen_id,
+            generation_run_id=generation_run_id,
+            model_session_id=model_session_id,
+            lens_binding_id=lens_binding_id,
+        )
+
+    def compute_frames(self, acts, positions, phase, jl, token_ids, gen_id=None, abs_positions=None, chunk=None):
+        old_layers, old_k, old_mask, old_J = self._manager.layers, self._manager.k, self._manager.mask, self._manager._J
+        try:
+            self._manager.layers, self._manager.k, self._manager.mask, self._manager._J = self.layers, self.k, self.mask, self._J
+            return self._manager.compute_frames(acts, positions, phase, jl, token_ids, gen_id=gen_id, abs_positions=abs_positions, chunk=chunk)
+        finally:
+            self._manager.layers, self._manager.k, self._manager.mask, self._manager._J = old_layers, old_k, old_mask, old_J
+
+
 class LensManager:
     def __init__(self):
         self._lock = threading.Lock()
@@ -104,75 +189,96 @@ class LensManager:
         self._J = None
         self._tok_strs = {}
         self.gen_store = OrderedDict()
+        self._provisional_gen_store = {}
+        self._pending_gen_publications = {}
         self._gen_counter = itertools.count(1)
         self._pref_key = None
+        self.binding_id = 0
+        self.model_session_id = None
+
+    def snapshot_for_generation(self):
+        with self._lock:
+            return LensGenerationView(self) if self.lens is not None else None
+
+    def state_record(self):
+        with self._lock:
+            return {
+                "lens": self.lens,
+                "meta": dict(self.meta) if self.meta else None,
+                "layers": list(self.layers),
+                "k": self.k,
+                "mask": self.mask,
+                "_J": self._J,
+                "_tok_strs": dict(self._tok_strs),
+                "_pref_key": self._pref_key,
+                "binding_id": self.binding_id,
+                "model_session_id": self.model_session_id,
+            }
+
+    def restore_state_record(self, record):
+        with self._lock:
+            self.lens = record["lens"]
+            self.meta = dict(record["meta"]) if record["meta"] else None
+            self.layers = list(record["layers"])
+            self.k = record["k"]
+            self.mask = record["mask"]
+            self._J = record["_J"]
+            self._tok_strs = dict(record["_tok_strs"])
+            self._pref_key = record["_pref_key"]
+            self.binding_id = record["binding_id"]
+            self.model_session_id = record["model_session_id"]
 
     def load(self, model_manager, *, repo_id=None, filename="lens.pt", revision=None,
              path=None, layers=None, k=8):
+        snap = model_manager.session_snapshot() if hasattr(model_manager, "session_snapshot") else None
+        if model_manager.hf_model is None:
+            raise ValueError("load a model first")
+        model_session_id = snap.model_session_id if snap is not None else None
+        if path:
+            lens = JacobianLens.from_pretrained(path)
+            source = {"path": path, "repo_id": None, "filename": None, "revision": None}
+        else:
+            lens = JacobianLens.from_pretrained(repo_id, filename=filename, revision=revision)
+            source = {"path": None, "repo_id": repo_id, "filename": filename, "revision": revision}
+
+        model_meta = dict(model_manager.meta)
+        if lens.d_model != model_meta["d_model"]:
+            raise ValueError(f"lens d_model ({lens.d_model}) != model ({model_meta['d_model']})")
+        n_layers = model_meta["n_layers"]
+        fitted = lens.source_layers
+        if fitted[-1] >= n_layers:
+            raise ValueError(f"the lens covers layer {fitted[-1]}, outside a model with {n_layers} layers")
+        pref_key = _lens_pref_key(source)
+        if layers:
+            tapped = sorted(set(layers) & set(fitted))
+            if not tapped:
+                raise ValueError(f"no requested layer is fitted (fitted: {fitted[0]}..{fitted[-1]})")
+        else:
+            saved = _load_lens_prefs().get(pref_key)
+            tapped = (sorted(set(saved) & set(fitted)) if saved else None) or list(fitted)
+        _save_lens_pref(pref_key, tapped)
+
+        device = model_manager.jl.input_device
+        stacked = torch.stack([lens.jacobians[l].float() for l in tapped]).to(device)
+        tokenizer = model_manager.tokenizer
+        vocab_size = model_manager.hf_model.get_output_embeddings().weight.shape[0]
+        mask = display_token_mask(tokenizer, vocab_size).to(device)
+
+        warnings = []
+        if model_meta.get("quant"):
+            warnings.append(
+                f"model loaded in {model_meta['quant']}: the lens was probably "
+                "fitted on the unquantized weights, the readouts may drift"
+            )
+        if model_meta["model_id"].startswith("local/"):
+            warnings.append("local model: cannot verify that the lens matches these exact weights")
+
         with self._lock:
-            if model_manager.hf_model is None:
-                raise ValueError("load a model first")
-            if path:
-                lens = JacobianLens.from_pretrained(path)
-                source = {"path": path, "repo_id": None, "filename": None, "revision": None}
-            else:
-                lens = JacobianLens.from_pretrained(
-                    repo_id, filename=filename, revision=revision
-                )
-                source = {"path": None, "repo_id": repo_id, "filename": filename, "revision": revision}
-
-            model_meta = model_manager.meta
-            if lens.d_model != model_meta["d_model"]:
-                raise ValueError(
-                    f"lens d_model ({lens.d_model}) != model ({model_meta['d_model']})"
-                )
-            n_layers = model_meta["n_layers"]
-            fitted = lens.source_layers
-            if fitted[-1] >= n_layers:
-                raise ValueError(
-                    f"the lens covers layer {fitted[-1]}, outside a model with {n_layers} layers"
-                )
-            pref_key = _lens_pref_key(source)
-            if layers:
-                tapped = sorted(set(layers) & set(fitted))
-                if not tapped:
-                    raise ValueError(
-                        f"no requested layer is fitted (fitted: {fitted[0]}..{fitted[-1]})"
-                    )
-            else:
-                # last range used for THIS lens, otherwise all the fitted layers
-                # (= the selection made when the fit was created; max range for a
-                # downloaded lens)
-                saved = _load_lens_prefs().get(pref_key)
-                tapped = (sorted(set(saved) & set(fitted)) if saved else None) or list(fitted)
-            _save_lens_pref(pref_key, tapped)
-            self._pref_key = pref_key
-
-            device = model_manager.jl.input_device
-            stacked = torch.stack([lens.jacobians[l].float() for l in tapped]).to(device)
-            tokenizer = model_manager.tokenizer
-            vocab_size = model_manager.hf_model.get_output_embeddings().weight.shape[0]
-            mask = display_token_mask(tokenizer, vocab_size).to(device)
-
-            warnings = []
-            if model_meta.get("quant"):
-                warnings.append(
-                    f"model loaded in {model_meta['quant']}: the lens was probably "
-                    "fitted on the unquantized weights, the readouts may drift"
-                )
-            if model_meta["model_id"].startswith("local/"):
-                warnings.append(
-                    "local model: cannot verify that the lens matches these exact weights"
-                )
-
-            self.lens = lens
-            self.layers = tapped
-            self.k = int(k)
-            self.mask = mask
-            self._J = stacked
-            self._tok_strs = {}
-            self.meta = {
+            binding_id = self.binding_id + 1
+            meta = {
                 **source,
+                "model_session_id": model_session_id,
+                "lens_binding_id": binding_id,
                 "model_id": model_meta["model_id"],
                 "model_revision": model_meta.get("revision"),
                 "d_model": lens.d_model,
@@ -180,63 +286,405 @@ class LensManager:
                 "fitted_layers": [int(fitted[0]), int(fitted[-1])],
                 "fitted_layers_all": [int(l) for l in fitted],
                 "tapped_layers": [int(l) for l in tapped],
-                "k": self.k,
+                "k": int(k),
                 "warnings": warnings,
             }
-            return self.meta
+            self.binding_id = binding_id
+            self.model_session_id = model_session_id
+            self.lens = lens
+            self.layers = tapped
+            self.k = int(k)
+            self.mask = mask
+            self._J = stacked
+            self._tok_strs = {}
+            self._pref_key = pref_key
+            self.meta = meta
+            return dict(self.meta)
 
     def set_layers(self, model_manager, layers, k=None):
         with self._lock:
             if self.lens is None:
                 raise ValueError("no lens loaded")
-            fitted = self.lens.source_layers
-            tapped = sorted(set(layers) & set(fitted))
-            if not tapped:
-                raise ValueError(
-                    f"no requested layer is fitted (fitted: {fitted[0]}..{fitted[-1]})"
-                )
-            device = model_manager.jl.input_device
+            lens = self.lens
+            old_k = self.k
+            pref_key = self._pref_key
+            old_meta = dict(self.meta)
+            binding_id = self.binding_id + 1
+        fitted = lens.source_layers
+        tapped = sorted(set(layers) & set(fitted))
+        if not tapped:
+            raise ValueError(f"no requested layer is fitted (fitted: {fitted[0]}..{fitted[-1]})")
+        device = model_manager.jl.input_device
+        stacked = torch.stack([lens.jacobians[l].float() for l in tapped]).to(device)
+        new_k = int(k) if k else old_k
+        if pref_key:
+            _save_lens_pref(pref_key, tapped)
+        with self._lock:
+            if self.lens is not lens:
+                raise ValueError("lens changed while updating layers")
             self.layers = tapped
-            self._J = torch.stack(
-                [self.lens.jacobians[l].float() for l in tapped]
-            ).to(device)
-            if k:
-                self.k = int(k)
-            self.meta = dict(self.meta, tapped_layers=[int(l) for l in tapped], k=self.k)
-            if getattr(self, "_pref_key", None):
-                _save_lens_pref(self._pref_key, tapped)
-            return self.meta
+            self._J = stacked
+            self.k = new_k
+            self.binding_id = binding_id
+            self.meta = dict(old_meta, lens_binding_id=self.binding_id, tapped_layers=[int(l) for l in tapped], k=self.k)
+            return dict(self.meta)
 
     def unload(self):
+        old = self.withdraw()
+        cleanup_error = self.cleanup_withdrawn(old)
+        if cleanup_error is not None:
+            raise cleanup_error
+        return {"unloaded": True}
+
+    def withdraw(self):
         with self._lock:
+            old = {
+                "lens": self.lens,
+                "meta": self.meta,
+                "layers": self.layers,
+                "k": self.k,
+                "mask": self.mask,
+                "_J": self._J,
+                "_tok_strs": self._tok_strs,
+                "_pref_key": self._pref_key,
+                "binding_id": self.binding_id,
+                "model_session_id": self.model_session_id,
+                "gen_store": self.gen_store,
+                "provisional_gen_store": self._provisional_gen_store,
+                "pending_gen_publications": self._pending_gen_publications,
+            }
             self.lens = None
             self.meta = None
             self.layers = []
             self.mask = None
             self._J = None
             self._tok_strs = {}
-            self.gen_store.clear()
-            torch.cuda.empty_cache()
-            return {"unloaded": True}
+            self.gen_store = OrderedDict()
+            self._provisional_gen_store = {}
+            self._pending_gen_publications = {}
+            self.model_session_id = None
+            return old
 
-    def start_gen(self):
+    def restore_withdrawn(self, old):
+        if not old:
+            return
+        with self._lock:
+            self.lens = old["lens"]
+            self.meta = old["meta"]
+            self.layers = old["layers"]
+            self.k = old["k"]
+            self.mask = old["mask"]
+            self._J = old["_J"]
+            self._tok_strs = old["_tok_strs"]
+            self._pref_key = old["_pref_key"]
+            self.binding_id = old["binding_id"]
+            self.model_session_id = old["model_session_id"]
+            self.gen_store = old["gen_store"]
+            self._provisional_gen_store = old.get("provisional_gen_store", {})
+            self._pending_gen_publications = old.get("pending_gen_publications", {})
+
+    @staticmethod
+    def cleanup_withdrawn(_old):
+        import gc
+        first_error = None
+        if isinstance(_old, dict):
+            _old.clear()
+        _old = None
+        try:
+            gc.collect()
+        except Exception as exc:
+            first_error = exc
+        try:
+            torch.cuda.empty_cache()
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+        return first_error
+
+    def start_gen(self, generation_run_id=None, provisional=False):
         gen_id = next(self._gen_counter)
-        self.gen_store[gen_id] = {
+        store = {
+            "generation_run_id": generation_run_id,
+            "model_session_id": self.model_session_id,
+            "lens_binding_id": self.binding_id,
             "layers": list(self.layers),
             "residuals": {l: [] for l in self.layers},
             "positions": [],
             "token_ids": [],
             "phases": [],
+            "finalized_thinking": None,
         }
-        while len(self.gen_store) > GEN_STORE_MAX:
-            self.gen_store.popitem(last=False)
+        if provisional:
+            self._provisional_gen_store[gen_id] = store
+        else:
+            self.gen_store[gen_id] = store
+            while len(self.gen_store) > GEN_STORE_MAX:
+                self.gen_store.popitem(last=False)
         return gen_id
 
-    @torch.no_grad()
-    def pin_ranks(self, gen_id, token_ids, jl, chunk=32):
+    def finalize_gen(self, gen_id, *, retained_thinking=None, publish=True):
+        store = self._provisional_gen_store.get(gen_id)
+        already_published = False
+        if store is None:
+            store = self.gen_store.get(gen_id)
+            already_published = store is not None
+        if store is None:
+            raise ValueError("unknown provisional generation")
+        run_id = store.get("generation_run_id")
+        if (
+            not isinstance(run_id, str) or len(run_id) != 32
+            or any(ch not in "0123456789abcdef" for ch in run_id)
+        ):
+            raise ValueError("generation run identity is invalid")
+        if (
+            store.get("model_session_id") != self.model_session_id
+            or store.get("lens_binding_id") != self.binding_id
+        ):
+            raise ValueError("generation binding is no longer current")
+
+        retained = None if retained_thinking is None else tuple(
+            (int(position), int(token_id)) for position, token_id in retained_thinking
+        )
+        previous = store.get("finalized_thinking")
+        if previous is not None:
+            if retained is not None and retained != previous:
+                raise ValueError("generation was finalized with a different retained sequence")
+        else:
+            if retained is None:
+                raise ValueError("retained thinking sequence is required before publication")
+            positions = store["positions"]
+            token_ids = store["token_ids"]
+            phases = store["phases"]
+            count = len(positions)
+            if len(token_ids) != count or len(phases) != count:
+                raise ValueError("generation residual metadata is not aligned")
+            residual_rows = {}
+            for layer in store["layers"]:
+                chunks = store["residuals"].get(layer)
+                if chunks is None:
+                    raise ValueError("generation residual layer is missing")
+                rows = sum(int(chunk.shape[0]) for chunk in chunks)
+                if rows != count:
+                    raise ValueError("generation residual rows are not aligned")
+                residual_rows[layer] = torch.cat(chunks, dim=0) if chunks else None
+
+            retained_index = 0
+            keep = []
+            for phase, position, token_id in zip(phases, positions, token_ids):
+                if phase == "reading":
+                    keep.append(True)
+                elif phase == "thinking":
+                    wanted = retained_index < len(retained) and retained[retained_index] == (position, token_id)
+                    keep.append(wanted)
+                    if wanted:
+                        retained_index += 1
+                else:
+                    raise ValueError("generation residual phase is invalid")
+            if retained_index != len(retained):
+                raise ValueError("retained thinking sequence is not present in captured residuals")
+            for layer, rows in residual_rows.items():
+                if rows is None:
+                    store["residuals"][layer] = []
+                else:
+                    mask = torch.tensor(keep, dtype=torch.bool, device=rows.device)
+                    store["residuals"][layer] = [rows[mask]] if any(keep) else []
+            store["positions"] = [value for value, selected in zip(positions, keep) if selected]
+            store["token_ids"] = [value for value, selected in zip(token_ids, keep) if selected]
+            store["phases"] = [value for value, selected in zip(phases, keep) if selected]
+            store["finalized_thinking"] = retained
+
+        if publish and not already_published:
+            receipt = self.begin_gen_publication(gen_id)
+            try:
+                return self.commit_gen_publication(receipt)
+            except BaseException:
+                self.rollback_gen_publication_total(receipt)
+                raise
+        return GenerationPublicationResult(
+            published=publish or already_published,
+            gen_id=int(gen_id),
+            generation_run_id=run_id,
+        )
+
+    def begin_gen_publication(self, gen_id):
+        """Prepare exact publication without exposing or evicting any run."""
+        import uuid
+        store = self._provisional_gen_store.get(gen_id)
+        if store is None or store.get("finalized_thinking") is None:
+            raise ValueError("generation is not a finalized provisional run")
+        if any(receipt.gen_id == gen_id for receipt, _store in self._pending_gen_publications.values()):
+            raise ValueError("generation publication is already pending")
+        run_id = store.get("generation_run_id")
+        if (
+            not isinstance(run_id, str) or len(run_id) != 32
+            or any(ch not in "0123456789abcdef" for ch in run_id)
+            or store.get("model_session_id") != self.model_session_id
+            or store.get("lens_binding_id") != self.binding_id
+        ):
+            raise ValueError("generation publication identity is no longer current")
+        receipt = GenerationPublicationReceipt(
+            nonce=uuid.uuid4().hex,
+            gen_id=int(gen_id),
+            generation_run_id=run_id,
+            model_session_id=self.model_session_id,
+            lens_binding_id=self.binding_id,
+        )
+        self._pending_gen_publications[receipt.nonce] = (receipt, store)
+        return receipt
+
+    def _pending_publication(self, receipt):
+        pending = self._pending_gen_publications.get(getattr(receipt, "nonce", None))
+        if pending is None or pending[0] != receipt:
+            raise ValueError("generation publication receipt is stale")
+        stored_receipt, store = pending
+        if (
+            stored_receipt.model_session_id != self.model_session_id
+            or stored_receipt.lens_binding_id != self.binding_id
+            or store.get("generation_run_id") != stored_receipt.generation_run_id
+            or self._provisional_gen_store.get(stored_receipt.gen_id) is not store
+        ):
+            raise ValueError("generation publication receipt identity changed")
+        return pending
+
+    def commit_gen_publication(self, receipt):
+        """Commit prepared publication, evicting only after durable approval."""
+        pending = self._pending_publication(receipt)
+        receipt, store = pending
+        # Construct the sole outward success value before any destructive
+        # mutation. Receipt consumption below is the linearization point; after
+        # it succeeds the only operation is returning this existing object.
+        result = GenerationPublicationResult(
+            True, receipt.gen_id, receipt.generation_run_id,
+        )
+        committed_before = OrderedDict(self.gen_store)
+        provisional_before = dict(self._provisional_gen_store)
+        try:
+            self.gen_store[receipt.gen_id] = store
+            while len(self.gen_store) > GEN_STORE_MAX:
+                self.gen_store.popitem(last=False)
+            if self._provisional_gen_store.pop(receipt.gen_id, None) is not store:
+                raise RuntimeError("provisional generation ownership changed during commit")
+            if self._pending_gen_publications.pop(receipt.nonce, None) is not pending:
+                raise RuntimeError("publication receipt ownership changed during commit")
+        except BaseException:
+            self.gen_store.clear()
+            self.gen_store.update(committed_before)
+            self._provisional_gen_store.clear()
+            self._provisional_gen_store.update(provisional_before)
+            self._pending_gen_publications[receipt.nonce] = pending
+            raise
+        return result
+
+    def rollback_gen_publication(self, receipt):
+        """Invalidate one exact prepared publication without touching old runs."""
+        pending = self._pending_publication(receipt)
+        receipt, store = pending
+        if self._pending_gen_publications.pop(receipt.nonce, None) is not pending:
+            raise RuntimeError("publication receipt ownership changed during rollback")
+        removed = self._provisional_gen_store.pop(receipt.gen_id, None)
+        if removed is not store:
+            self._pending_gen_publications[receipt.nonce] = pending
+            raise RuntimeError("provisional generation ownership changed during rollback")
+        store.clear()
+        return True
+
+    @staticmethod
+    def _publication_retry_yield():
+        try:
+            time.sleep(0)
+        except BaseException:
+            pass
+
+    @staticmethod
+    def _store_matches_publication_receipt(store, receipt):
+        return bool(
+            store is not None
+            and store.get("generation_run_id") == receipt.generation_run_id
+            and store.get("model_session_id") == receipt.model_session_id
+            and store.get("lens_binding_id") == receipt.lens_binding_id
+        )
+
+    def rollback_gen_publication_total(self, receipt):
+        """Resolve exact wrapper-owned publication rollback before returning."""
+        while True:
+            try:
+                if self.rollback_gen_publication(receipt):
+                    continue
+            except BaseException:
+                pass
+
+            try:
+                pending = self._pending_gen_publications.get(receipt.nonce)
+                provisional = self._provisional_gen_store.get(receipt.gen_id)
+                committed = self.gen_store.get(receipt.gen_id)
+                provisional_exact = self._store_matches_publication_receipt(
+                    provisional, receipt,
+                )
+                committed_exact = self._store_matches_publication_receipt(
+                    committed, receipt,
+                )
+
+                if pending is None and not provisional_exact and not committed_exact:
+                    return True
+
+                if pending is not None:
+                    if (
+                        pending[0] != receipt
+                        or pending[1] is not provisional
+                        or not provisional_exact
+                    ):
+                        self._publication_retry_yield()
+                        continue
+                elif provisional_exact and not committed_exact:
+                    # Recover an exact orphaned provisional owner only; never
+                    # touch an unrelated entry reusing the numeric ID.
+                    if self._provisional_gen_store.pop(receipt.gen_id, None) is provisional:
+                        provisional.clear()
+                    continue
+            except BaseException:
+                pass
+            self._publication_retry_yield()
+
+    def discard_gen(self, gen_id):
+        store = self._provisional_gen_store.pop(gen_id, None)
+        if store is not None:
+            store.clear()
+            return True
+        return False
+
+    def unpublish_gen(self, gen_id, *, generation_run_id, model_session_id, lens_binding_id):
+        """Remove exactly one committed run after durable publication rollback."""
         store = self.gen_store.get(gen_id)
         if store is None:
+            return False
+        if (
+            store.get("generation_run_id") != generation_run_id
+            or store.get("model_session_id") != model_session_id
+            or store.get("lens_binding_id") != lens_binding_id
+        ):
+            return False
+        self.gen_store.pop(gen_id, None)
+        store.clear()
+        return True
+
+    def has_published_gen(self, gen_id, generation_run_id):
+        store = self.gen_store.get(gen_id)
+        return bool(
+            store is not None
+            and store.get("generation_run_id") == generation_run_id
+            and store.get("model_session_id") == self.model_session_id
+            and store.get("lens_binding_id") == self.binding_id
+        )
+
+    @torch.no_grad()
+    def pin_ranks(self, gen_id, token_ids, jl, chunk=32, generation_run_id=None):
+        store = self.gen_store.get(gen_id)
+        if store is not None and (store.get("model_session_id") != self.model_session_id or store.get("lens_binding_id") != self.binding_id):
+            store = None
+        if store is None:
             raise ValueError("unknown generation (residual store expired)")
+        if generation_run_id is None or store.get("generation_run_id") != generation_run_id:
+            raise ValueError("generation run identity is missing or no longer current")
         layers = store["layers"]
         device = self._J.device
         tids = torch.tensor(token_ids, dtype=torch.long, device=device)
@@ -264,6 +712,7 @@ class LensManager:
                 pins[int(t)]["p"].append(layer_p[int(t)])
         return {
             "gen_id": gen_id,
+            "generation_run_id": store["generation_run_id"],
             "layers": [int(l) for l in layers],
             "positions": store["positions"],
             "phases": store["phases"],
@@ -301,7 +750,9 @@ class LensManager:
             }
             for pos, tid in zip(abs_positions, token_ids)
         ]
-        store = self.gen_store.get(gen_id) if gen_id is not None else None
+        store = None
+        if gen_id is not None:
+            store = self._provisional_gen_store.get(gen_id) or self.gen_store.get(gen_id)
         if store is not None:
             store["positions"].extend(int(p) for p in abs_positions)
             store["token_ids"].extend(int(t) for t in token_ids)

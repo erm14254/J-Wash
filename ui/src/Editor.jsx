@@ -256,7 +256,7 @@ const MODE_INFO = {
 }
 
 export default function Editor({
-  open, onClose, rules, scale, mode, lensMeta, nLayers, genId, busy,
+  open, onClose, rules, scale, mode, lensMeta, nLayers, genId, generationRunId, busy,
   prefill, onPrefillConsumed, onRules, onScale, onMode, onNotice,
   rebaseSupported = true, autoLayerRadius, llamaCppSet = false, ggufState,
 }) {
@@ -410,12 +410,12 @@ export default function Editor({
   // (same data as the pins) and set the layers to peak ± 1. Silent if there is
   // no generation, the token was never seen, or the server is busy.
   useEffect(() => {
-    if (addToken.id == null || genId == null) return
+    if (addToken.id == null || genId == null || generationRunId == null) return
     let stale = false
     jsonFetch('/api/lens/pin', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ gen_id: genId, token_ids: [addToken.id] }),
+      body: JSON.stringify({ gen_id: genId, generation_run_id: generationRunId, token_ids: [addToken.id] }),
     })
       .then((body) => {
         if (stale) return
@@ -437,7 +437,7 @@ export default function Editor({
       })
       .catch(() => {})
     return () => { stale = true }
-  }, [addToken.id, genId])
+  }, [addToken.id, genId, generationRunId])
 
   useEffect(() => {
     if (!prefill) return
