@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { applyGenerationTerminal, frameArchivePinIdentity } from '../src/continuationState.js'
+import { applyGenerationTerminal, frameArchivePinIdentity, generationPinIdentity } from '../src/continuationState.js'
 
 const existing = [{ id: 7, role: 'assistant', content: 'old', frames: [{ gen: 1 }] }]
 
@@ -50,6 +50,34 @@ test('ordinary assistant appends once and duplicate id is ignored', () => {
   assert.equal(created.messages.length, 1)
   const duplicate = applyGenerationTerminal(created.messages, { type: 'done', message_id: 8, text: 'new' }, [])
   assert.equal(duplicate.messages.length, 1)
+})
+
+test('ordinary published assistant is immediately pinnable', () => {
+  const runId = 'c'.repeat(32)
+  const created = applyGenerationTerminal([], {
+    type: 'done', message_id: 8, text: 'new', gen_id: 4,
+    generation_run_id: runId, pin_publication_state: 'published',
+  }, [{ gen: 4 }])
+  assert.deepEqual(generationPinIdentity(created.messages[0]), {
+    gen_id: 4, generation_run_id: runId, pin_publication_state: 'published',
+  })
+})
+
+test('ordinary nonpublished assistant fails closed for pinning', () => {
+  for (const state of ['pending', 'unavailable', undefined]) {
+    const frame = {
+      type: 'done', message_id: 8, text: 'new', gen_id: 4,
+      generation_run_id: 'd'.repeat(32),
+    }
+    if (state !== undefined) frame.pin_publication_state = state
+    const message = applyGenerationTerminal([], frame, [{ gen: 4 }]).messages[0]
+    assert.equal(message.gen_id, undefined)
+    assert.equal(message.generation_run_id, undefined)
+    assert.deepEqual(generationPinIdentity(message), {
+      gen_id: null, generation_run_id: null,
+      pin_publication_state: state ?? 'unavailable',
+    })
+  }
 })
 
 test('error clears continuation attempt state', () => {

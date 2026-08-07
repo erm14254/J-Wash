@@ -1088,9 +1088,14 @@ class Store:
                 )
             old_file = row["frames_file"]
             data = msgpack.unpackb((FRAMES_DIR / old_file).read_bytes(), strict_map_key=False)
+            current_pin_state = data.get("pin_publication_state")
+            allowed_source = (
+                current_pin_state == "pending"
+                or state == "unavailable" and current_pin_state == "published"
+            )
             if (
                 data.get("version") != 3
-                or data.get("pin_publication_state") != "pending"
+                or not allowed_source
                 or data.get("pin_generation_run_id") != generation_run_id
                 or (gen_id is not None and data.get("pin_gen_id") != gen_id)
             ):

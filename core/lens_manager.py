@@ -20,6 +20,15 @@ class GenerationPublicationResult:
     generation_run_id: str
 
 
+@dataclass(frozen=True)
+class GenerationPublicationReceipt:
+    nonce: str
+    gen_id: int
+    generation_run_id: str
+    model_session_id: int
+    lens_binding_id: str
+
+
 MASKS_DIR = config.DATA_DIR / "masks"
 
 # Last range of layers captured per lens: {lens key: [layers]}.
@@ -139,6 +148,15 @@ class LensGenerationView:
             gen_id, retained_thinking=retained_thinking, publish=publish,
         )
 
+    def begin_gen_publication(self, gen_id):
+        return self._manager.begin_gen_publication(gen_id)
+
+    def commit_gen_publication(self, receipt):
+        return self._manager.commit_gen_publication(receipt)
+
+    def rollback_gen_publication(self, receipt):
+        return self._manager.rollback_gen_publication(receipt)
+
     def discard_gen(self, gen_id):
         return self._manager.discard_gen(gen_id)
 
@@ -171,6 +189,7 @@ class LensManager:
         self._tok_strs = {}
         self.gen_store = OrderedDict()
         self._provisional_gen_store = {}
+        self._pending_gen_publications = {}
         self._gen_counter = itertools.count(1)
         self._pref_key = None
         self.binding_id = 0
@@ -331,6 +350,7 @@ class LensManager:
                 "model_session_id": self.model_session_id,
                 "gen_store": self.gen_store,
                 "provisional_gen_store": self._provisional_gen_store,
+                "pending_gen_publications": self._pending_gen_publications,
             }
             self.lens = None
             self.meta = None
@@ -340,6 +360,7 @@ class LensManager:
             self._tok_strs = {}
             self.gen_store = OrderedDict()
             self._provisional_gen_store = {}
+            self._pending_gen_publications = {}
             self.model_session_id = None
             return old
 
@@ -359,6 +380,7 @@ class LensManager:
             self.model_session_id = old["model_session_id"]
             self.gen_store = old["gen_store"]
             self._provisional_gen_store = old.get("provisional_gen_store", {})
+            self._pending_gen_publications = old.get("pending_gen_publications", {})
 
     @staticmethod
     def cleanup_withdrawn(_old):
@@ -471,29 +493,87 @@ class LensManager:
             store["finalized_thinking"] = retained
 
         if publish and not already_published:
-            # Publication is an in-memory transaction.  Keep the provisional
-            # owner until committed visibility and eviction both succeed, and
-            # restore both maps exactly if any injected/runtime failure occurs.
-            committed_before = OrderedDict(self.gen_store)
-            provisional_before = dict(self._provisional_gen_store)
-            try:
-                self.gen_store[gen_id] = store
-                while len(self.gen_store) > GEN_STORE_MAX:
-                    self.gen_store.popitem(last=False)
-                removed = self._provisional_gen_store.pop(gen_id, None)
-                if removed is not store:
-                    raise RuntimeError("provisional generation ownership changed during publication")
-            except BaseException:
-                self.gen_store.clear()
-                self.gen_store.update(committed_before)
-                self._provisional_gen_store.clear()
-                self._provisional_gen_store.update(provisional_before)
-                raise
+            receipt = self.begin_gen_publication(gen_id)
+            self.commit_gen_publication(receipt)
         return GenerationPublicationResult(
             published=publish or already_published,
             gen_id=int(gen_id),
             generation_run_id=run_id,
         )
+
+    def begin_gen_publication(self, gen_id):
+        """Prepare exact publication without exposing or evicting any run."""
+        import uuid
+        store = self._provisional_gen_store.get(gen_id)
+        if store is None or store.get("finalized_thinking") is None:
+            raise ValueError("generation is not a finalized provisional run")
+        if any(receipt.gen_id == gen_id for receipt, _store in self._pending_gen_publications.values()):
+            raise ValueError("generation publication is already pending")
+        run_id = store.get("generation_run_id")
+        if (
+            not isinstance(run_id, str) or len(run_id) != 32
+            or any(ch not in "0123456789abcdef" for ch in run_id)
+            or store.get("model_session_id") != self.model_session_id
+            or store.get("lens_binding_id") != self.binding_id
+        ):
+            raise ValueError("generation publication identity is no longer current")
+        receipt = GenerationPublicationReceipt(
+            nonce=uuid.uuid4().hex,
+            gen_id=int(gen_id),
+            generation_run_id=run_id,
+            model_session_id=self.model_session_id,
+            lens_binding_id=self.binding_id,
+        )
+        self._pending_gen_publications[receipt.nonce] = (receipt, store)
+        return receipt
+
+    def _pending_publication(self, receipt):
+        pending = self._pending_gen_publications.get(getattr(receipt, "nonce", None))
+        if pending is None or pending[0] != receipt:
+            raise ValueError("generation publication receipt is stale")
+        stored_receipt, store = pending
+        if (
+            stored_receipt.model_session_id != self.model_session_id
+            or stored_receipt.lens_binding_id != self.binding_id
+            or store.get("generation_run_id") != stored_receipt.generation_run_id
+            or self._provisional_gen_store.get(stored_receipt.gen_id) is not store
+        ):
+            raise ValueError("generation publication receipt identity changed")
+        return stored_receipt, store
+
+    def commit_gen_publication(self, receipt):
+        """Commit prepared publication, evicting only after durable approval."""
+        receipt, store = self._pending_publication(receipt)
+        committed_before = OrderedDict(self.gen_store)
+        provisional_before = dict(self._provisional_gen_store)
+        try:
+            self.gen_store[receipt.gen_id] = store
+            while len(self.gen_store) > GEN_STORE_MAX:
+                self.gen_store.popitem(last=False)
+            if self._provisional_gen_store.pop(receipt.gen_id, None) is not store:
+                raise RuntimeError("provisional generation ownership changed during commit")
+            if self._pending_gen_publications.pop(receipt.nonce, None) != (receipt, store):
+                raise RuntimeError("publication receipt ownership changed during commit")
+        except BaseException:
+            self.gen_store.clear()
+            self.gen_store.update(committed_before)
+            self._provisional_gen_store.clear()
+            self._provisional_gen_store.update(provisional_before)
+            self._pending_gen_publications[receipt.nonce] = (receipt, store)
+            raise
+        return GenerationPublicationResult(True, receipt.gen_id, receipt.generation_run_id)
+
+    def rollback_gen_publication(self, receipt):
+        """Invalidate one exact prepared publication without touching old runs."""
+        receipt, store = self._pending_publication(receipt)
+        if self._pending_gen_publications.pop(receipt.nonce, None) != (receipt, store):
+            raise RuntimeError("publication receipt ownership changed during rollback")
+        removed = self._provisional_gen_store.pop(receipt.gen_id, None)
+        if removed is not store:
+            self._pending_gen_publications[receipt.nonce] = (receipt, store)
+            raise RuntimeError("provisional generation ownership changed during rollback")
+        store.clear()
+        return True
 
     def discard_gen(self, gen_id):
         store = self._provisional_gen_store.pop(gen_id, None)

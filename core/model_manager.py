@@ -5,6 +5,7 @@ import threading
 import time
 import uuid
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -60,6 +61,22 @@ FALLBACK_CHAT_TEMPLATE = (
     "{% endif %}{% endfor %}"
     "{% if add_generation_prompt %}{{ 'Assistant:' }}{% endif %}"
 )
+
+
+@dataclass
+class GenerationAttemptOwner:
+    gen_id: int | None = None
+    generation_run_id: str | None = None
+    model_session_id: int | None = None
+    lens_binding_id: str | None = None
+
+    def record(self, *, gen_id, generation_run_id, model_session_id, lens_binding_id):
+        if self.gen_id is not None:
+            raise RuntimeError("generation attempt owner is already bound")
+        self.gen_id = int(gen_id)
+        self.generation_run_id = str(generation_run_id)
+        self.model_session_id = model_session_id
+        self.lens_binding_id = lens_binding_id
 
 
 def _extract_template(chat_template):
@@ -692,7 +709,7 @@ class ModelManager:
     @torch.no_grad()
     def generate(self, messages, sampling, stop_event, emit, lens=None, ablator=None,
                  continue_final=False, capture_full_input_frames=False,
-                 defer_lens_publication=False):
+                 defer_lens_publication=False, attempt_owner=None):
         """``continue_final=True``: the last message is an assistant reply to
         EXTEND — the template leaves its turn open instead of starting a new
         one, and the model picks up where it stopped."""
@@ -764,6 +781,13 @@ class ModelManager:
                 gen_id = lens.start_gen(
                     generation_run_id=generation_run_id, provisional=True,
                 )
+                if attempt_owner is not None:
+                    attempt_owner.record(
+                        gen_id=gen_id,
+                        generation_run_id=generation_run_id,
+                        model_session_id=lens.model_session_id,
+                        lens_binding_id=lens.binding_id,
+                    )
                 if not capture_full_input_frames and len(messages) > 1 and any(m["role"] != "system" for m in messages[:-1]):
                     prev = tokenizer.apply_chat_template(
                         messages[:-1],

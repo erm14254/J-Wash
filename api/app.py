@@ -32,6 +32,7 @@ from core.gpus import gpu_stats
 from core.lens_manager import LensManager
 from core.model_session import GenerationContext, LoadedModelBundle, OperationConflict, OperationType, ModelStateError, WorkerDispatch, WorkerOutcome
 from core.model_manager import (
+    GenerationAttemptOwner,
     ModelManager,
     _resolve_revision,
     resolve_local_dir,
@@ -3271,15 +3272,38 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
         else:
             emit(frame)
 
-    manager.generate(
-        messages=messages, sampling=req.get("sampling", {}), stop_event=stop_event, emit=emit_inner, lens=gen_context,
-        ablator=interventions if gen_context.intervention_snapshot.get("rules") else None,
-        continue_final=True,
-        capture_full_input_frames=lens is not None,
-        defer_lens_publication=lens is not None,
+    attempt_owner = GenerationAttemptOwner()
+    generation_returned = False
+    try:
+        manager.generate(
+            messages=messages, sampling=req.get("sampling", {}), stop_event=stop_event, emit=emit_inner, lens=gen_context,
+            ablator=interventions if gen_context.intervention_snapshot.get("rules") else None,
+            continue_final=True,
+            capture_full_input_frames=lens is not None,
+            defer_lens_publication=lens is not None,
+            attempt_owner=attempt_owner,
+        )
+        generation_returned = True
+    finally:
+        if not generation_returned and lens is not None and attempt_owner.gen_id is not None:
+            try:
+                lens.unpublish_gen(
+                    attempt_owner.gen_id,
+                    generation_run_id=attempt_owner.generation_run_id,
+                    model_session_id=attempt_owner.model_session_id,
+                    lens_binding_id=attempt_owner.lens_binding_id,
+                )
+            except BaseException:
+                pass
+            try:
+                lens.discard_gen(attempt_owner.gen_id)
+            except BaseException:
+                pass
+    attempt_gen_id = (
+        attempt_owner.gen_id if lens is not None and attempt_owner.gen_id is not None
+        else done_holder.get("gen_id") if lens is not None else None
     )
-    attempt_gen_id = done_holder.get("gen_id") if lens is not None else None
-    attempt_run_id = done_holder.get("generation_run_id")
+    attempt_run_id = attempt_owner.generation_run_id or done_holder.get("generation_run_id")
     attempt_resolved = attempt_gen_id is None
     durable_committed = False
     durable_version = expected_version + 1
@@ -3384,8 +3408,13 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
 
         if attempt_gen_id is not None:
             publication_ok = False
+            publication_receipt = None
             try:
-                publication = lens.finalize_gen(attempt_gen_id, publish=True)
+                publication_receipt = lens.begin_gen_publication(attempt_gen_id)
+                durable = resolve_durable_state("published")
+                if durable.state != "committed":
+                    raise RuntimeError(f"durable pin publication state was {durable.state}")
+                publication = lens.commit_gen_publication(publication_receipt)
                 publication_ok = (
                     publication.published
                     and publication.gen_id == attempt_gen_id
@@ -3393,9 +3422,6 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
                 )
                 if not publication_ok:
                     raise RuntimeError("residual publication identity mismatch")
-                durable = resolve_durable_state("published")
-                if durable.state != "committed":
-                    raise RuntimeError(f"durable pin publication state was {durable.state}")
                 attempt_resolved = True
                 terminal["pin_publication_state"] = "published"
             except BaseException as exc:
@@ -3403,6 +3429,17 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
                     "durable continuation committed but residual publication failed: %s",
                     _bounded_failure(exc, "residual publication failed")[1],
                 )
+                if publication_receipt is not None:
+                    while True:
+                        try:
+                            lens.rollback_gen_publication(publication_receipt)
+                            break
+                        except ValueError:
+                            # A successful commit consumes the receipt.  Exact
+                            # unpublish below handles the post-commit case.
+                            break
+                        except BaseException:
+                            _retry_thread_yield()
                 lens.unpublish_gen(
                     attempt_gen_id,
                     generation_run_id=attempt_run_id,
@@ -3549,13 +3586,19 @@ async def _cancel_task_uninterruptibly(task):
     if task is None:
         return False
     cancelled = False
-    try:
-        task.cancel()
-    except BaseException as exc:
-        if isinstance(exc, asyncio.CancelledError):
+    cancel_requested = False
+    while not task.done() and not cancel_requested:
+        try:
+            cancel_requested = bool(task.cancel())
+        except asyncio.CancelledError:
             cancelled = True
             _remember_task_cancellation()
-        logging.getLogger(__name__).exception("task cancellation failed during websocket cleanup")
+        except BaseException:
+            logging.getLogger(__name__).exception(
+                "task cancellation failed during websocket cleanup"
+            )
+        if not task.done() and not cancel_requested:
+            cancelled |= await _cleanup_yield()
     while not task.done():
         try:
             await _drain_worker_uninterruptibly(task)

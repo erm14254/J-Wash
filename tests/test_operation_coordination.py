@@ -2627,9 +2627,12 @@ def test_persisted_continue_publication_failure_commits_visualization_without_pi
             self.provisional = {9}
             self.committed = set()
 
-        def finalize_gen(self, gen_id, *, publish=True):
-            assert gen_id == 9 and publish
+        def begin_gen_publication(self, gen_id):
+            assert gen_id == 9
             raise RuntimeError("injected residual publication failure")
+
+        def rollback_gen_publication(self, _receipt):
+            raise AssertionError("no receipt was created")
 
         def discard_gen(self, gen_id):
             self.provisional.discard(gen_id)
@@ -2710,6 +2713,226 @@ def test_finalize_gen_publication_failure_restores_committed_and_provisional_map
     assert attempt in lens._provisional_gen_store
     assert lens.discard_gen(attempt)
     assert list(lens.gen_store) == old_ids
+
+
+def test_generation_publication_receipt_delays_capacity_eviction_and_is_exact():
+    from core.lens_manager import GEN_STORE_MAX, LensManager
+
+    lens = LensManager()
+    lens.layers = []
+    lens.model_session_id = 1
+    lens.binding_id = 2
+    old_ids = [lens.start_gen(generation_run_id=f"{i:032x}") for i in range(1, GEN_STORE_MAX + 1)]
+    attempt = lens.start_gen(generation_run_id="f" * 32, provisional=True)
+    lens.finalize_gen(attempt, retained_thinking=[], publish=False)
+
+    receipt = lens.begin_gen_publication(attempt)
+    assert list(lens.gen_store) == old_ids
+    assert attempt in lens._provisional_gen_store
+    assert not lens.has_published_gen(attempt, "f" * 32)
+    assert lens.rollback_gen_publication(receipt)
+    assert list(lens.gen_store) == old_ids
+    assert attempt not in lens._provisional_gen_store
+    with pytest.raises(ValueError, match="stale"):
+        lens.rollback_gen_publication(receipt)
+
+    successful = lens.start_gen(generation_run_id="e" * 32, provisional=True)
+    lens.finalize_gen(successful, retained_thinking=[], publish=False)
+    committed = lens.commit_gen_publication(lens.begin_gen_publication(successful))
+    assert committed.published
+    assert list(lens.gen_store) == old_ids[1:] + [successful]
+    assert len(lens.gen_store) == GEN_STORE_MAX
+
+
+def test_generation_publication_prepare_and_eviction_failures_preserve_old_runs():
+    from collections import OrderedDict
+    from core.lens_manager import GEN_STORE_MAX, LensManager
+
+    lens = LensManager()
+    lens.layers = []
+    lens.model_session_id = 1
+    lens.binding_id = 2
+    old_ids = [lens.start_gen(generation_run_id=f"{i:032x}") for i in range(GEN_STORE_MAX)]
+    attempt = lens.start_gen(generation_run_id="f" * 32, provisional=True)
+    lens.finalize_gen(attempt, retained_thinking=[], publish=False)
+
+    class FailPending(dict):
+        def __setitem__(self, key, value):
+            raise RuntimeError("injected pending insertion failure")
+
+    lens._pending_gen_publications = FailPending()
+    with pytest.raises(RuntimeError, match="pending insertion"):
+        lens.begin_gen_publication(attempt)
+    assert list(lens.gen_store) == old_ids
+    assert attempt in lens._provisional_gen_store
+
+    lens._pending_gen_publications = {}
+    receipt = lens.begin_gen_publication(attempt)
+
+    class FailEviction(OrderedDict):
+        def popitem(self, *args, **kwargs):
+            raise RuntimeError("injected eviction failure")
+
+    lens.gen_store = FailEviction(lens.gen_store)
+    with pytest.raises(RuntimeError, match="eviction failure"):
+        lens.commit_gen_publication(receipt)
+    assert list(lens.gen_store) == old_ids
+    assert attempt in lens._provisional_gen_store
+    assert lens.rollback_gen_publication(receipt)
+    assert list(lens.gen_store) == old_ids
+
+
+def test_persisted_continue_durable_publish_failure_preserves_full_committed_store(tmp_path, monkeypatch):
+    from api import app
+    from core import store as store_mod
+    from core.lens_manager import GEN_STORE_MAX, LensGenerationView, LensManager
+
+    monkeypatch.setattr(store_mod, "DB_PATH", tmp_path / "db.sqlite3")
+    monkeypatch.setattr(store_mod, "FRAMES_DIR", tmp_path / "frames")
+    durable_store = store_mod.Store()
+    monkeypatch.setattr(app, "store", durable_store)
+    cid = durable_store.create_conversation("c").value
+    mid, version = durable_store.add_message(
+        cid, None, "assistant", "old", return_version=True,
+    ).value
+
+    manager = LensManager()
+    manager.layers = [0]
+    manager.model_session_id = 3
+    manager.binding_id = 4
+    manager.lens = SimpleNamespace(meta={})
+    manager.meta = {
+        "path": "/lens", "model_id": "m", "model_revision": "r",
+        "fitted_layers_all": [0], "tapped_layers": [0], "k": 1,
+    }
+    manager.k = 1
+    old_ids = [
+        manager.start_gen(generation_run_id=f"{i:032x}")
+        for i in range(1, GEN_STORE_MAX + 1)
+    ]
+    lens = LensGenerationView(manager)
+    run_id = "b" * 32
+    rollback_calls = 0
+    rollback_publication = lens.rollback_gen_publication
+
+    def rollback_once(receipt):
+        nonlocal rollback_calls
+        rollback_calls += 1
+        if rollback_calls == 1:
+            raise RuntimeError("injected rollback fault")
+        return rollback_publication(receipt)
+
+    lens.rollback_gen_publication = rollback_once
+
+    def generate(**kwargs):
+        attempt = lens.start_gen(generation_run_id=run_id, provisional=True)
+        lens.finalize_gen(attempt, retained_thinking=[], publish=False)
+        kwargs["attempt_owner"].record(
+            gen_id=attempt, generation_run_id=run_id,
+            model_session_id=3, lens_binding_id=4,
+        )
+        frame = _frame(1, "thinking", "0")
+        frame.update(gen=attempt, generation_run_id=run_id)
+        kwargs["emit"]({"type": "frame", **frame})
+        kwargs["emit"]({
+            "type": "done", "text": " plus", "gen_id": attempt,
+            "generation_run_id": run_id, "pin_publication_state": "pending",
+            "meta": {}, "stats": {}, "stopped": False,
+            "continuation_suffix_start_pos": 1,
+            "continuation_suffix_end_pos": 2,
+        })
+
+    original_finalize = durable_store.finalize_continuation_pin_publication
+
+    def fail_published(*args, **kwargs):
+        if kwargs["state"] == "published":
+            return SimpleNamespace(state="not_committed")
+        return original_finalize(*args, **kwargs)
+
+    monkeypatch.setattr(app.manager, "generate", generate)
+    monkeypatch.setattr(durable_store, "finalize_continuation_pin_publication", fail_published)
+    emitted = []
+    app._persisted_continue(
+        {}, mid, threading.Event(), emitted.append,
+        SimpleNamespace(lens=lens, intervention_snapshot={"rules": []}),
+    )
+
+    assert list(manager.gen_store) == old_ids
+    assert manager._provisional_gen_store == {}
+    assert manager._pending_gen_publications == {}
+    assert rollback_calls == 2
+    message = durable_store.get_message(mid)
+    assert message["content"] == "old plus"
+    assert message["version"] == version + 1
+    archive = durable_store.load_frames(mid)
+    assert archive["pin_publication_state"] == "unavailable"
+    assert archive["pin_gen_id"] is None
+    terminal = emitted[-1]
+    assert terminal["pin_publication_state"] == "unavailable"
+    assert "gen_id" not in terminal
+    assert "generation_run_id" not in terminal
+
+
+@pytest.mark.parametrize("cleanup_stage", ["hook", "reader", "maintenance"])
+def test_persisted_continue_owns_attempt_before_post_done_cleanup_failure(monkeypatch, cleanup_stage):
+    from api import app
+
+    class FakeStore:
+        def get_message(self, message_id):
+            return {
+                "id": message_id, "conversation_id": 1, "role": "assistant",
+                "content": "old", "meta": None, "version": 2, "frames_file": None,
+            }
+
+        def path_to_root(self, _message_id):
+            return [{"role": "assistant", "content": "old"}]
+
+        def update_message_and_frames_if_unchanged(self, *_args, **_kwargs):
+            raise AssertionError("Store must not mutate when generation cleanup fails")
+
+    class FakeLens:
+        layers = [0]
+        k = 1
+        binding_id = 4
+        model_session_id = 3
+        meta = {"model_id": "m"}
+
+        def __init__(self):
+            self.provisional = {9}
+            self.committed = {1, 2, 3, 4}
+
+        def discard_gen(self, gen_id):
+            self.provisional.discard(gen_id)
+            return True
+
+        def unpublish_gen(self, gen_id, **_identity):
+            self.committed.discard(gen_id)
+            return False
+
+    lens = FakeLens()
+
+    def generate(**kwargs):
+        kwargs["attempt_owner"].record(
+            gen_id=9, generation_run_id="a" * 32,
+            model_session_id=3, lens_binding_id=4,
+        )
+        kwargs["emit"]({
+            "type": "done", "text": " plus", "gen_id": 9,
+            "generation_run_id": "a" * 32, "pin_publication_state": "pending",
+        })
+        raise RuntimeError(f"injected {cleanup_stage} cleanup failure")
+
+    monkeypatch.setattr(app, "store", FakeStore())
+    monkeypatch.setattr(app.manager, "generate", generate)
+    emitted = []
+    with pytest.raises(RuntimeError, match=cleanup_stage):
+        app._persisted_continue(
+            {}, 1, threading.Event(), emitted.append,
+            SimpleNamespace(lens=lens, intervention_snapshot={"rules": []}),
+        )
+    assert lens.provisional == set()
+    assert lens.committed == {1, 2, 3, 4}
+    assert emitted == []
 
 
 def test_persisted_continue_unexpected_metadata_failure_discards_provisional(monkeypatch):
@@ -3156,6 +3379,92 @@ def test_cancel_task_uninterruptibly_survives_repeated_caller_cancellation():
         observed = await cleanup
         assert observed is True
         assert child.done()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("first_result", [RuntimeError("cancel fault"), False])
+def test_cancel_task_uninterruptibly_retries_failed_cancel_request(first_result):
+    from api import app
+
+    class FaultTask:
+        def __init__(self):
+            self.cancel_calls = 0
+            self.finished = False
+
+        def done(self):
+            return self.finished
+
+        def cancel(self):
+            self.cancel_calls += 1
+            if self.cancel_calls == 1:
+                if isinstance(first_result, BaseException):
+                    raise first_result
+                return first_result
+            self.finished = True
+            return True
+
+    async def scenario():
+        task = FaultTask()
+        assert await app._cancel_task_uninterruptibly(task) is False
+        assert task.done()
+        assert task.cancel_calls == 2
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("faulted_child", ["receiver", "waiter"])
+def test_ws_finalizer_retries_receiver_and_waiter_cancel_faults(faulted_child):
+    from api import app
+
+    async def scenario():
+        async def blocked():
+            await asyncio.Event().wait()
+
+        class CancelFaultProxy:
+            def __init__(self, task):
+                self.task = task
+                self.cancel_calls = 0
+
+            def __await__(self):
+                return self.task.__await__()
+
+            def done(self):
+                return self.task.done()
+
+            def result(self):
+                return self.task.result()
+
+            def cancel(self):
+                self.cancel_calls += 1
+                if self.cancel_calls == 1:
+                    raise RuntimeError("injected child cancel fault")
+                return self.task.cancel()
+
+        receiver_task = asyncio.create_task(blocked())
+        waiter_task = asyncio.create_task(blocked())
+        receiver = CancelFaultProxy(receiver_task) if faulted_child == "receiver" else receiver_task
+        waiter = CancelFaultProxy(waiter_task) if faulted_child == "waiter" else waiter_task
+        worker = asyncio.create_task(asyncio.sleep(0, result=app.WorkerOutcome()))
+
+        class Coordinator:
+            def is_current(self, _token):
+                return False
+
+        class Dispatch:
+            coordinator = Coordinator()
+            token = object()
+            claimed = True
+
+            def cancel_from_awaiter(self):
+                return False
+
+        await app._finalize_ws_runtime(
+            object(), worker, receiver, waiter, threading.Event(), Dispatch(), True,
+        )
+        faulted = receiver if faulted_child == "receiver" else waiter
+        assert faulted.cancel_calls == 2
+        assert receiver_task.done() and waiter_task.done() and worker.done()
 
     asyncio.run(scenario())
 

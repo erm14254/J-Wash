@@ -4,7 +4,7 @@ import DOMPurify from 'dompurify'
 import LensView from './LensView.jsx'
 import LensDiff from './Diff.jsx'
 import Editor from './Editor.jsx'
-import { applyGenerationTerminal, frameArchivePinIdentity } from './continuationState.js'
+import { applyGenerationTerminal, frameArchivePinIdentity, generationPinIdentity } from './continuationState.js'
 import { fmtTok } from './tok'
 
 const GB = 2 ** 30
@@ -835,10 +835,10 @@ export default function App() {
     // gen_id is only known for messages generated THIS page session; after a
     // reload, fall back to the id carried by the persisted frames themselves —
     // the server-side residual store survives a page refresh.
-    const publishedMessage = idx >= 0 && messages[idx].pin_publication_state === 'published'
-    const msgGen = publishedMessage ? messages[idx].gen_id ?? null : null
+    const pin = generationPinIdentity(idx >= 0 ? messages[idx] : null)
+    const msgGen = pin.gen_id
     const genId = live ? null : msgGen
-    const msgRunId = publishedMessage ? messages[idx].generation_run_id ?? null : null
+    const msgRunId = pin.generation_run_id
     const generationRunId = live ? null : msgRunId
     return { live, idx, genId, generationRunId }
   }
