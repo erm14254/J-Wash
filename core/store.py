@@ -990,6 +990,7 @@ class Store:
         packed = []
         run_ids = {frame.get("generation_run_id") for frame in frames}
         gen_ids = {frame.get("gen") for frame in frames}
+        numeric_gen_ids = {value for value in gen_ids if value is not None}
         archive_version = 2 if not frames or run_ids == {None} else 3
         if archive_version == 3 and (
             len(run_ids) != 1
@@ -999,17 +1000,17 @@ class Store:
             or any(ch not in "0123456789abcdef" for ch in next(iter(run_ids)))
         ):
             raise FrameStorageError("schema-v3 frames require one valid generation run id")
-        if archive_version == 3 and (
-            len(gen_ids) != 1
-            or isinstance(next(iter(gen_ids)), bool)
-            or not isinstance(next(iter(gen_ids)), int)
-            or next(iter(gen_ids)) < 0
-        ):
-            raise FrameStorageError("schema-v3 frames require one valid generation id")
         if archive_version == 3:
             pin_publication_state = pin_publication_state or "published"
             if pin_publication_state not in {"pending", "published", "unavailable"}:
                 raise FrameStorageError("invalid pin publication state")
+            if pin_publication_state in {"pending", "published"} and (
+                len(numeric_gen_ids) != 1
+                or isinstance(next(iter(numeric_gen_ids)), bool)
+                or not isinstance(next(iter(numeric_gen_ids)), int)
+                or next(iter(numeric_gen_ids)) < 0
+            ):
+                raise FrameStorageError("pinnable schema-v3 frames require one valid generation id")
         else:
             pin_publication_state = "unavailable"
         for frame in frames:
@@ -1040,8 +1041,14 @@ class Store:
             "k": k,
             "descriptor": dict(descriptor) if descriptor is not None else None,
             "pin_publication_state": pin_publication_state,
-            "pin_gen_id": next(iter(gen_ids)) if archive_version == 3 else None,
-            "pin_generation_run_id": next(iter(run_ids)) if archive_version == 3 else None,
+            "pin_gen_id": (
+                next(iter(numeric_gen_ids))
+                if archive_version == 3 and pin_publication_state in {"pending", "published"} else None
+            ),
+            "pin_generation_run_id": (
+                next(iter(run_ids))
+                if archive_version == 3 and pin_publication_state in {"pending", "published"} else None
+            ),
             "layers": [int(l) for l in layers],
             "frames": packed,
             "vocab": {str(t): s for t, s in vocab.items()},

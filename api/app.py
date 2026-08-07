@@ -3184,7 +3184,7 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
         defer_lens_publication=lens is not None,
     )
     attempt_gen_id = done_holder.get("gen_id") if lens is not None else None
-    attempt_run_id = done_holder.get("generation_run_id") if attempt_gen_id is not None else None
+    attempt_run_id = done_holder.get("generation_run_id")
     attempt_resolved = attempt_gen_id is None
     durable_committed = False
     durable_version = expected_version + 1
@@ -3234,14 +3234,15 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
                 "frames_error", "frames_pending",
             ):
                 meta.pop(stale_key, None)
+            initial_pin_state = "pending" if attempt_gen_id is not None else "unavailable"
             meta.update(
                 publication_state="complete", frames_expected=True,
-                pin_publication_state="pending",
+                pin_publication_state=initial_pin_state,
             )
             meta.pop("pin_gen_id", None)
             meta.pop("pin_generation_run_id", None)
             if meta.get("continuations"):
-                meta["continuations"][-1]["pin_publication_state"] = "pending"
+                meta["continuations"][-1]["pin_publication_state"] = initial_pin_state
             meta.update(_frames_lens_signature(lens, layers_used, k_used))
             merged = _finalize_continuation_frames(
                 frames_acc,
@@ -3260,7 +3261,10 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
             message_id, expected_version, new_content, meta,
             frames=merged, layers=layers_used, k=k_used, clear_frames=clear_frames,
             frame_descriptor=_frame_descriptor(lens, layers_used, k_used) if merged is not None else None,
-            pin_publication_state="pending" if merged is not None else None,
+            pin_publication_state=(
+                "pending" if merged is not None and attempt_gen_id is not None
+                else "unavailable" if merged is not None else None
+            ),
         )
         if outcome.state in {"stale", "superseded"}:
             discard_attempt()
@@ -3326,12 +3330,6 @@ def _persisted_continue(req, message_id, stop_event, emit, gen_context):
                     emit(frame)
         else:
             if merged is not None:
-                unavailable = resolve_durable_state("unavailable")
-                if unavailable.state != "committed":
-                    logging.getLogger(__name__).error(
-                        "could not resolve identity-free frame state for message %s: %s",
-                        message_id, unavailable.state,
-                    )
                 terminal["pin_publication_state"] = "unavailable"
                 terminal.pop("gen_id", None)
                 terminal.pop("generation_run_id", None)
