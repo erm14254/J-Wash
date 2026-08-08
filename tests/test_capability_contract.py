@@ -146,7 +146,6 @@ def test_declared_quantization_does_not_block_usable_floating_head(quant):
     jl = dense_lens()
     jl._jwash_declared_quant = quant
     jl.tokenizer = SimpleNamespace(decode=lambda ids: str(ids[0]))
-    jl.tokenizer = SimpleNamespace(decode=lambda ids: str(ids[0]))
     lens_manager = SimpleNamespace(lens=SimpleNamespace(jacobians={}))
     iv = Interventions()
     assert iv.add(lens_manager, jl, token_id=1, layers=[0])[0]["token_id"] == 1
@@ -236,6 +235,7 @@ def test_quantized_declaration_does_not_reject_usable_preset(quant, monkeypatch)
     import api.app as app
     jl = dense_lens()
     jl._jwash_declared_quant = quant
+    jl.tokenizer = SimpleNamespace(decode=lambda ids: str(ids[0]))
     iv = Interventions()
     iv.set_scale(2.0)
     monkeypatch.setattr(app, "interventions", iv)
