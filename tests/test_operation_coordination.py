@@ -515,8 +515,6 @@ def test_normal_export_preflight_propagates_recorded_revision(monkeypatch, tmp_p
             calls.append((model_id, revision)) or str(tmp_path)
         ),
     )
-    monkeypatch.setattr(app.capabilities, "ensure_unquantized", lambda *_a, **_k: None)
-    monkeypatch.setattr(app.capabilities, "require", lambda *_a, **_k: None)
     rule = {"layers": [0]}
     snap = SimpleNamespace(
         bundle=SimpleNamespace(
