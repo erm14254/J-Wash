@@ -352,13 +352,6 @@ class Interventions:
                token_id=None, replacement_id=None, mode=None,
                lens_manager=None, jl=None):
         needs_dirs = any(x is not None for x in (layers, token_id, replacement_id, mode))
-        if needs_dirs:
-            if lens_manager is None or jl is None:
-                raise ValueError("model and lens required to edit the rule")
-            lens = lens_manager.lens
-            if lens is None:
-                raise ValueError("no lens loaded")
-            tokenizer = jl.tokenizer
         with self._lock:
             for index, rule in enumerate(self._rules):
                 if rule["id"] != rule_id:
@@ -374,6 +367,16 @@ class Interventions:
                     self._rules[index] = candidate
                     self._revision += 1
                     return self._summary_locked()
+                # Establish existence under the same lock before concrete
+                # direction prerequisites can mask an unknown-rule response.
+                # Validation and commit remain one locked transaction, so no
+                # concurrent mutation can invalidate the cloned candidate.
+                if lens_manager is None or jl is None:
+                    raise ValueError("model and lens required to edit the rule")
+                lens = lens_manager.lens
+                if lens is None:
+                    raise ValueError("no lens loaded")
+                tokenizer = jl.tokenizer
                 if mode is not None:
                     if mode not in ("scale", "replace"):
                         raise ValueError(f"invalid mode: {mode}")

@@ -146,6 +146,7 @@ def test_declared_quantization_does_not_block_usable_floating_head(quant):
     jl = dense_lens()
     jl._jwash_declared_quant = quant
     jl.tokenizer = SimpleNamespace(decode=lambda ids: str(ids[0]))
+    jl.tokenizer = SimpleNamespace(decode=lambda ids: str(ids[0]))
     lens_manager = SimpleNamespace(lens=SimpleNamespace(jacobians={}))
     iv = Interventions()
     assert iv.add(lens_manager, jl, token_id=1, layers=[0])[0]["token_id"] == 1
@@ -238,9 +239,11 @@ def test_quantized_declaration_does_not_reject_usable_preset(quant, monkeypatch)
     iv = Interventions()
     iv.set_scale(2.0)
     monkeypatch.setattr(app, "interventions", iv)
-    monkeypatch.setattr(app.manager, "hf_model", object())
-    monkeypatch.setattr(app.manager, "jl", jl)
-    monkeypatch.setattr(app.manager, "meta", {"model_id": "local", "quant": quant})
+    profile = capabilities.build_profile(jl, quant)
+    _install_loaded_bundle(
+        app, monkeypatch, jl=jl, profile=profile,
+        meta={"model_id": "local", "quant": quant},
+    )
     monkeypatch.setattr(app.lens_manager, "lens", SimpleNamespace(jacobians={}))
     monkeypatch.setattr(app.editing, "load_preset", lambda _name: {
         "scale": 9.0, "rules": [{"token_id": 1, "mode": "scale", "factor": 0.0}]
@@ -330,13 +333,13 @@ def test_direction_patch_unavailable_profile_reaches_concrete_validation(monkeyp
     assert iv.state_record() == before
 
 
-def test_direction_patch_unknown_rule_with_valid_profile_remains_404(monkeypatch):
+def test_direction_patch_unknown_rule_without_lens_remains_404(monkeypatch):
     import api.app as app
     jl = dense_lens()
     jl.tokenizer = SimpleNamespace(decode=lambda ids: str(ids[0]))
     iv = Interventions()
     monkeypatch.setattr(app, "interventions", iv)
-    monkeypatch.setattr(app.lens_manager, "lens", SimpleNamespace(jacobians={}))
+    monkeypatch.setattr(app.lens_manager, "lens", None)
     _install_loaded_bundle(app, monkeypatch, jl=jl, profile=_profile())
     with pytest.raises(app.HTTPException) as exc:
         app.api_interventions_patch(
@@ -355,7 +358,9 @@ def test_preset_unavailable_profile_does_not_preempt_mutation(monkeypatch):
     before = iv.state_record()
     monkeypatch.setattr(app, "interventions", iv)
     monkeypatch.setattr(app.lens_manager, "lens", SimpleNamespace(jacobians={}))
-    _install_loaded_bundle(app, monkeypatch, jl=dense_lens(), profile={"modes": {}})
+    jl = dense_lens()
+    jl.tokenizer = SimpleNamespace(decode=lambda ids: str(ids[0]))
+    _install_loaded_bundle(app, monkeypatch, jl=jl, profile={"modes": {}})
     monkeypatch.setattr(app.editing, "load_preset", lambda _name: {
         "scale": 9.0, "rules": [{"token_id": 2, "mode": "scale", "factor": 0.0}],
     })
