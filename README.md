@@ -202,6 +202,11 @@ J-Wash reports read-projection validation coverage for the loaded architecture.
 or unvalidated result remains attemptable, but may fail at operation time or
 produce a model whose correctness still requires validation.
 
+The normal editor neither gates nor decorates controls with architecture
+validation metadata. When the real session, lens, rule, and tool prerequisites
+are present, the operation is attempted and its concrete execution determines
+success or the actionable failure returned to the user.
+
 | Read-projection topology | Recognition contract | Live readthrough | Live exact | Full checkpoint | Modified layers | LoRA |
 |---|---|---:|---:|---:|---:|---:|
 | Exact `LlamaDecoderLayer` adapter | Complete reader/writer inventory, audited RMSNorm, biasless tensor-returning writers | Yes | Yes | Yes | Yes | Yes |

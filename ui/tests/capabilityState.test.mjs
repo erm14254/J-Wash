@@ -1,6 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { activeRuleCount, readCapabilityState, isCapabilityRefreshEvent, selectedExportState } from '../src/capabilityState.js'
+import { readFileSync } from 'node:fs'
+import { activeRuleCount, readCapabilityState, isCapabilityRefreshEvent } from '../src/capabilityState.js'
 
 const yes = { supported: true, reason_code: 'supported', reason: 'Supported for this model.' }
 const no = (code = 'future_denial', reason = 'Server says no.') => ({ supported: false, reason_code: code, reason })
@@ -52,7 +53,6 @@ test('GGUF local setup remains separate from its server decision', () => {
 
 test('GGUF supported reason remains available beside missing local setup', () => {
   const state = readCapabilityState(snapshot(), { rules: [{ layers: [0] }], llamaCppConfigured: false })
-  assert.equal(state.formats.gguf.diagnosticValidated, true)
   assert.equal(state.formats.gguf.decision.reason, yes.reason)
   assert.equal(state.formats.gguf.local.reason, 'Configure llama.cpp in Options.')
 })
@@ -80,8 +80,7 @@ test('export selection is external and advisory across sessions', () => {
   const next = readCapabilityState(snapshot({ exports: { lora: no('new_denial', 'LoRA denied on session B.') } }), {
     rules: [{ layers: [0] }], llamaCppConfigured: true,
   })
-  const item = selectedExportState(next, selected)
-  assert.equal(item.id, 'lora')
+  const item = next.formats[selected]
   assert.equal(item.enabled, true)
   assert.equal(item.decision.reason, 'LoRA denied on session B.')
 })
@@ -104,6 +103,34 @@ test('malformed diagnostics remain advisory for a fresh coherent session', () =>
   assert.equal(state.actions.addRule, true)
   assert.equal(state.formats.full.enabled, true)
   assert.match(state.modes.exact.decision.reason, /not been validated/)
+})
+
+test('missing diagnostics remain advisory for a fresh coherent session', () => {
+  const value = snapshot()
+  delete value.capabilities
+  const state = readCapabilityState(value, {
+    lensAvailable: true, rules: [{ layers: [0] }], llamaCppConfigured: true,
+  })
+  assert.equal(state.diagnosticsValid, false)
+  assert.equal(state.sessionReady, true)
+  assert.equal(state.modes.readthrough.enabled, true)
+  assert.equal(state.actions.addRule, true)
+  assert.equal(state.formats.full.enabled, true)
+})
+
+test('busy and transition states expose mechanical mode reasons and block attempts', () => {
+  const busy = readCapabilityState(snapshot(), { busy: true, lensAvailable: true })
+  assert.equal(busy.modes.readthrough.enabled, false)
+  assert.equal(busy.modes.readthrough.mechanicalReason, 'Another operation is in progress.')
+  const transition = readCapabilityState(snapshot(), { transitionPending: true, lensAvailable: true })
+  assert.equal(transition.modes.exact.enabled, false)
+  assert.equal(transition.modes.exact.mechanicalReason, 'Refreshing session status.')
+})
+
+test('normal Editor mode and export rows do not present capability confidence', () => {
+  const source = readFileSync(new URL('../src/Editor.jsx', import.meta.url), 'utf8')
+  assert.doesNotMatch(source, /item\.decision\.(?:reason|supported)/)
+  assert.doesNotMatch(source, /cap-advisory|⚠ Experimental|Validated:/)
 })
 
 test('llama.cpp readiness is tri-state', () => {
