@@ -435,6 +435,255 @@ def test_publication_gate_rename_wins_before_cancellation():
     assert gate.state == "published"
 
 
+def test_handoff_publication_current_owner_is_exactly_once(tmp_path):
+    from api import app
+
+    coordinator = ModelSessionCoordinator()
+    handoff = app.OperationHandoff(coordinator, stop_event=threading.Event())
+    token, _ = handoff.acquire(OperationType.EXPORT)
+    gate = PublicationGate(
+        lambda owner=token, coordinator=handoff.coordinator:
+        coordinator.can_publish(owner)
+    )
+    stage = tmp_path / "stage"; final = tmp_path / "final"
+    stage.write_text("complete")
+    gate.publish(lambda: stage.replace(final))
+    second = []
+    with pytest.raises(PublicationCancelled):
+        gate.publish(lambda: second.append(True))
+    assert final.read_text() == "complete" and not stage.exists()
+    assert second == [] and gate.state == "published"
+    assert coordinator.release(token)
+
+
+def test_handoff_publication_cancelled_owner_never_renames(tmp_path):
+    from api import app
+
+    coordinator = ModelSessionCoordinator()
+    handoff = app.OperationHandoff(coordinator, stop_event=threading.Event())
+    token, _ = handoff.acquire(OperationType.EXPORT)
+    gate = PublicationGate(
+        lambda owner=token, coordinator=handoff.coordinator:
+        coordinator.can_publish(owner)
+    )
+    stage = tmp_path / "stage"; final = tmp_path / "final"
+    stage.write_text("partial")
+    assert gate.cancel()
+    with pytest.raises(PublicationCancelled):
+        gate.publish(lambda: stage.replace(final))
+    stage.unlink()
+    assert not final.exists() and gate.state == "cancelled-before-publication"
+    assert coordinator.release(token)
+
+
+def test_handoff_stale_late_publication_cannot_disturb_successor(tmp_path):
+    from api import app
+
+    coordinator = ModelSessionCoordinator()
+    handoff = app.OperationHandoff(coordinator, stop_event=threading.Event())
+    old, _ = handoff.acquire(OperationType.EXPORT)
+    gate = PublicationGate(
+        lambda owner=old, coordinator=handoff.coordinator:
+        coordinator.can_publish(owner)
+    )
+    assert coordinator.release(old)
+    successor, _ = coordinator.acquire(OperationType.UNLOAD, include_bundle=False)
+    stage = tmp_path / "late"; final = tmp_path / "final"
+    stage.write_text("late")
+    with pytest.raises(PublicationCancelled):
+        gate.publish(lambda: stage.replace(final))
+    stage.unlink()
+    assert not final.exists() and coordinator.is_current(successor)
+    assert not coordinator.release(old)
+    assert coordinator.is_current(successor)
+    assert coordinator.release(successor)
+
+
+def test_publication_cancelled_worker_failure_is_http_409():
+    from api import app
+    outcome = app._worker_failure(PublicationCancelled("stale publication"))
+    assert outcome.http_status == 409
+
+
+def test_normal_export_preflight_propagates_recorded_revision(monkeypatch, tmp_path):
+    from api import app
+
+    calls = []
+    monkeypatch.setattr(
+        app, "resolve_local_dir",
+        lambda model_id, *, revision=None: (
+            calls.append((model_id, revision)) or str(tmp_path)
+        ),
+    )
+    monkeypatch.setattr(app.capabilities, "ensure_unquantized", lambda *_a, **_k: None)
+    monkeypatch.setattr(app.capabilities, "require", lambda *_a, **_k: None)
+    rule = {"layers": [0]}
+    snap = SimpleNamespace(
+        bundle=SimpleNamespace(
+            meta={"model_id": "owner/model", "revision": "snapshot-sha"},
+            jl=object(), capability_profile=object(),
+        ),
+        interventions={"active_rules": [rule], "scale": 1.0, "mode": "readthrough"},
+    )
+    outcome = app._export_preflight_resource(
+        snap, SimpleNamespace(format="full", name="export")
+    )
+    assert outcome.status is None
+    assert calls == [("owner/model", "snapshot-sha")]
+
+
+@pytest.mark.parametrize("mode", ["cancel", "stale"])
+def test_production_export_builder_rejects_cancelled_or_stale_late_publication(
+        mode, monkeypatch, tmp_path):
+    from api import app
+
+    coordinator = ModelSessionCoordinator()
+    monkeypatch.setattr(app.manager, "coordinator", coordinator)
+    stage = tmp_path / "stage"; final = tmp_path / "final"
+    ready = threading.Event(); release = threading.Event(); received = []
+
+    def fake_export(*_args, publication_guard=None, **_kwargs):
+        received.append(publication_guard)
+        stage.write_text("staged")
+        ready.set()
+        try:
+            assert release.wait(2)
+            publication_guard.publish(lambda: stage.replace(final))
+        finally:
+            stage.unlink(missing_ok=True)
+
+    monkeypatch.setattr(app.editing, "export_rebase", fake_export)
+    monkeypatch.setattr(
+        app, "_export_preflight_resource",
+        lambda *_a, **_k: app._route_value(app.PreparedWorkerPayload({
+            "bundle": SimpleNamespace(jl=object()), "meta": {}, "rules": [],
+            "source_dir": str(tmp_path), "scale": 1.0, "kwargs": {},
+            "export_fn": app.editing.export_rebase,
+        })),
+    )
+
+    async def scenario():
+        handoff = app.OperationHandoff(coordinator, stop_event=threading.Event())
+        old, _ = handoff.acquire(OperationType.EXPORT)
+        setup = await app._prepare_export_handoff(
+            handoff, SimpleNamespace(format="full", name="x")
+        )
+        waiter = asyncio.create_task(app._await_transferred_worker(
+            setup.task, setup.dispatch, on_cancel=setup.gate.cancel,
+        ))
+        assert await asyncio.to_thread(ready.wait, 2)
+        successor = None
+        try:
+            if mode == "cancel":
+                waiter.cancel()
+                while setup.gate.state == "pending":
+                    await asyncio.sleep(0)
+            else:
+                assert coordinator.release(old)
+                successor, _ = coordinator.acquire(
+                    OperationType.UNLOAD, include_bundle=False
+                )
+        finally:
+            release.set()
+        if mode == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+            assert coordinator.status_snapshot().operation is None
+        else:
+            outcome = await waiter
+            assert outcome.http_status == 409
+            assert coordinator.is_current(successor)
+            assert coordinator.release(successor)
+        assert received == [setup.gate]
+        assert setup.gate.state == "cancelled-before-publication"
+
+    asyncio.run(scenario())
+    assert not final.exists() and not stage.exists()
+
+
+def _install_route_export_preflight(app, monkeypatch, coordinator, exporter, tmp_path):
+    load, snapshot = coordinator.acquire(OperationType.LOAD)
+    coordinator.publish_loaded(
+        load, LoadedModelBundle.from_parts(object(), object(), object(), {}, None),
+        expected_unloaded_session=snapshot.model_session_id,
+    )
+    coordinator.release(load)
+    monkeypatch.setattr(app.manager, "coordinator", coordinator)
+    monkeypatch.setattr(app.editing, "export_rebase", exporter)
+    monkeypatch.setattr(
+        app, "_export_preflight_resource",
+        lambda *_a, **_k: app._route_value(app.PreparedWorkerPayload({
+            "bundle": SimpleNamespace(jl=object()), "meta": {}, "rules": [],
+            "source_dir": str(tmp_path), "scale": 1.0, "kwargs": {},
+            "export_fn": app.editing.export_rebase,
+        })),
+    )
+
+
+def test_api_edit_export_current_owner_uses_production_gate_and_real_rename(
+        monkeypatch, tmp_path):
+    from api import app
+
+    coordinator = ModelSessionCoordinator(); stage = tmp_path / "stage"
+    final = tmp_path / "final"; guards = []; callbacks = []
+    def exporter(*_args, publication_guard=None, **_kwargs):
+        guards.append(publication_guard); stage.write_text("complete")
+        publication_guard.publish(
+            lambda: callbacks.append("rename") or stage.replace(final)
+        )
+        return {"published": True}
+    _install_route_export_preflight(app, monkeypatch, coordinator, exporter, tmp_path)
+    result = asyncio.run(app.api_edit_export(
+        SimpleNamespace(name="route-success", format="full")
+    ))
+    assert result == {"published": True}
+    assert len(guards) == 1 and guards[0].state == "published"
+    assert callbacks == ["rename"]
+    assert final.read_text() == "complete" and not stage.exists()
+    assert coordinator.status_snapshot().operation is None
+
+
+def test_api_edit_export_caller_cancel_uses_route_owned_gate_callback(
+        monkeypatch, tmp_path):
+    from api import app
+
+    coordinator = ModelSessionCoordinator(); stage = tmp_path / "stage"
+    final = tmp_path / "final"; guards = []
+    before_publish = threading.Event(); release = threading.Event()
+    def exporter(*_args, publication_guard=None, **_kwargs):
+        guards.append(publication_guard); stage.write_text("partial")
+        before_publish.set()
+        try:
+            assert release.wait(2)
+            publication_guard.publish(lambda: stage.replace(final))
+        finally:
+            stage.unlink(missing_ok=True)
+    _install_route_export_preflight(app, monkeypatch, coordinator, exporter, tmp_path)
+
+    async def scenario():
+        task = asyncio.create_task(app.api_edit_export(
+            SimpleNamespace(name="route-cancel", format="full")
+        ))
+        try:
+            assert await asyncio.wait_for(
+                asyncio.to_thread(before_publish.wait, 2), timeout=2.5
+            )
+            task.cancel()
+            async with asyncio.timeout(2):
+                while not guards or guards[0].state == "pending":
+                    await asyncio.sleep(0)
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2.5)
+
+    asyncio.run(scenario())
+    assert len(guards) == 1
+    assert guards[0].state == "cancelled-before-publication"
+    assert not final.exists() and not stage.exists()
+    assert coordinator.status_snapshot().operation is None
+
+
 def test_dispatch_payload_cleared_on_cancellation_before_claim():
     import weakref
     from core.model_session import WorkerDispatch

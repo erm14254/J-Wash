@@ -1537,18 +1537,64 @@ def _safe_relative_parts(name):
     return validate_export_name(name)
 
 
-def apply_transform_bounded(entry, tensor, *, row_budget=REBASE_EXPORT_ROW_BUDGET,
-                            observer=None):
+def apply_transform_bounded(entry, tensor, *, spec, disk_key=None,
+                            row_budget=REBASE_EXPORT_ROW_BUDGET, observer=None):
     """Apply a read transform with bounded float32 row temporaries.
 
     The destination is allocated directly in the source dtype.  Write
     transforms are ordinary dense matrices and retain the established path.
     """
+    label = disk_key or getattr(spec, "memory_key", "<tensor>")
+    if not isinstance(tensor, torch.Tensor):
+        raise ValueError(f"{label}: transformed source must be a torch.Tensor")
+    if not isinstance(spec, rebase.SourceTensorSpec):
+        raise ValueError(f"{label}: a valid SourceTensorSpec is required")
+    if not isinstance(entry, (tuple, list)) or len(entry) != 3:
+        raise ValueError(f"{label}: malformed transform entry")
     kind, X, Y = entry
+    if kind not in ("read", "write"):
+        raise ValueError(f"{label}: unknown transform kind {kind!r}")
+    valid_sites = {"reader": "read", "final_head": "read", "writer": "write"}
+    if spec.site not in valid_sites:
+        raise ValueError(f"{label}: unknown source spec site {spec.site!r}")
+    if spec.transform_kind != kind or valid_sites[spec.site] != kind:
+        raise ValueError(f"{label}: transform role {kind!r} conflicts with {spec.site} spec")
+    if not isinstance(spec.shape, tuple) or not spec.shape:
+        raise ValueError(f"{label}: source spec shape must be a nonempty tuple")
+    rank = len(spec.shape)
+    axis = spec.residual_axis + rank if spec.residual_axis < 0 else spec.residual_axis
+    if axis < 0 or axis >= rank:
+        raise ValueError(f"{label}: source spec residual axis is out of range")
+    expected_axis = rank - 1 if kind == "read" else 0
+    if axis != expected_axis:
+        raise ValueError(f"{label}: source spec residual axis conflicts with {kind} orientation")
+    if tensor.ndim != rank or tuple(tensor.shape) != spec.shape:
+        raise ValueError(
+            f"{label}: source shape {tuple(tensor.shape)} does not match validated shape {spec.shape}"
+        )
+    if tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        raise ValueError(f"{label}: transformed source dtype {tensor.dtype} is not supported")
+    if not isinstance(X, torch.Tensor):
+        raise ValueError(f"{label}: transform X must be a tensor")
+    if not isinstance(Y, torch.Tensor):
+        raise ValueError(f"{label}: transform Y must be a tensor")
+    if X.ndim != 2:
+        raise ValueError(f"{label}: transform X must be rank-2")
+    if Y.ndim != 2:
+        raise ValueError(f"{label}: transform Y must be rank-2")
+    if X.shape[1] != Y.shape[1]:
+        raise ValueError(f"{label}: transform X/Y low-rank dimensions disagree")
+    residual = spec.shape[axis]
+    if X.shape[0] != residual or Y.shape[0] != residual:
+        raise ValueError(f"{label}: transform residual dimensions do not match source orientation")
+    original_shape, original_dtype = tuple(tensor.shape), tensor.dtype
     if kind != "read":
         source = tensor.detach().to("cpu", torch.float32)
         updated, _B, _A = rebase.apply_transform(entry, source)
-        return updated.to(tensor.dtype), float((updated - source).abs().max())
+        result = updated.to(tensor.dtype)
+        if tuple(result.shape) != original_shape or result.dtype != original_dtype:
+            raise ValueError(f"{label}: transform did not preserve source shape and dtype")
+        return result, float((updated - source).abs().max())
     if row_budget < 1:
         raise ValueError("row_budget must be positive")
     source = tensor.detach().cpu().contiguous()
@@ -1565,6 +1611,8 @@ def apply_transform_bounded(entry, tensor, *, row_budget=REBASE_EXPORT_ROW_BUDGE
         updated = chunk + B @ Y.T
         delta_max = max(delta_max, float((updated - chunk).abs().max()))
         dest_rows[start:start + count].copy_(updated.to(source.dtype))
+    if tuple(destination.shape) != original_shape or destination.dtype != original_dtype:
+        raise ValueError(f"{label}: transform did not preserve source shape and dtype")
     return destination, delta_max
 
 
@@ -1681,6 +1729,7 @@ def _export_rebase_impl_from_inventory(rules, jl, model_meta, *, fmt, name, sour
         rules, jl, scale, exact=exact, inventory=inventory
     )
     lm_head_key = info["lm_head_key"]
+    source_specs = info["source_specs"]
 
     # The cached fact drives API eligibility; repeat this cheap topology fact at
     # deep execution so direct callers with legacy metadata cannot bypass it.
@@ -1702,10 +1751,11 @@ def _export_rebase_impl_from_inventory(rules, jl, model_meta, *, fmt, name, sour
     delta_max = 0.0
     applied = set()
 
-    def bake(key, tensor):
+    def bake(key, tensor, *, diagnostic_key=None):
         nonlocal delta_max
         W_new, chunk_delta = apply_transform_bounded(
-            transforms[key], tensor, row_budget=REBASE_EXPORT_ROW_BUDGET,
+            transforms[key], tensor, spec=source_specs[key], disk_key=diagnostic_key or key,
+            row_budget=REBASE_EXPORT_ROW_BUDGET,
             observer=REBASE_EXPORT_CHUNK_OBSERVER,
         )
         delta_max = max(delta_max, chunk_delta)
@@ -1823,7 +1873,14 @@ def _export_rebase_impl_from_inventory(rules, jl, model_meta, *, fmt, name, sour
             with safe_open(str(shard), framework="pt") as f:
                 disk_keys.update(f.keys())
         to_disk = _disk_mapper(info["embed_key"], disk_keys)
-        transforms = {to_disk(k): fn for k, fn in transforms.items()}
+        mapped_transforms, mapped_specs = {}, {}
+        for memory_key, transform in transforms.items():
+            disk_key = to_disk(memory_key)
+            if disk_key in mapped_transforms:
+                raise ValueError(f"mapped transform key collision at {disk_key}")
+            mapped_transforms[disk_key] = transform
+            mapped_specs[disk_key] = source_specs[memory_key]
+        transforms, source_specs = mapped_transforms, mapped_specs
         lm_head_key = to_disk(lm_head_key)
         embed_key = to_disk(info["embed_key"])
         required = set(transforms)
@@ -1836,6 +1893,60 @@ def _export_rebase_impl_from_inventory(rules, jl, model_meta, *, fmt, name, sour
                 f"{len(missing_source)} parameter(s) to transform absent from the source "
                 f"checkpoint (e.g. {sample}) — export cancelled before writing"
             )
+        # Metadata-only structural preflight for every active physical source.
+        # For a tied checkpoint without a disk head, the embedding is the
+        # explicit physical source of the logical head transform.
+        tied_fallback = info["tied"] and lm_head_key not in disk_keys
+        tied_owner = None
+        if tied_fallback:
+            if embed_key not in disk_keys:
+                raise ValueError("cannot untie: embed not found in the source")
+            if source_index is not None:
+                tied_owner = source_index["weight_map"].get(embed_key)
+                if tied_owner is None:
+                    raise ValueError("cannot untie: index does not own the embedding source")
+            else:
+                owners = []
+                for shard in shards:
+                    with safe_open(str(shard), framework="pt") as f:
+                        if embed_key in f.keys():
+                            owners.append(shard.name)
+                if len(owners) != 1:
+                    raise ValueError(
+                        f"cannot untie: embedding source ownership is ambiguous ({len(owners)} shards)"
+                    )
+                tied_owner = owners[0]
+
+        def validate_source_header(shard, physical_key, spec, logical_key):
+            with safe_open(str(shard), framework="pt") as f:
+                if physical_key not in f.keys():
+                    raise ValueError(
+                        f"{logical_key}: physical source {physical_key!r} is absent from {shard.name}"
+                    )
+                tensor_slice = f.get_slice(physical_key)
+                if tuple(tensor_slice.get_shape()) != tuple(spec.shape):
+                    raise ValueError(
+                        f"{physical_key}: source shape {tuple(tensor_slice.get_shape())} "
+                        f"does not match validated shape {tuple(spec.shape)}"
+                    )
+                if tensor_slice.get_dtype() not in {"F16", "BF16", "F32", "F64"}:
+                    raise ValueError(
+                        f"{physical_key}: transformed source dtype "
+                        f"{tensor_slice.get_dtype()} is not supported"
+                    )
+
+        for shard in shards:
+            with safe_open(str(shard), framework="pt") as f:
+                direct_keys = set(f.keys()) & set(transforms)
+            for key in direct_keys:
+                validate_source_header(shard, key, source_specs[key], key)
+        if tied_fallback:
+            owner_path = next((shard for shard in shards if shard.name == tied_owner), None)
+            if owner_path is None:
+                raise ValueError(f"cannot untie: embedding owner shard {tied_owner!r} is absent")
+            validate_source_header(
+                owner_path, embed_key, source_specs[lm_head_key], lm_head_key
+            )
         if any(key.startswith("mtp.") for key in disk_keys):
             warnings.append(
                 "MTP weights were preserved but not transformed. Ordinary Transformers "
@@ -1844,19 +1955,25 @@ def _export_rebase_impl_from_inventory(rules, jl, model_meta, *, fmt, name, sour
             )
 
         lm_head_written = False
-        embed_shard_name = None
+        embed_shard_name = tied_owner if tied_fallback else None
+        if (source_index is not None and info["tied"]
+                and lm_head_key not in disk_keys):
+            if embed_shard_name is None:
+                raise ValueError("cannot untie: index does not own the embedding source")
+            if embed_key not in disk_keys:
+                raise ValueError("cannot untie: indexed embedding source is absent")
         for shard in shards:
             out = {}
             with safe_open(str(shard), framework="pt") as f:
                 for key in f.keys():
                     original = f.get_tensor(key)
                     if key in transforms:
-                        out[key] = bake(key, original).to(original.dtype)
+                        out[key] = bake(key, original, diagnostic_key=key)
                         if key == lm_head_key:
                             lm_head_written = True
                     else:
                         out[key] = original
-                    if key == embed_key:
+                    if key == embed_key and source_index is None:
                         embed_shard_name = shard.name
             save_file(out, str(out_dir / shard.name))
             del out
@@ -1870,7 +1987,9 @@ def _export_rebase_impl_from_inventory(rules, jl, model_meta, *, fmt, name, sour
             with safe_open(str(target_shard), framework="pt") as f:
                 merged = {k: f.get_tensor(k) for k in f.keys()}
             embed_original = merged[embed_key]
-            lm_head_value = bake(lm_head_key, embed_original).to(embed_original.dtype)
+            # The physical embedding is the explicit source of the logical
+            # tied head, but must satisfy the head's inventory contract.
+            lm_head_value = bake(lm_head_key, embed_original, diagnostic_key=embed_key)
             merged[lm_head_key] = lm_head_value
             save_file(merged, str(out_dir / embed_shard_name))
             del merged

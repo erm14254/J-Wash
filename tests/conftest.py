@@ -1,6 +1,16 @@
 import pytest
 import torch
 import sys
+from helpers import GGUFTestWorkerRegistry
+
+
+@pytest.fixture
+def gguf_test_workers():
+    registry = GGUFTestWorkerRegistry()
+    yield registry
+    assert registry.real == []
+    assert registry.deferred == []
+    assert registry.releases == []
 
 
 @pytest.fixture(autouse=True)
@@ -21,16 +31,40 @@ def synthetic_decoder_specs(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def restore_api_gguf_state():
+def restore_api_gguf_state(gguf_test_workers, monkeypatch):
     app = sys.modules.get("api.app")
-    original = (dict(app._gguf_state) if app is not None else
+    original = (app._gguf_state_snapshot() if app is not None else
                 {"state": "idle", "name": None, "step": None,
                  "error": None, "result": None})
     yield
     app = sys.modules.get("api.app")
     if app is not None:
-        app._gguf_state.clear()
-        app._gguf_state.update(original)
+        live, incomplete = gguf_test_workers.drain(timeout=2)
+        worker_failures = []
+        if live:
+            worker_failures.append(f"live GGUF test worker(s): {live!r}")
+        if incomplete:
+            worker_failures.append(f"incomplete deferred GGUF work: {incomplete!r}")
+        if live:
+            pytest.exit("; ".join(worker_failures), returncode=2)
+        leaked_owner = leaked_delete = None
+        with app._gguf_lock:
+            leaked_owner = app._gguf_owner
+            leaked_delete = app._gguf_delete_claim
+            app._gguf_owner = None
+            app._gguf_delete_claim = None
+            app._gguf_state.clear()
+            app._gguf_state.update(original)
+        gguf_test_workers.clear()
+        leaks = []
+        if leaked_owner is not None:
+            leaks.append(f"GGUF job owner leaked: {leaked_owner!r}")
+        if leaked_delete is not None:
+            leaks.append(f"GGUF cache-delete claim leaked: {leaked_delete!r}")
+        if leaks:
+            worker_failures.extend(leaks)
+        if worker_failures:
+            pytest.fail("; ".join(worker_failures))
 
 @pytest.fixture(scope="module")
 def tiny():
