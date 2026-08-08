@@ -108,12 +108,15 @@ def test_audited_decoder_class_and_alias_contracts_fail_closed():
     unknown = block(sparse=False)
     rebase.AUDITED_DECODER_SPECS.pop(type(unknown))
     try:
-        with pytest.raises(ValueError, match="not audited"):
+        with pytest.raises(ValueError) as exc:
             rebase.model_preflight(SimpleNamespace(
                 layers=[unknown], _lm_head=nn.Linear(8, 17, False),
                 _final_norm=unknown.post_attention_layernorm,
                 _embed_tokens=nn.Embedding(17, 8),
                 layout=SimpleNamespace(lm_head="lm_head")))
+        message = str(exc.value)
+        assert "no Readthrough/Exact transform adapter is implemented" in message
+        assert f"{type(unknown).__module__}.{type(unknown).__name__}" in message
     finally:
         rebase.AUDITED_DECODER_SPECS[type(unknown)] = (
             SYNTHETIC_DENSE_SPEC)
@@ -136,8 +139,10 @@ def test_modified_and_noncanonical_dense_topologies_fail_closed():
     subclass = type("SyntheticSubclass", (type(base),), {})()
     subclass.__dict__.update(base.__dict__)
     jl = dense_lens(); jl.layers[0] = subclass
-    with pytest.raises(ValueError, match="not audited"):
+    with pytest.raises(ValueError) as exc:
         rebase.model_preflight(jl)
+    assert "no Readthrough/Exact transform adapter is implemented" in str(exc.value)
+    assert f"{type(subclass).__module__}.{type(subclass).__name__}" in str(exc.value)
     jl = dense_lens()
     jl.layers[0].adapter = nn.Linear(8, 8, False)
     with pytest.raises(ValueError, match="inventory is not audited"):

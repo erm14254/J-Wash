@@ -1,4 +1,9 @@
-"""Small, strict, fail-closed capability contract for the loaded model."""
+"""Advisory validation diagnostics for the loaded model.
+
+``supported`` means positively validated by the current audit.  A false value
+is a warning, not authorization to deny an operation; concrete implementations
+remain responsible for deciding whether an attempted operation can proceed.
+"""
 
 PUBLIC_REASONS = {
     "supported": "Supported for this model.",
@@ -166,22 +171,3 @@ def legacy(profile, *, loaded=False):
             "readthrough_supported": readthrough["supported"],
             "readthrough_reason": readthrough["reason"],
             "exact_supported": exact["supported"], "exact_reason": exact["reason"]}
-
-
-def require(profile, kind, name, mode="standard", *, loaded=False):
-    contract = snapshot(profile, mode, loaded=loaded)
-    items = contract["modes"] if kind == "modes" else contract["exports"]
-    item = items.get(name, decision(False, "mode_unsupported"))
-    if type(item.get("supported")) is not bool or item["supported"] is not True:
-        raise ValueError(item.get("reason", PUBLIC_REASONS["capability_data_unavailable"]))
-
-
-def ensure_unquantized(jl, model_meta=None):
-    """Deep guard using both declarations; disagreement is unsupported."""
-    jl_quant = getattr(jl, "_jwash_declared_quant", None)
-    meta_quant = model_meta.get("quant") if isinstance(model_meta, dict) else None
-    if jl_quant not in (None, *QUANTS) or meta_quant not in (None, *QUANTS):
-        raise ValueError(PUBLIC_REASONS["quantized_model_unsupported"])
-    if jl_quant in QUANTS or meta_quant in QUANTS or (
-            isinstance(model_meta, dict) and jl_quant != meta_quant):
-        raise ValueError(PUBLIC_REASONS["quantized_model_unsupported"])

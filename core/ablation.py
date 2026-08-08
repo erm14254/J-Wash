@@ -117,6 +117,10 @@ def clone_intervention_snapshot(snapshot):
 MODES = ("standard", "readthrough", "exact", "abliteration")
 
 
+class UnknownInterventionRule(ValueError):
+    """A requested intervention rule does not exist."""
+
+
 class HookAttachment:
     def __init__(self, handles):
         self._handles = list(handles)
@@ -269,8 +273,77 @@ class Interventions:
         with self._lock:
             return self._summary_locked()
 
-    def _direction(self, lens, weight, token_id, layers):
-        row = weight[token_id].float()
+    def _direction_source(self, lens_manager, jl, token_ids, layers):
+        if lens_manager is None or lens_manager.lens is None:
+            raise ValueError("no lens loaded")
+        if jl is None:
+            raise ValueError("model and lens required to construct directions")
+        layers_obj = getattr(jl, "layers", None)
+        if layers_obj is None:
+            raise ValueError("model layers are unavailable for direction construction")
+        try:
+            n_layers = len(layers_obj)
+        except (TypeError, RuntimeError) as exc:
+            raise ValueError("model layers are not a readable sequence") from exc
+        head_module = getattr(jl, "_lm_head", None)
+        head = getattr(head_module, "weight", None)
+        if not isinstance(head, torch.Tensor) or head.ndim != 2:
+            raise ValueError("lm_head weight must be a readable 2-D tensor")
+        if not head.is_floating_point() or head.is_complex():
+            raise ValueError("lm_head weight must support floating-point direction arithmetic")
+        if head.layout != torch.strided:
+            raise ValueError("lm_head weight must use a dense strided layout")
+        if head.device.type == "meta":
+            from core.rebase import materialize_parameter_for_inspection
+            try:
+                head = materialize_parameter_for_inspection(head_module, "weight")
+            except ValueError as exc:
+                raise ValueError(f"lm_head weight is not materializable: {exc}") from exc
+            if not isinstance(head, torch.Tensor) or head.device.type == "meta":
+                raise ValueError("lm_head weight could not be materialized")
+            if head.ndim != 2 or not head.is_floating_point() or head.is_complex() \
+                    or head.layout != torch.strided:
+                raise ValueError("materialized lm_head weight is not a readable 2-D floating tensor")
+
+        embed = getattr(getattr(jl, "_embed_tokens", None), "weight", None)
+        if not isinstance(embed, torch.Tensor) or embed.ndim != 2:
+            raise ValueError("model embedding weight is unavailable for residual-width validation")
+        residual_width = int(embed.shape[1])
+        if residual_width <= 0:
+            raise ValueError("model residual width must be positive")
+        if int(head.shape[1]) != residual_width:
+            raise ValueError(
+                f"lm_head input width {head.shape[1]} does not match model residual width "
+                f"{residual_width}"
+            )
+        try:
+            resolved = sorted({int(layer) for layer in layers})
+        except (TypeError, ValueError) as exc:
+            raise ValueError("requested layers must be an iterable of integers") from exc
+        if any(layer < 0 or layer >= n_layers for layer in resolved):
+            raise ValueError(f"requested layer must be between 0 and {max(n_layers - 1, 0)}")
+        for token_id in token_ids:
+            if token_id is None or int(token_id) < 0 or int(token_id) >= head.shape[0]:
+                raise ValueError(f"token id {token_id} is outside lm_head vocabulary")
+        lens = lens_manager.lens
+        if not isinstance(getattr(lens, "jacobians", None), Mapping):
+            raise ValueError("loaded lens has no readable Jacobian mapping")
+        tokenizer = getattr(jl, "tokenizer", None)
+        if not callable(getattr(tokenizer, "decode", None)):
+            raise ValueError("model tokenizer is unavailable for intervention labels")
+        return lens, head, resolved, residual_width
+
+    def _direction(self, lens, weight, token_id, layers, residual_width):
+        try:
+            row = weight[token_id].detach().float()
+        except (IndexError, RuntimeError, TypeError) as exc:
+            raise ValueError(f"lm_head row for token {token_id} is unreadable: {exc}") from exc
+        if row.layout != torch.strided or row.device.type == "meta":
+            raise ValueError(f"lm_head row for token {token_id} is not readable")
+        if row.ndim != 1 or row.shape[0] != residual_width:
+            raise ValueError("lm_head row does not match model residual width")
+        if not torch.isfinite(row).all():
+            raise ValueError(f"lm_head row for token {token_id} contains non-finite values")
         dirs = {}
         for layer in layers:
             J = lens.jacobians.get(layer)
@@ -279,31 +352,62 @@ class Interventions:
                 # a good approximation near the output
                 v = row
             else:
-                v = row @ J.float().to(weight.device)
-            dirs[layer] = v / v.norm().clamp_min(1e-8)
+                if not isinstance(J, torch.Tensor):
+                    raise ValueError(f"Jacobian at layer {layer} must be a tensor")
+                if J.ndim != 2:
+                    raise ValueError(f"Jacobian at layer {layer} must be 2-D")
+                if J.layout != torch.strided or J.device.type == "meta":
+                    raise ValueError(f"Jacobian at layer {layer} is not readable")
+                if J.shape[0] != row.shape[0]:
+                    raise ValueError(
+                        f"Jacobian input width at layer {layer} does not match lm_head width"
+                    )
+                if J.shape[1] != residual_width:
+                    raise ValueError(
+                        f"Jacobian output width at layer {layer} does not match model residual width"
+                    )
+                if not (J.is_floating_point() and not J.is_complex()):
+                    raise ValueError(f"Jacobian at layer {layer} must use real floating-point arithmetic")
+                if not torch.isfinite(J).all():
+                    raise ValueError(f"Jacobian at layer {layer} contains non-finite values")
+                try:
+                    v = row @ J.to(device=row.device, dtype=row.dtype)
+                except (RuntimeError, TypeError) as exc:
+                    raise ValueError(f"Jacobian at layer {layer} cannot construct a direction: {exc}") from exc
+            if v.ndim != 1 or v.shape[0] != residual_width:
+                raise ValueError(f"direction width at layer {layer} does not match model residual width")
+            if not torch.isfinite(v).all():
+                raise ValueError(f"direction at layer {layer} contains non-finite values")
+            norm = v.norm()
+            if not torch.isfinite(norm) or norm.item() <= 1e-8:
+                raise ValueError(f"direction at layer {layer} cannot be normalized")
+            dirs[layer] = v / norm
         return dirs
 
     def add(self, lens_manager, jl, *, token_id, mode="scale", factor=0.0,
             replacement_id=None, layers=None, enabled=True):
-        from core.capabilities import ensure_unquantized
-        ensure_unquantized(jl)
         with self._lock:
-            lens = lens_manager.lens
-            if lens is None:
-                raise ValueError("no lens loaded")
             if mode not in ("scale", "replace"):
                 raise ValueError(f"invalid mode: {mode}")
             if mode == "replace" and replacement_id is None:
                 raise ValueError("replacement_id required in replace mode")
-            n_layers = len(jl.layers)
             if layers is None:
-                layers = default_layers(n_layers)
+                layers_obj = getattr(jl, "layers", None)
+                try:
+                    layers = default_layers(len(layers_obj))
+                except (TypeError, AttributeError, RuntimeError) as exc:
+                    raise ValueError("model layers are unavailable for direction construction") from exc
             # layers=[] is valid: rule recorded but inactive
-            layers = sorted({int(l) for l in layers if 0 <= int(l) < n_layers})
-            weight = jl._lm_head.weight
-            if weight.dtype not in (torch.float16, torch.bfloat16, torch.float32):
-                raise ValueError("interventions unavailable on a quantized model")
+            token_ids = [token_id] + ([replacement_id] if replacement_id is not None else [])
+            lens, weight, layers, residual_width = self._direction_source(
+                lens_manager, jl, token_ids, layers
+            )
             tokenizer = jl.tokenizer
+            dirs_a = self._direction(lens, weight, int(token_id), layers, residual_width)
+            dirs_b = (
+                self._direction(lens, weight, int(replacement_id), layers, residual_width)
+                if replacement_id is not None else None
+            )
             rule = {
                 "id": next(self._counter),
                 "token_id": int(token_id),
@@ -314,10 +418,8 @@ class Interventions:
                 "replacement": tokenizer.decode([int(replacement_id)]) if replacement_id is not None else None,
                 "layers": [int(l) for l in layers],
                 "enabled": bool(enabled),
-                "dirs_a": self._direction(lens, weight, int(token_id), layers),
-                "dirs_b": self._direction(lens, weight, int(replacement_id), layers)
-                if replacement_id is not None
-                else None,
+                "dirs_a": dirs_a,
+                "dirs_b": dirs_b,
             }
             self._rules.append(rule)
             self._revision += 1
@@ -327,15 +429,6 @@ class Interventions:
                token_id=None, replacement_id=None, mode=None,
                lens_manager=None, jl=None):
         needs_dirs = any(x is not None for x in (layers, token_id, replacement_id, mode))
-        if needs_dirs:
-            from core.capabilities import ensure_unquantized
-            ensure_unquantized(jl)
-            if lens_manager is None or jl is None:
-                raise ValueError("model and lens required to edit the rule")
-            lens = lens_manager.lens
-            if lens is None:
-                raise ValueError("no lens loaded")
-            tokenizer = jl.tokenizer
         with self._lock:
             for index, rule in enumerate(self._rules):
                 if rule["id"] != rule_id:
@@ -351,6 +444,16 @@ class Interventions:
                     self._rules[index] = candidate
                     self._revision += 1
                     return self._summary_locked()
+                # Establish existence under the same lock before concrete
+                # direction prerequisites can mask an unknown-rule response.
+                # Validation and commit remain one locked transaction, so no
+                # concurrent mutation can invalidate the cloned candidate.
+                if lens_manager is None or jl is None:
+                    raise ValueError("model and lens required to edit the rule")
+                lens = lens_manager.lens
+                if lens is None:
+                    raise ValueError("no lens loaded")
+                tokenizer = jl.tokenizer
                 if mode is not None:
                     if mode not in ("scale", "replace"):
                         raise ValueError(f"invalid mode: {mode}")
@@ -367,13 +470,21 @@ class Interventions:
                 elif candidate["replacement_id"] is None:
                     raise ValueError("replacement_id required in replace mode")
                 if layers is not None:
-                    n_layers = len(jl.layers)
-                    # new_layers=[] is valid: rule kept but inactive
-                    candidate["layers"] = sorted({int(l) for l in layers if 0 <= int(l) < n_layers})
-                weight = jl._lm_head.weight
-                dirs_a = self._direction(lens, weight, candidate["token_id"], candidate["layers"])
+                    candidate["layers"] = list(layers)
+                token_ids = [candidate["token_id"]]
+                if candidate["replacement_id"] is not None:
+                    token_ids.append(candidate["replacement_id"])
+                lens, weight, candidate["layers"], residual_width = self._direction_source(
+                    lens_manager, jl, token_ids, candidate["layers"]
+                )
+                dirs_a = self._direction(
+                    lens, weight, candidate["token_id"], candidate["layers"], residual_width
+                )
                 dirs_b = (
-                    self._direction(lens, weight, candidate["replacement_id"], candidate["layers"])
+                    self._direction(
+                        lens, weight, candidate["replacement_id"], candidate["layers"],
+                        residual_width,
+                    )
                     if candidate["replacement_id"] is not None
                     else None
                 )
@@ -382,7 +493,7 @@ class Interventions:
                 self._rules[index] = candidate
                 self._revision += 1
                 return self._summary_locked()
-            raise ValueError(f"unknown rule {rule_id}")
+            raise UnknownInterventionRule(f"unknown rule {rule_id}")
 
     def remove(self, rule_id=None):
         with self._lock:
@@ -420,15 +531,13 @@ class Interventions:
             }
 
     def attach(self, jl, *, snapshot=None):
-        from core.capabilities import ensure_unquantized, PUBLIC_REASONS
-        ensure_unquantized(jl)
         snap = clone_intervention_snapshot(snapshot) if snapshot is not None else self.snapshot()
         mode = snap["mode"]
-        if mode == "abliteration":
-            raise ValueError(PUBLIC_REASONS["global_projection_unvalidated"])
         active = [r for r in snap["rules"] if r["layers"] and r.get("enabled", True)]
         if not active:
             return HookAttachment([])
+        if mode == "abliteration":
+            return self._attach_abliteration(jl)
         if mode in ("readthrough", "exact"):
             return self._attach_rebase(jl, exact=mode == "exact", active=active, scale=snap["scale"])
         by_layer = {}
@@ -464,8 +573,7 @@ class Interventions:
         return HookAttachment(handles)
 
     def _attach_abliteration(self, jl):
-        from core.capabilities import PUBLIC_REASONS
-        raise ValueError(PUBLIC_REASONS["global_projection_unvalidated"])
+        raise ValueError("Global Projection live attachment is not implemented")
 
     def _attach_rebase(self, jl, exact, active=None, scale=None):
         # readthrough/exact preview: the SAME transform as the bake (core/rebase),

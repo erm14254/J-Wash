@@ -60,12 +60,10 @@ def test_no_model_snapshot_is_complete_and_fail_closed():
     {},
     {"declared_quantization": None, "has_packed_read_parameters": False, "modes": {}},
 ])
-def test_missing_capability_data_fails_closed_for_loaded_model(bad):
+def test_missing_capability_data_produces_advisory_for_loaded_model(bad):
     snap = capabilities.snapshot(bad, loaded=True)
     assert all(item["reason_code"] == "capability_data_unavailable"
                for item in snap["modes"].values())
-    with pytest.raises(ValueError, match="Capability data is unavailable"):
-        capabilities.require(bad, "modes", "standard", loaded=True)
 
 
 @pytest.mark.parametrize("value", ["false", 0, 1, None])
@@ -106,8 +104,6 @@ def test_contradictory_intrinsic_profiles_never_authorize_exact(mutate):
     assert not snap["modes"]["exact"]["supported"]
     assert not snap["exports"]["full"]["supported"]
     assert capabilities.legacy(profile, loaded=True)["exact_supported"] is False
-    with pytest.raises(ValueError):
-        capabilities.require(profile, "modes", "exact", loaded=True)
 
 
 def test_snapshot_and_decision_identity_are_isolated():
@@ -122,7 +118,7 @@ def test_snapshot_and_decision_identity_are_isolated():
     assert len(ids) == len(set(ids))
 
 
-def test_global_projection_is_always_disabled_in_contract_and_deep_paths(
+def test_global_projection_is_advisory_and_fails_at_implementation_seams(
         tmp_path, monkeypatch):
     jl = dense_lens()
     monkeypatch.setattr(editing, "EDITS_DIR", tmp_path / "edits")
@@ -131,48 +127,104 @@ def test_global_projection_is_always_disabled_in_contract_and_deep_paths(
         False, "global_projection_unvalidated"
     )
     rules = [{"layers": [0]}]
-    with pytest.raises(ValueError, match="temporarily unavailable"):
+    with pytest.raises(ValueError, match="not safely implemented"):
         editing.compute_abliteration(rules, jl)
     iv = Interventions()
     iv.set_mode("abliteration")
-    with pytest.raises(ValueError, match="temporarily unavailable"):
+    iv._rules = [{"layers": [0], "enabled": True}]
+    with pytest.raises(ValueError, match="live attachment is not implemented"):
         attachment = iv.attach(jl)
         attachment.close()
-    with pytest.raises(ValueError, match="temporarily unavailable"):
+    with pytest.raises(ValueError, match="not safely implemented"):
         editing.export_abliteration(rules, jl, {"quant": None}, fmt="full",
                                     name="must-not-exist", source_dir=tmp_path)
     assert not (editing.EDITS_DIR / "must-not-exist").exists()
 
 
 @pytest.mark.parametrize("quant", ["int8", "nf4"])
-def test_declared_quantization_blocks_floating_head_mutations(quant):
+def test_declared_quantization_does_not_block_usable_floating_head(quant):
     jl = dense_lens()
     jl._jwash_declared_quant = quant
     jl.tokenizer = SimpleNamespace(decode=lambda ids: str(ids[0]))
     lens_manager = SimpleNamespace(lens=SimpleNamespace(jacobians={}))
     iv = Interventions()
-    with pytest.raises(ValueError, match="quantized"):
-        iv.add(lens_manager, jl, token_id=1, layers=[0])
-    assert iv.summary() == []
-    iv._rules = [{"id": 1, "factor": 1.0}]
-    before = copy.deepcopy(iv._rules)
-    with pytest.raises(ValueError, match="quantized"):
-        iv.update(1, layers=[0], lens_manager=lens_manager, jl=jl)
-    assert iv._rules == before
-    iv.set_mode("readthrough")
-    with pytest.raises(ValueError, match="quantized"):
-        attachment = iv.attach(jl)
-        attachment.close()
+    assert iv.add(lens_manager, jl, token_id=1, layers=[0])[0]["token_id"] == 1
+    assert iv.update(1, layers=[0], lens_manager=lens_manager, jl=jl)[0]["layers"] == [0]
 
 
-def test_quantization_declarations_disagree_fail_closed():
+def test_unusable_direction_tensor_fails_concretely_and_transactionally():
     jl = dense_lens()
-    jl._jwash_declared_quant = "int8"
-    with pytest.raises(ValueError, match="quantized"):
-        capabilities.ensure_unquantized(jl, {"quant": None})
-    jl._jwash_declared_quant = None
-    with pytest.raises(ValueError, match="quantized"):
-        capabilities.ensure_unquantized(jl, {"quant": "nf4"})
+    jl._lm_head.weight = torch.nn.Parameter(torch.ones(8, dtype=torch.int64), requires_grad=False)
+    jl.tokenizer = SimpleNamespace(decode=lambda ids: str(ids[0]))
+    iv = Interventions()
+    with pytest.raises(ValueError, match="2-D tensor"):
+        iv.add(SimpleNamespace(lens=SimpleNamespace(jacobians={})), jl, token_id=1, layers=[0])
+    assert iv.summary() == []
+
+
+def _direction_fixture(*, jacobian=None):
+    jl = dense_lens()
+    jl.tokenizer = SimpleNamespace(decode=lambda ids: str(ids[0]))
+    lens = SimpleNamespace(jacobians={} if jacobian is None else {0: jacobian})
+    return jl, SimpleNamespace(lens=lens)
+
+
+@pytest.mark.parametrize("failure", ["missing_layers", "unreadable_layers", "meta_head",
+                                      "wrong_head_width"])
+def test_concrete_direction_source_failures_do_not_mutate_add(failure):
+    jl, lens_manager = _direction_fixture()
+    if failure == "missing_layers":
+        del jl.layers
+    elif failure == "unreadable_layers":
+        jl.layers = object()
+    elif failure == "meta_head":
+        jl._lm_head.weight = torch.nn.Parameter(torch.empty(17, 8, device="meta"))
+    else:
+        jl._lm_head = torch.nn.Linear(7, 17, bias=False)
+    iv = Interventions()
+    before = iv.state_record()
+    with pytest.raises(ValueError):
+        iv.add(lens_manager, jl, token_id=1, layers=[0])
+    assert iv.state_record() == before
+
+
+@pytest.mark.parametrize("jacobian,match", [
+    ("not-a-tensor", "must be a tensor"),
+    (torch.ones(8), "must be 2-D"),
+    (torch.ones(7, 8), "input width"),
+    (torch.ones(8, 7), "output width"),
+    (torch.full((8, 8), float("nan")), "non-finite"),
+])
+def test_concrete_jacobian_failures_do_not_mutate_add(jacobian, match):
+    jl, lens_manager = _direction_fixture(jacobian=jacobian)
+    iv = Interventions()
+    before = iv.state_record()
+    with pytest.raises(ValueError, match=match):
+        iv.add(lens_manager, jl, token_id=1, layers=[0])
+    assert iv.state_record() == before
+
+
+@pytest.mark.parametrize("value,match", [
+    (float("inf"), "non-finite"),
+    (0.0, "cannot be normalized"),
+])
+def test_nonfinite_or_zero_head_direction_does_not_mutate_add(value, match):
+    jl, lens_manager = _direction_fixture()
+    with torch.no_grad():
+        jl._lm_head.weight[1].fill_(value)
+    iv = Interventions()
+    before = iv.state_record()
+    with pytest.raises(ValueError, match=match):
+        iv.add(lens_manager, jl, token_id=1, layers=[0])
+    assert iv.state_record() == before
+
+
+def test_empty_layers_remains_a_valid_inactive_rule():
+    jl, lens_manager = _direction_fixture()
+    iv = Interventions()
+    rules = iv.add(lens_manager, jl, token_id=1, layers=[])
+    assert rules[0]["layers"] == []
+    assert iv.active_rules_full() == []
 
 
 @pytest.mark.parametrize("quant", [None, "int8", "nf4"])
@@ -224,15 +276,14 @@ def test_status_malformed_loaded_profile_is_controlled_and_legacy_matches(monkey
         "modes"]["readthrough"]["reason"]
 
 
-def test_global_mode_is_rejected_by_mode_and_export_apis(tmp_path, monkeypatch):
+def test_global_mode_commits_and_export_reaches_safe_stub(tmp_path, monkeypatch):
     import api.app as app
     iv = Interventions()
     monkeypatch.setattr(app, "interventions", iv)
     _install_loaded_bundle(app, monkeypatch, jl=dense_lens(), profile=_profile())
-    with pytest.raises(app.HTTPException) as exc:
-        app.api_interventions_scale(SimpleNamespace(scale=2, mode="abliteration"))
-    assert exc.value.status_code == 422
-    assert iv.state_snapshot() == (1.0, "standard")
+    assert app.api_interventions_scale(SimpleNamespace(scale=2, mode="abliteration")) == {
+        "scale": 2.0, "mode": "abliteration",
+    }
 
     iv._mode = "abliteration"
     iv._rules = [{"layers": [0], "enabled": True}]
@@ -246,24 +297,26 @@ def test_global_mode_is_rejected_by_mode_and_export_apis(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("quant", ["int8", "nf4"])
-def test_quantized_preset_rejection_is_transactional(quant, monkeypatch):
+def test_quantized_declaration_does_not_reject_usable_preset(quant, monkeypatch):
     import api.app as app
     jl = dense_lens()
     jl._jwash_declared_quant = quant
+    jl.tokenizer = SimpleNamespace(decode=lambda ids: str(ids[0]))
     iv = Interventions()
     iv.set_scale(2.0)
     monkeypatch.setattr(app, "interventions", iv)
-    monkeypatch.setattr(app.manager, "hf_model", object())
-    monkeypatch.setattr(app.manager, "jl", jl)
-    monkeypatch.setattr(app.manager, "meta", {"model_id": "local", "quant": quant})
+    profile = capabilities.build_profile(jl, quant)
+    _install_loaded_bundle(
+        app, monkeypatch, jl=jl, profile=profile,
+        meta={"model_id": "local", "quant": quant},
+    )
     monkeypatch.setattr(app.lens_manager, "lens", SimpleNamespace(jacobians={}))
     monkeypatch.setattr(app.editing, "load_preset", lambda _name: {
         "scale": 9.0, "rules": [{"token_id": 1, "mode": "scale", "factor": 0.0}]
     })
-    with pytest.raises(app.HTTPException) as exc:
-        app.api_presets_apply("quantized")
-    assert exc.value.status_code == 422
-    assert iv.summary() == [] and iv.global_scale == 2.0
+    result = app.api_presets_apply("quantized")
+    assert result["scale"] == 9.0
+    assert len(result["rules"]) == 1
 
 
 def test_mode_only_does_not_overwrite_concurrent_scale():
@@ -328,7 +381,7 @@ def _existing_rule():
     }
 
 
-def test_direction_patch_unavailable_profile_is_canonical_422_and_transactional(monkeypatch):
+def test_direction_patch_unavailable_profile_reaches_concrete_validation(monkeypatch):
     import api.app as app
     jl = dense_lens()
     iv = Interventions()
@@ -342,17 +395,17 @@ def test_direction_patch_unavailable_profile_is_canonical_422_and_transactional(
                                replacement_id=None, mode=None)
         )
     assert exc.value.status_code == 422
-    assert exc.value.detail == capabilities.PUBLIC_REASONS["capability_data_unavailable"]
+    assert "lens" in exc.value.detail
     assert iv.state_record() == before
 
 
-def test_direction_patch_unknown_rule_with_valid_profile_remains_404(monkeypatch):
+def test_direction_patch_unknown_rule_without_lens_remains_404(monkeypatch):
     import api.app as app
     jl = dense_lens()
     jl.tokenizer = SimpleNamespace(decode=lambda ids: str(ids[0]))
     iv = Interventions()
     monkeypatch.setattr(app, "interventions", iv)
-    monkeypatch.setattr(app.lens_manager, "lens", SimpleNamespace(jacobians={}))
+    monkeypatch.setattr(app.lens_manager, "lens", None)
     _install_loaded_bundle(app, monkeypatch, jl=jl, profile=_profile())
     with pytest.raises(app.HTTPException) as exc:
         app.api_interventions_patch(
@@ -363,7 +416,46 @@ def test_direction_patch_unknown_rule_with_valid_profile_remains_404(monkeypatch
     assert exc.value.detail == "unknown rule 999"
 
 
-def test_preset_unavailable_profile_rejects_before_any_mutation(monkeypatch):
+def test_add_wrong_residual_width_is_422_and_transactional(monkeypatch):
+    import api.app as app
+    jl, lens_manager = _direction_fixture()
+    jl._lm_head = torch.nn.Linear(7, 17, bias=False)
+    iv = Interventions()
+    before = iv.state_record()
+    monkeypatch.setattr(app, "interventions", iv)
+    monkeypatch.setattr(app.lens_manager, "lens", lens_manager.lens)
+    _install_loaded_bundle(app, monkeypatch, jl=jl, profile={"modes": {}})
+    with pytest.raises(app.HTTPException) as exc:
+        app.api_interventions_add(SimpleNamespace(
+            token_id=1, mode="scale", factor=0.0, replacement_id=None, layers=[0]
+        ))
+    assert exc.value.status_code == 422
+    assert "does not match model residual width" in exc.value.detail
+    assert iv.state_record() == before
+
+
+def test_direction_patch_bad_jacobian_is_422_and_transactional(monkeypatch):
+    import api.app as app
+    jl, lens_manager = _direction_fixture(jacobian=torch.ones(7, 8))
+    iv = Interventions()
+    iv._rules = [_existing_rule()]
+    before = iv.state_record()
+    monkeypatch.setattr(app, "interventions", iv)
+    monkeypatch.setattr(app.lens_manager, "lens", lens_manager.lens)
+    _install_loaded_bundle(app, monkeypatch, jl=jl, profile={"modes": {}})
+    with pytest.raises(app.HTTPException) as exc:
+        app.api_interventions_patch(
+            1, SimpleNamespace(factor=None, layers=[0], enabled=None, token_id=None,
+                               replacement_id=None, mode=None)
+        )
+    assert exc.value.status_code == 422
+    assert "Jacobian input width" in exc.value.detail
+    assert iv.state_record()["revision"] == before["revision"]
+    assert iv.summary()[0]["layers"] == [0]
+    assert iv._rules[0]["dirs_a"][0] is before["rules"][0]["dirs_a"][0]
+
+
+def test_preset_unavailable_profile_does_not_preempt_mutation(monkeypatch):
     import api.app as app
     iv = Interventions()
     iv._rules = [_existing_rule()]
@@ -371,15 +463,15 @@ def test_preset_unavailable_profile_rejects_before_any_mutation(monkeypatch):
     before = iv.state_record()
     monkeypatch.setattr(app, "interventions", iv)
     monkeypatch.setattr(app.lens_manager, "lens", SimpleNamespace(jacobians={}))
-    _install_loaded_bundle(app, monkeypatch, jl=dense_lens(), profile={"modes": {}})
+    jl = dense_lens()
+    jl.tokenizer = SimpleNamespace(decode=lambda ids: str(ids[0]))
+    _install_loaded_bundle(app, monkeypatch, jl=jl, profile={"modes": {}})
     monkeypatch.setattr(app.editing, "load_preset", lambda _name: {
         "scale": 9.0, "rules": [{"token_id": 2, "mode": "scale", "factor": 0.0}],
     })
-    with pytest.raises(app.HTTPException) as exc:
-        app.api_presets_apply("unavailable")
-    assert exc.value.status_code == 422
-    assert exc.value.detail == capabilities.PUBLIC_REASONS["capability_data_unavailable"]
-    assert iv.state_record() == before
+    result = app.api_presets_apply("unavailable")
+    assert result["scale"] == 9.0
+    assert all("Capability data" not in warning for warning in result["warnings"])
 
 
 def test_cleanup_disable_delete_and_clear_survive_unavailable_profile(monkeypatch):
@@ -405,7 +497,7 @@ def test_cleanup_disable_delete_and_clear_survive_unavailable_profile(monkeypatc
     ({"enabled": True}, "enabled", False),
     ({"enabled": False, "factor": 0.75}, "factor", 0.0),
 ])
-def test_effectful_factor_enable_and_combined_patches_require_capability(
+def test_effectful_factor_enable_and_combined_patches_ignore_capability(
         monkeypatch, patch, field, expected):
     import api.app as app
     rule = _existing_rule()
@@ -413,18 +505,13 @@ def test_effectful_factor_enable_and_combined_patches_require_capability(
         rule["enabled"] = False
     iv = Interventions()
     iv._rules = [rule]
-    before = iv.state_record()
     monkeypatch.setattr(app, "interventions", iv)
     _install_loaded_bundle(app, monkeypatch, profile={"modes": {}})
     request = dict(factor=None, layers=None, enabled=None, token_id=None,
                    replacement_id=None, mode=None)
     request.update(patch)
-    with pytest.raises(app.HTTPException) as exc:
-        app.api_interventions_patch(1, SimpleNamespace(**request))
-    assert exc.value.status_code == 422
-    assert exc.value.detail == capabilities.PUBLIC_REASONS["capability_data_unavailable"]
-    assert iv.state_record() == before
-    assert iv.summary()[0][field] == expected
+    response = app.api_interventions_patch(1, SimpleNamespace(**request))
+    assert response["rules"][0][field] == patch[field]
 
 
 def test_standard_editing_does_not_require_readthrough_support(monkeypatch):
@@ -487,16 +574,10 @@ def test_generation_unavailable_profile_only_blocks_actual_active_rules(monkeypa
         intervention_snapshot=intervention_snapshot, stop_event=threading.Event(),
     )
     ablator = Ablator()
-    if active:
-        with pytest.raises(ValueError, match="Capability data is unavailable"):
-            app.manager.generate([], {}, threading.Event(), lambda _event: None,
-                                 lens=context, ablator=ablator)
-        assert ablator.attach_calls == 0
-    else:
-        with pytest.raises(NormalGenerationSeam, match="normal generation reached"):
-            app.manager.generate([], {}, threading.Event(), lambda _event: None,
-                                 lens=context, ablator=ablator)
-        assert ablator.attach_calls == 1
+    with pytest.raises(NormalGenerationSeam, match="normal generation reached"):
+        app.manager.generate([], {}, threading.Event(), lambda _event: None,
+                             lens=context, ablator=ablator)
+    assert ablator.attach_calls == 1
 
 
 @pytest.mark.parametrize("mode,profile,allowed", [
@@ -540,13 +621,7 @@ def test_generation_guard_uses_captured_selected_mode(monkeypatch, mode, profile
         intervention_snapshot=snapshot, stop_event=threading.Event(),
     )
     ablator = Ablator()
-    if allowed:
-        with pytest.raises(Seam, match="normal seam"):
-            app.manager.generate([], {}, threading.Event(), lambda _event: None,
-                                 lens=context, ablator=ablator)
-        assert ablator.calls == 1
-    else:
-        with pytest.raises(ValueError, match="not been validated"):
-            app.manager.generate([], {}, threading.Event(), lambda _event: None,
-                                 lens=context, ablator=ablator)
-        assert ablator.calls == 0
+    with pytest.raises(Seam, match="normal seam"):
+        app.manager.generate([], {}, threading.Event(), lambda _event: None,
+                             lens=context, ablator=ablator)
+    assert ablator.calls == 1

@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { fmtTok } from './tok'
 import { createEditorMutationState, isEditorMutationCancellation, throwIfEditorMutationCancelled } from './editorMutationState.js'
-import { selectedExportState, shouldOpenAdvanced } from './capabilityState.js'
 
 // Default layer slice for a new rule, as fractions of the model's layer count
 // (aligned with core/ablation.py): 56 layers -> 33 to 44.
@@ -176,12 +175,8 @@ function ruleTitle(r) {
   return lines.join('\n')
 }
 
-// Four independent rows mirror the authoritative server decisions.
+// All known modes are offered whenever the session mechanics permit an attempt.
 function ModeSelector({ state, onChange }) {
-  const [advanced, setAdvanced] = useState(shouldOpenAdvanced(state.selectedMode))
-  useEffect(() => {
-    if (shouldOpenAdvanced(state.selectedMode)) setAdvanced(true)
-  }, [state.selectedMode])
   const rows = (ids) => ids.map((id) => {
     const item = state.modes[id]
     const info = MODE_INFO[id]
@@ -191,16 +186,13 @@ function ModeSelector({ state, onChange }) {
         disabled={!item.enabled} aria-describedby={!item.enabled ? reasonId : undefined}
         onChange={() => onChange(id)} />
       <span><strong>{info.label}</strong><span className="src">{info.subtitle}</span>
-        {!item.decision.supported && <span id={reasonId} className="cap-reason">{item.decision.reason}</span>}
-        {item.decision.supported && !item.enabled && <span id={reasonId} className="cap-local">Refreshing or another operation is in progress.</span>}
+        {!item.enabled && <span id={reasonId} className="cap-local">{item.mechanicalReason}</span>}
       </span>
     </label>
   })
   return (
     <div className="mode-selector" role="radiogroup" aria-label="intervention mode">
-      {rows(['standard', 'readthrough'])}
-      <button type="button" className="advanced-toggle" aria-expanded={advanced} onClick={() => setAdvanced(!advanced)}>Advanced {advanced ? '▾' : '▸'}</button>
-      {advanced && rows(['exact', 'abliteration'])}
+      {rows(['standard', 'readthrough', 'exact', 'abliteration'])}
     </div>
   )
 }
@@ -212,9 +204,7 @@ const MODE_INFO = {
   },
   readthrough: {
     label: 'Readthrough', subtitle: 'Read projection',
-    help: 'every read of the residual downstream of the chosen layers (q/k/v, gate/up, lm_head) '
-      + 'sees the transformed residual: the preview = the exported checkpoint. Recommended for '
-      + 'removals and replacements. Regenerate after a change.',
+    help: 'Applies a read projection to downstream residual reads. Regenerate after a change.',
   },
   exact: {
     label: 'Exact', subtitle: 'Exact compensated',
@@ -224,7 +214,8 @@ const MODE_INFO = {
   },
   abliteration: {
     label: 'Abliteration', subtitle: 'Global projection',
-    help: 'Global projection transforms residual writes throughout the model.',
+    help: 'Global projection. Active live attachment and export are not implemented yet; '
+      + 'inactive rules are a no-op.',
   },
 }
 
@@ -334,9 +325,9 @@ export default function Editor({
   }
 
   useEffect(() => {
-    if (capabilityState.valid) return
+    if (capabilityState.sessionReady) return
     resetPendingWrites()
-  }, [capabilityState.valid, capabilityState.sessionId])
+  }, [capabilityState.sessionReady, capabilityState.sessionId])
 
   useEffect(() => () => resetPendingWrites({ renew: false }), [])
 
@@ -769,12 +760,11 @@ export default function Editor({
           <h3>Export the edit</h3>
           <div className="exp-grid" role="radiogroup" aria-label="export format">
             {Object.entries({ full: 'Full checkpoint', layers: 'Layers', lora: 'LoRA', gguf: 'GGUF' }).map(([id, label]) => {
-              const item = selectedExportState(capabilityState, id)
+              const item = capabilityState.formats[id]
               return <label key={id} className={`cap-row ${exportFmt === id ? 'selected' : ''}`}>
                 <input type="radio" name="export-format" checked={exportFmt === id}
                   onChange={() => onExportFmtChange(id)} />
                 <span><strong>{label}</strong>
-                  <span className={item.serverEnabled ? 'cap-local' : 'cap-reason'}>Model/mode: {item.decision.reason}</span>
                   {!item.local.ready && <span className="cap-local">Local: {item.local.reason}</span>}
                 </span>
               </label>

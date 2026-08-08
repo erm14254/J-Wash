@@ -502,7 +502,11 @@ def _block_inventory(block, index, hidden, validated_norms, config=None):
                 break
     spec = AUDITED_DECODER_SPECS.get(type(block))
     if spec is None:
-        raise ValueError(f"layer {index} decoder class or forward is not audited")
+        cls = type(block)
+        raise ValueError(
+            f"no Readthrough/Exact transform adapter is implemented for layer {index} "
+            f"decoder {cls.__module__}.{cls.__name__}"
+        )
     validate_forward_provenance(block, spec.decoder, f"layer {index} decoder")
     for marker in _UNSUPPORTED_MARKERS:
         if getattr(block, marker, None) is not None:
@@ -1213,8 +1217,6 @@ def build_plan(rules, jl, scale, exact=False):
     The names follow the model's layout (``{path}.layers.{m}.{suffix}.weight``,
     ``{lm_head}.weight``); the guard matching them against the checkpoint keys is
     done by the export."""
-    from core.capabilities import ensure_unquantized
-    ensure_unquantized(jl)
     inventory = model_preflight(jl, exact=exact)
     return _build_plan_from_inventory(rules, jl, scale, exact=exact, inventory=inventory)
 

@@ -451,7 +451,7 @@ export default function App() {
   const streaming = draft !== null
   const capabilityState = readCapabilityState(status, {
     fresh: statusFresh,
-    llamaCppConfigured: !!settings?.llamacpp_dir,
+    llamaCppConfigured: settings == null ? null : !!settings.llamacpp_dir,
     lensAvailable: !!lensMeta,
     busy: !!busy,
     rules: ivRules,
@@ -1797,7 +1797,7 @@ export default function App() {
                 onNotice={(text, kind) => setNotice({ kind: kind || 'err', text })}
                 onEditToken={(id, str, layer) => openEditorWith({ id, str, layer })}
                 editAvailable={capabilityState.actions.addRule}
-                editBlockingReason={capabilityState.editing.blockingDecision?.reason || capabilityState.editing.localReason}
+                editBlockingReason={capabilityState.editing.localReason}
                 maxH={lensViewH}
                 editorOpen={editorOpen}
                 streaming={streaming}

@@ -190,10 +190,13 @@ def test_production_fresh_gguf_builder_caller_cancel_rejects_late_cache_publish(
     assert app._gguf_owner is None
 
 
-def test_fresh_gguf_bake_requires_capability_profile(tmp_path, monkeypatch):
+def test_fresh_gguf_bake_without_capability_profile_reaches_guarded_exporter(
+        tmp_path, monkeypatch, gguf_test_workers):
     import api.app as app
     monkeypatch.setattr(app.editing, "EDITS_DIR", tmp_path / "edits")
     monkeypatch.setattr(app, "_llamacpp_paths", lambda: (tmp_path / "convert.py", None, None))
+    monkeypatch.setattr(app, "resolve_local_dir",
+                        lambda _model, *, revision=None: tmp_path / "source")
     _install_loaded_bundle(app, monkeypatch, profile=None)
     rules = [{"id": 1, "layers": [0], "enabled": True, "mode": "scale", "factor": 0.0}]
     app.manager.coordinator.bootstrap_interventions_for_test({
@@ -214,17 +217,25 @@ def test_fresh_gguf_bake_requires_capability_profile(tmp_path, monkeypatch):
         "active_summary": rules,
     })
     monkeypatch.setattr(app.interventions, "_mode", "readthrough")
-    forbidden = lambda *_args, **_kwargs: (_ for _ in ()).throw(
-        AssertionError("export must not run without a capability profile")
-    )
-    monkeypatch.setattr(app.editing, "export_rebase", forbidden)
+    calls = []
+    def fake_export(*_args, publication_guard=None, **kwargs):
+        calls.append(kwargs["name"])
+        target = app.editing.EDITS_DIR / kwargs["name"]
+        stage = target.with_name(".hf.advisory-stage")
+        stage.mkdir(parents=True); (stage / "config.json").write_text("{}")
+        publication_guard.publish(lambda: stage.replace(target))
+        return {"out_dir": str(target)}
+    monkeypatch.setattr(app.editing, "export_rebase", fake_export)
+    pending = _deferred_threads(monkeypatch, app, gguf_test_workers)
     _set_idle_gguf_state(app)
-    with pytest.raises(app.HTTPException) as exc:
-        asyncio.run(app.api_edit_export_gguf(
-            SimpleNamespace(name="job", gguf_type="bf16")
-        ))
-    assert exc.value.status_code == 422
-    assert exc.value.detail == "Capability data is unavailable for this model."
+    result = asyncio.run(app.api_edit_export_gguf(
+        SimpleNamespace(name="job", gguf_type="bf16")
+    ))
+    assert calls == ["job/hf"]
+    assert result["checkpoint"] == "baked"
+    assert app.manager.coordinator.status_snapshot().operation is None
+    pending[0].run()
+    assert app._gguf_owner is None
 
 
 def test_fresh_gguf_predispatch_failure_releases_bake_owner(
