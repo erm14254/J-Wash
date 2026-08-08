@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { fmtTok } from './tok'
-import { createEditorMutationState } from './editorMutationState.js'
+import { createEditorMutationState, isEditorMutationCancellation, throwIfEditorMutationCancelled } from './editorMutationState.js'
 import { selectedExportState, shouldOpenAdvanced } from './capabilityState.js'
 
 // Default layer slice for a new rule, as fractions of the model's layer count
@@ -270,6 +270,10 @@ export default function Editor({
     setScaleEdit(null)
   }
 
+  function reportMutationError(error) {
+    if (!isEditorMutationCancellation(error)) onNotice(String(error.message || error))
+  }
+
   function firePatch(id) {
     const entry = pendingRef.current.get(id)
     if (!entry) return Promise.resolve()
@@ -284,8 +288,9 @@ export default function Editor({
       },
     )
       .catch((err) => {
+        if (isEditorMutationCancellation(err)) return
         setLocalFactors((prev) => { const n = { ...prev }; delete n[id]; return n })
-        onNotice(String(err.message || err))
+        reportMutationError(err)
       })
   }
 
@@ -315,7 +320,11 @@ export default function Editor({
       (signal) => patchJson('/api/interventions', { scale: +v }, { signal }),
       (r) => { onScale(r.scale); setScaleEdit(null) },
     )
-      .catch((err) => { setScaleEdit(null); onNotice(String(err.message || err)) })
+      .catch((err) => {
+        if (isEditorMutationCancellation(err)) return
+        setScaleEdit(null)
+        reportMutationError(err)
+      })
   }
 
   function setMode(next) {
@@ -350,9 +359,11 @@ export default function Editor({
         let last = null
         for (const id of selIds) last = await patchJson(`/api/interventions/${id}`, body, { signal })
         return last
-      }, (last) => { if (last) onRules(last.rules) })
-      onNotice(`${selIds.length} rule(s) updated`, 'ok')
-    } catch (err) { onNotice(String(err.message || err)) }
+      }, (last) => {
+        if (last) onRules(last.rules)
+        onNotice(`${selIds.length} rule(s) updated`, 'ok')
+      })
+    } catch (err) { reportMutationError(err) }
   }
 
   // --- per-rule layers (inline picker) ---
@@ -450,40 +461,42 @@ export default function Editor({
     onPrefillConsumed()
   }, [prefill])
 
-  async function resolveId(field) {
+  async function resolveId(field, signal) {
     if (field.id != null) return field.id
-    const body = await jsonFetch(`/api/token-lookup?q=${encodeURIComponent(field.text.trim())}`)
+    const body = await jsonFetch(`/api/token-lookup?q=${encodeURIComponent(field.text.trim())}`, { signal })
     if (!body.candidates.length) throw new Error(`no single token for "${field.text}"`)
     return (body.candidates.find((c) => c.str.startsWith(' ')) || body.candidates[0]).id
   }
 
   async function addRule() {
+    const state = mutationStateRef.current
     try {
-      const tokenId = await resolveId(addToken)
-      const replId = addMode === 'replace' ? await resolveId(addRepl) : null
-      if (editRuleId != null) {
-        // rewrite the existing rule in place (directions re-resolved server-side)
-        const state = mutationStateRef.current
-        await state.request((signal) => patchJson(`/api/interventions/${editRuleId}`, {
-          token_id: tokenId, mode: addMode, factor: +addFactor,
-          replacement_id: replId, layers: addLayers,
-        }, { signal }), (resp) => onRules(resp.rules))
-        resetAddForm()
-        onNotice('rule updated — regenerate to see the effect', 'ok')
-        return
-      }
-      const state = mutationStateRef.current
-      await state.request((signal) => jsonFetch('/api/interventions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      await state.request(async (signal) => {
+        const tokenId = await resolveId(addToken, signal)
+        const replId = addMode === 'replace' ? await resolveId(addRepl, signal) : null
+        throwIfEditorMutationCancelled(signal)
+        if (editRuleId != null) {
+          return patchJson(`/api/interventions/${editRuleId}`, {
+            token_id: tokenId, mode: addMode, factor: +addFactor,
+            replacement_id: replId, layers: addLayers,
+          }, { signal })
+        }
+        return jsonFetch('/api/interventions', {
+          method: 'POST', signal,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
           token_id: tokenId, mode: addMode, factor: +addFactor,
           replacement_id: replId, layers: addLayers.length ? addLayers : null,
-        }), signal,
-      }), (r) => onRules(r.rules))
-      resetAddForm()
-      onNotice('rule added — regenerate to see the effect', 'ok')
-    } catch (err) { onNotice(String(err.message || err)) }
+          }),
+        })
+      }, (result) => {
+        onRules(result.rules)
+        resetAddForm()
+        onNotice(editRuleId != null
+          ? 'rule updated — regenerate to see the effect'
+          : 'rule added — regenerate to see the effect', 'ok')
+      })
+    } catch (err) { reportMutationError(err) }
   }
 
   // --- presets ---
@@ -505,13 +518,16 @@ export default function Editor({
   async function applyPreset(name) {
     try {
       const state = mutationStateRef.current
-      const r = await state.request(
+      await state.request(
         (signal) => jsonFetch(`/api/presets/${encodeURIComponent(name)}/apply`, { method: 'POST', signal }),
-        (result) => { onRules(result.rules); if (result.scale != null) onScale(result.scale) },
+        (result) => {
+          onRules(result.rules)
+          if (result.scale != null) onScale(result.scale)
+          const warn = (result.warnings || []).join(' ; ')
+          onNotice(warn || `preset "${name}" applied`, warn ? 'err' : 'ok')
+        },
       )
-      const warn = (r.warnings || []).join(' ; ')
-      onNotice(warn || `preset "${name}" applied`, warn ? 'err' : 'ok')
-    } catch (err) { onNotice(String(err.message || err)) }
+    } catch (err) { reportMutationError(err) }
   }
 
   // --- export ---
@@ -613,7 +629,7 @@ export default function Editor({
                         (signal) => patchJson(`/api/interventions/${r.id}`, { enabled: r.enabled === false }, { signal }),
                         (resp) => onRules(resp.rules),
                       )
-                    } catch (err) { onNotice(String(err.message || err)) }
+                    } catch (err) { reportMutationError(err) }
                   }}>{r.enabled === false ? '○' : '●'}</button>
                 <span className="ed-rule-tok" title={ruleTitle(r)}>
                   «{fmtTok(r.token)}»{r.mode === 'replace' ? ` → «${fmtTok(r.replacement)}»` : ''}
@@ -637,10 +653,12 @@ export default function Editor({
                     const state = mutationStateRef.current
                     await state.request(
                       (signal) => jsonFetch(`/api/interventions/${r.id}`, { method: 'DELETE', signal }),
-                      (resp) => onRules(resp.rules),
+                      (resp) => {
+                        onRules(resp.rules)
+                        if (editRuleId === r.id) resetAddForm()
+                      },
                     )
-                    if (editRuleId === r.id) resetAddForm()
-                  } catch (err) { onNotice(String(err.message || err)) }
+                  } catch (err) { reportMutationError(err) }
                 }}>✕</button>
               </div>
               {expandedRule === r.id && (
@@ -653,7 +671,7 @@ export default function Editor({
                           (signal) => patchJson(`/api/interventions/${r.id}`, { layers }, { signal }),
                           (resp) => onRules(resp.rules),
                         )
-                      } catch (err) { onNotice(String(err.message || err)) }
+                      } catch (err) { reportMutationError(err) }
                     } : () => {}} />
                 </div>
               )}
@@ -672,7 +690,7 @@ export default function Editor({
                     (signal) => jsonFetch('/api/interventions', { method: 'DELETE', signal }),
                     (resp) => onRules(resp.rules),
                   )
-                } catch (err) { onNotice(String(err.message || err)) }
+                } catch (err) { reportMutationError(err) }
               }}>remove all</button>
             </div>
           )}

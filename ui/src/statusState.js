@@ -35,21 +35,22 @@ export async function runCapabilityMutation({ invalidate, mutate, refresh }) {
 }
 
 export function createCapabilityMutationLatch({ invalidate, refresh, setPending }) {
-  let epoch = 0
+  const active = new Set()
   return async function run(mutate) {
-    const ownEpoch = ++epoch
-    setPending(true)
+    const token = Symbol('capability-mutation')
+    active.add(token)
+    if (active.size === 1) setPending(true)
     try {
       return await runCapabilityMutation({ invalidate, mutate, refresh })
     } finally {
-      if (ownEpoch === epoch) setPending(false)
+      active.delete(token)
+      if (active.size === 0) setPending(false)
     }
   }
 }
 
-export function capabilitySocketOpened({ invalidate, refresh }) {
+export function capabilitySocketConnecting({ invalidate }) {
   invalidate()
-  return refresh()
 }
 
 export function capabilitySocketClosed({ invalidate, reconnect }) {

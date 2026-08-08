@@ -7,7 +7,7 @@ import Editor from './Editor.jsx'
 import { applyGenerationTerminal, frameArchivePinIdentity, generationPinIdentity } from './continuationState.js'
 import { fmtTok } from './tok'
 import { readCapabilityState, isCapabilityRefreshEvent } from './capabilityState.js'
-import { createLatestStatusRefresher, createCapabilityMutationLatch, capabilitySocketOpened, capabilitySocketClosed } from './statusState.js'
+import { createLatestStatusRefresher, createCapabilityMutationLatch, capabilitySocketConnecting, capabilitySocketClosed } from './statusState.js'
 
 const GB = 2 ** 30
 
@@ -109,6 +109,7 @@ export default function App() {
   const [reg, setReg] = useState(null)
   // model being loaded right now (id requested) + lens queued to chain-load
   const [loadingId, setLoadingId] = useState(null)
+  const modelTransitionStartingRef = useRef(false)
   const queuedLensRef = useRef(null)
   const [queuedLensName, setQueuedLensName] = useState(null)
   const [lensOn, setLensOn] = useState(true)
@@ -346,9 +347,10 @@ export default function App() {
     let timer
     let closed = false
     const open = () => {
+      capabilitySocketConnecting({ invalidate: invalidateCapabilities })
       const proto = location.protocol === 'https:' ? 'wss' : 'ws'
       ws = new WebSocket(`${proto}://${location.host}/ws`)
-      ws.onopen = () => capabilitySocketOpened({ invalidate: invalidateCapabilities, refresh: tick })
+      ws.onopen = tick
       ws.onmessage = (ev) => { try { if (isCapabilityRefreshEvent(JSON.parse(ev.data))) { invalidateCapabilities(); tick() } } catch { /* ignore */ } }
       ws.onclose = () => {
         if (!closed) capabilitySocketClosed({
@@ -766,7 +768,8 @@ export default function App() {
   }
 
   async function onLoad() {
-    if (!selected) return
+    if (!selected || capabilityMutationPending || loadingId || modelTransitionStartingRef.current) return
+    modelTransitionStartingRef.current = true
     setNotice({ kind: 'ok', text: `loading ${selected}...` })
     setLoadingId(selected)
     try {
@@ -787,10 +790,13 @@ export default function App() {
       setNotice({ kind: 'err', text: String(err.message || err) })
     } finally {
       setLoadingId(null)
+      modelTransitionStartingRef.current = false
     }
   }
 
   async function onUnload() {
+    if (!loadedId || capabilityMutationPending || modelTransitionStartingRef.current) return
+    modelTransitionStartingRef.current = true
     try {
       const r = await capabilityMutation(() => jsonFetch('/api/unload', { method: 'POST' }))
       let text = 'nothing to unload'
@@ -804,6 +810,8 @@ export default function App() {
       setNotice({ kind: 'ok', text })
     } catch (err) {
       setNotice({ kind: 'err', text: String(err.message || err) })
+    } finally {
+      modelTransitionStartingRef.current = false
     }
   }
 
@@ -1196,8 +1204,9 @@ export default function App() {
           </select>
         </div>
         <div className="row">
-          <button className="primary" style={{ flex: 1 }} disabled={!selected || !!busy} onClick={onLoad}>Load</button>
-          <button className="danger" disabled={!loadedId || !!busy} onClick={onUnload}>Unload</button>
+          <button className="primary" style={{ flex: 1 }}
+            disabled={!selected || !!busy || capabilityMutationPending || !!loadingId} onClick={onLoad}>Load</button>
+          <button className="danger" disabled={!loadedId || !!busy || capabilityMutationPending} onClick={onUnload}>Unload</button>
         </div>
         </>)}
 

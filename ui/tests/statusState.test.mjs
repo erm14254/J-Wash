@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { createLatestStatusRefresher, runCapabilityMutation, createCapabilityMutationLatch, capabilitySocketOpened, capabilitySocketClosed } from '../src/statusState.js'
+import { createLatestStatusRefresher, runCapabilityMutation, createCapabilityMutationLatch, capabilitySocketConnecting, capabilitySocketClosed } from '../src/statusState.js'
 
 const deferred = () => { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b }); return { promise, resolve, reject } }
 
@@ -69,9 +69,40 @@ for (const rejected of [false, true]) test(`mutation barrier survives an inciden
   assert.equal(pending, false)
 })
 
-test('socket open and close invalidate before refresh or reconnect', async () => {
+test('socket connecting invalidates before handshake refresh and close invalidates before reconnect', async () => {
   const events = []
-  await capabilitySocketOpened({ invalidate: () => events.push('invalidate-open'), refresh: async () => events.push('refresh') })
+  capabilitySocketConnecting({ invalidate: () => events.push('invalidate-connecting') })
+  events.push('socket-constructed')
+  await (async () => events.push('refresh-on-open'))()
   capabilitySocketClosed({ invalidate: () => events.push('invalidate-close'), reconnect: () => events.push('reconnect') })
-  assert.deepEqual(events, ['invalidate-open', 'refresh', 'invalidate-close', 'reconnect'])
+  assert.deepEqual(events, ['invalidate-connecting', 'socket-constructed', 'refresh-on-open', 'invalidate-close', 'reconnect'])
+})
+
+for (const finishBFirst of [true, false]) test(`overlapping mutations retain barrier when ${finishBFirst ? 'B' : 'A'} finishes first`, async () => {
+  const a = deferred(), b = deferred(), refreshes = []
+  const pendingEvents = []; let pending = false
+  const run = createCapabilityMutationLatch({
+    invalidate: () => {},
+    refresh: () => { const item = deferred(); refreshes.push(item); return item.promise },
+    setPending: (value) => { pending = value; pendingEvents.push(value) },
+  })
+  const operationA = run(() => a.promise)
+  const operationB = run(() => b.promise)
+  assert.equal(pending, true)
+  const first = finishBFirst ? b : a
+  first.resolve('first')
+  await Promise.resolve(); await Promise.resolve()
+  assert.equal(refreshes.length, 1)
+  refreshes[0].resolve('first-status')
+  await (finishBFirst ? operationB : operationA)
+  assert.equal(pending, true, 'finishing a non-last operation must not clear pending')
+
+  const second = finishBFirst ? a : b
+  if (finishBFirst) second.reject(new Error('A rejected')); else second.resolve('second')
+  await Promise.resolve(); await Promise.resolve()
+  assert.equal(refreshes.length, 2)
+  refreshes[1].resolve('second-status')
+  if (finishBFirst) await assert.rejects(operationA, /A rejected/); else await operationB
+  assert.equal(pending, false)
+  assert.deepEqual(pendingEvents, [true, false])
 })

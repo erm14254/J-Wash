@@ -1,3 +1,18 @@
+export class EditorMutationCancellation extends Error {
+  constructor() {
+    super('Editor mutation cancelled.')
+    this.name = 'EditorMutationCancellation'
+  }
+}
+
+export function isEditorMutationCancellation(error) {
+  return error instanceof EditorMutationCancellation || error?.name === 'AbortError'
+}
+
+export function throwIfEditorMutationCancelled(signal) {
+  if (signal?.aborted) throw new EditorMutationCancellation()
+}
+
 export function createEditorMutationState({ setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
   let current = true
   const timers = new Set()
@@ -18,11 +33,13 @@ export function createEditorMutationState({ setTimer = setTimeout, clearTimer = 
   }
 
   async function request(factory, publish) {
+    if (!current) throw new EditorMutationCancellation()
     const controller = new AbortController()
     controllers.add(controller)
     try {
       const value = await factory(controller.signal)
-      if (current) publish?.(value)
+      if (!current) throw new EditorMutationCancellation()
+      publish?.(value)
       return value
     } finally {
       controllers.delete(controller)
