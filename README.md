@@ -22,8 +22,9 @@ standalone model** (full checkpoint, modified layers, or LoRA): standard
 safetensors weights that load anywhere `transformers` models do, with the
 available export formats determined by the topology matrix below.
 
-The editing preview runs live in the chat, and the exported checkpoint reproduces
-it faithfully. **What you see is what you get**.
+For positively validated Readthrough/Exact implementations, the live preview and
+exported transform share the same plan. Experimental attempts can instead fail
+at concrete operation time and must not be assumed correct without validation.
 
 ![J-Wash - chat with the live Jacobian lens](assets/header.png)
 <p align="center"><sub>Introducing non-expert friendly alignment!</sub></p>
@@ -203,7 +204,7 @@ produce a model whose correctness still requires validation.
 
 | Read-projection topology | Recognition contract | Live readthrough | Live exact | Full checkpoint | Modified layers | LoRA |
 |---|---|---:|---:|---:|---:|---:|
-| Audited dense Llama, Mistral, Qwen2, Qwen3, and dense Qwen3.5 layouts | Complete reader/writer inventory, audited RMSNorm, biasless tensor-returning writers | Yes | Yes | Yes | Yes | Yes |
+| Exact `LlamaDecoderLayer` adapter | Complete reader/writer inventory, audited RMSNorm, biasless tensor-returning writers | Yes | Yes | Yes | Yes | Yes |
 | Packed Qwen3.5-MoE ordinary decoder | Full/linear-attention readers plus router, packed routed gate/up, shared expert, and shared gate | Yes | No | Yes | No | No |
 | Unknown, modified, or incomplete topology | No positive topology match | Experimental | Experimental | Experimental | Experimental | Experimental |
 
@@ -303,8 +304,12 @@ editing. A mode toggle switches between:
 
 - **Per-layer steering** (default) - the most expressive way to *explore*, but it
   does not export faithfully.
-- **Read projection** (pure-weights) - a change of basis of the downstream reads so
-  the **live preview matches the exported checkpoint exactly**. Use this to save a model and preview the result.
+- **Read projection** (pure-weights) - attempts a change of basis of downstream
+  reads. Positively validated adapters use the same transform plan for preview
+  and export; experimental architectures may fail at the strict planner.
+- **Global projection** - selectable for experimentation, but active live
+  attachment and export are not implemented safely yet. An inactive rule set is
+  a no-op; active attempts return an explicit implementation error.
 
 
 #### Read projection is what you want to use if your intent is to export the result.
@@ -312,11 +317,11 @@ editing. A mode toggle switches between:
 ![projection](assets/projection.png)
 
 
-> **Architecture note**: models whose layers normalize their *writes* into the
-> residual stream (Gemma 2/3 style, `pre/post_feedforward_layernorm`) can't take
-> the read projection. On those, the toggle offers **Global projection** (W_U
-> abliteration) instead - still pure weights, faithful for full removals and
-> replacements (a rule's layer range is ignored: the projection is global).
+> **Architecture note**: unimplemented architectures remain experimentally
+> attemptable. Readthrough/Exact then either reach their strict transform planner
+> or return its concrete adapter/topology error. Global projection is visible and
+> selectable but currently returns explicit not-implemented errors for active
+> live attachment and export.
 
 ### 5. Export the edit
 
@@ -442,7 +447,9 @@ hf_cache/ only if you run with --hf-cache ./hf_cache (git-ignored)
 - **Gated / private models** need a valid `HF_TOKEN` in your environment.
 - Loading `.gguf` files directly as models is **not** supported - J-Wash loads
   transformers/safetensors models only.
-- Interventions and lens readouts are unavailable on quantized (int8/nf4) weights.
+- Declared int8/nf4 metadata is advisory. An intervention is attempted, and the
+  concrete head, Jacobian, hook, or transform representation it consumes decides
+  whether it works; support is not promised for every quantized representation.
 - Gemma models having a slightly different attention are not as easy to modify.
 
 ## Final words

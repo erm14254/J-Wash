@@ -276,26 +276,74 @@ class Interventions:
     def _direction_source(self, lens_manager, jl, token_ids, layers):
         if lens_manager is None or lens_manager.lens is None:
             raise ValueError("no lens loaded")
-        if jl is None or not hasattr(jl, "layers"):
+        if jl is None:
             raise ValueError("model and lens required to construct directions")
-        head = getattr(getattr(jl, "_lm_head", None), "weight", None)
+        layers_obj = getattr(jl, "layers", None)
+        if layers_obj is None:
+            raise ValueError("model layers are unavailable for direction construction")
+        try:
+            n_layers = len(layers_obj)
+        except (TypeError, RuntimeError) as exc:
+            raise ValueError("model layers are not a readable sequence") from exc
+        head_module = getattr(jl, "_lm_head", None)
+        head = getattr(head_module, "weight", None)
         if not isinstance(head, torch.Tensor) or head.ndim != 2:
             raise ValueError("lm_head weight must be a readable 2-D tensor")
-        if not (head.is_floating_point() or head.is_complex()):
+        if not head.is_floating_point() or head.is_complex():
             raise ValueError("lm_head weight must support floating-point direction arithmetic")
-        if head.is_complex():
-            raise ValueError("lm_head weight must use real floating-point arithmetic")
-        n_layers = len(jl.layers)
-        resolved = sorted({int(layer) for layer in layers})
+        if head.layout != torch.strided:
+            raise ValueError("lm_head weight must use a dense strided layout")
+        if head.device.type == "meta":
+            from core.rebase import materialize_parameter_for_inspection
+            try:
+                head = materialize_parameter_for_inspection(head_module, "weight")
+            except ValueError as exc:
+                raise ValueError(f"lm_head weight is not materializable: {exc}") from exc
+            if not isinstance(head, torch.Tensor) or head.device.type == "meta":
+                raise ValueError("lm_head weight could not be materialized")
+            if head.ndim != 2 or not head.is_floating_point() or head.is_complex() \
+                    or head.layout != torch.strided:
+                raise ValueError("materialized lm_head weight is not a readable 2-D floating tensor")
+
+        embed = getattr(getattr(jl, "_embed_tokens", None), "weight", None)
+        if not isinstance(embed, torch.Tensor) or embed.ndim != 2:
+            raise ValueError("model embedding weight is unavailable for residual-width validation")
+        residual_width = int(embed.shape[1])
+        if residual_width <= 0:
+            raise ValueError("model residual width must be positive")
+        if int(head.shape[1]) != residual_width:
+            raise ValueError(
+                f"lm_head input width {head.shape[1]} does not match model residual width "
+                f"{residual_width}"
+            )
+        try:
+            resolved = sorted({int(layer) for layer in layers})
+        except (TypeError, ValueError) as exc:
+            raise ValueError("requested layers must be an iterable of integers") from exc
         if any(layer < 0 or layer >= n_layers for layer in resolved):
             raise ValueError(f"requested layer must be between 0 and {max(n_layers - 1, 0)}")
         for token_id in token_ids:
             if token_id is None or int(token_id) < 0 or int(token_id) >= head.shape[0]:
                 raise ValueError(f"token id {token_id} is outside lm_head vocabulary")
-        return lens_manager.lens, head, resolved
+        lens = lens_manager.lens
+        if not isinstance(getattr(lens, "jacobians", None), Mapping):
+            raise ValueError("loaded lens has no readable Jacobian mapping")
+        tokenizer = getattr(jl, "tokenizer", None)
+        if not callable(getattr(tokenizer, "decode", None)):
+            raise ValueError("model tokenizer is unavailable for intervention labels")
+        return lens, head, resolved, residual_width
 
-    def _direction(self, lens, weight, token_id, layers):
-        row = weight[token_id].float()
+    def _direction(self, lens, weight, token_id, layers, residual_width):
+        try:
+            row = weight[token_id].detach().float()
+        except (IndexError, RuntimeError, TypeError) as exc:
+            raise ValueError(f"lm_head row for token {token_id} is unreadable: {exc}") from exc
+        if row.layout != torch.strided or row.device.type == "meta":
+            raise ValueError(f"lm_head row for token {token_id} is not readable")
+        if row.ndim != 1 or row.shape[0] != residual_width:
+            raise ValueError("lm_head row does not match model residual width")
+        if not torch.isfinite(row).all():
+            raise ValueError(f"lm_head row for token {token_id} contains non-finite values")
         dirs = {}
         for layer in layers:
             J = lens.jacobians.get(layer)
@@ -304,8 +352,29 @@ class Interventions:
                 # a good approximation near the output
                 v = row
             else:
-                v = row @ J.float().to(weight.device)
-            if v.ndim != 1 or v.shape[0] != weight.shape[1]:
+                if not isinstance(J, torch.Tensor):
+                    raise ValueError(f"Jacobian at layer {layer} must be a tensor")
+                if J.ndim != 2:
+                    raise ValueError(f"Jacobian at layer {layer} must be 2-D")
+                if J.layout != torch.strided or J.device.type == "meta":
+                    raise ValueError(f"Jacobian at layer {layer} is not readable")
+                if J.shape[0] != row.shape[0]:
+                    raise ValueError(
+                        f"Jacobian input width at layer {layer} does not match lm_head width"
+                    )
+                if J.shape[1] != residual_width:
+                    raise ValueError(
+                        f"Jacobian output width at layer {layer} does not match model residual width"
+                    )
+                if not (J.is_floating_point() and not J.is_complex()):
+                    raise ValueError(f"Jacobian at layer {layer} must use real floating-point arithmetic")
+                if not torch.isfinite(J).all():
+                    raise ValueError(f"Jacobian at layer {layer} contains non-finite values")
+                try:
+                    v = row @ J.to(device=row.device, dtype=row.dtype)
+                except (RuntimeError, TypeError) as exc:
+                    raise ValueError(f"Jacobian at layer {layer} cannot construct a direction: {exc}") from exc
+            if v.ndim != 1 or v.shape[0] != residual_width:
                 raise ValueError(f"direction width at layer {layer} does not match model residual width")
             if not torch.isfinite(v).all():
                 raise ValueError(f"direction at layer {layer} contains non-finite values")
@@ -322,13 +391,23 @@ class Interventions:
                 raise ValueError(f"invalid mode: {mode}")
             if mode == "replace" and replacement_id is None:
                 raise ValueError("replacement_id required in replace mode")
-            n_layers = len(jl.layers)
             if layers is None:
-                layers = default_layers(n_layers)
+                layers_obj = getattr(jl, "layers", None)
+                try:
+                    layers = default_layers(len(layers_obj))
+                except (TypeError, AttributeError, RuntimeError) as exc:
+                    raise ValueError("model layers are unavailable for direction construction") from exc
             # layers=[] is valid: rule recorded but inactive
             token_ids = [token_id] + ([replacement_id] if replacement_id is not None else [])
-            lens, weight, layers = self._direction_source(lens_manager, jl, token_ids, layers)
+            lens, weight, layers, residual_width = self._direction_source(
+                lens_manager, jl, token_ids, layers
+            )
             tokenizer = jl.tokenizer
+            dirs_a = self._direction(lens, weight, int(token_id), layers, residual_width)
+            dirs_b = (
+                self._direction(lens, weight, int(replacement_id), layers, residual_width)
+                if replacement_id is not None else None
+            )
             rule = {
                 "id": next(self._counter),
                 "token_id": int(token_id),
@@ -339,10 +418,8 @@ class Interventions:
                 "replacement": tokenizer.decode([int(replacement_id)]) if replacement_id is not None else None,
                 "layers": [int(l) for l in layers],
                 "enabled": bool(enabled),
-                "dirs_a": self._direction(lens, weight, int(token_id), layers),
-                "dirs_b": self._direction(lens, weight, int(replacement_id), layers)
-                if replacement_id is not None
-                else None,
+                "dirs_a": dirs_a,
+                "dirs_b": dirs_b,
             }
             self._rules.append(rule)
             self._revision += 1
@@ -397,12 +474,17 @@ class Interventions:
                 token_ids = [candidate["token_id"]]
                 if candidate["replacement_id"] is not None:
                     token_ids.append(candidate["replacement_id"])
-                lens, weight, candidate["layers"] = self._direction_source(
+                lens, weight, candidate["layers"], residual_width = self._direction_source(
                     lens_manager, jl, token_ids, candidate["layers"]
                 )
-                dirs_a = self._direction(lens, weight, candidate["token_id"], candidate["layers"])
+                dirs_a = self._direction(
+                    lens, weight, candidate["token_id"], candidate["layers"], residual_width
+                )
                 dirs_b = (
-                    self._direction(lens, weight, candidate["replacement_id"], candidate["layers"])
+                    self._direction(
+                        lens, weight, candidate["replacement_id"], candidate["layers"],
+                        residual_width,
+                    )
                     if candidate["replacement_id"] is not None
                     else None
                 )

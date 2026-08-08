@@ -4,7 +4,7 @@ edits on a model that is ALREADY loaded in the running J-Wash app (port 8381).
 It exposes only what is needed to experiment, and nothing else:
 
   * generate                — (re)generate text from the current model
-  * scale_token / replace_token — apply a pure-weights token operation, any intensity
+  * scale_token / replace_token — attempt a Readthrough token operation, any intensity
   * set_intensity           — global multiplier over all edits (sweep the intensity)
   * list_edits / reset_edits — inspect / clear the current edits
 
@@ -14,9 +14,10 @@ drive a model you loaded yourself. By design it never loads models or lenses,
 never changes the sampling defaults beyond the call, and never exports anything:
 a model AND a Jacobian lens must already be loaded from the J-Wash UI.
 
-Token edits are always applied in a *pure-weights* mode (read projection, or W_U
-abliteration on Gemma-style models): the live preview matches an exported
-checkpoint exactly, so what the model tests here is what a baked model would do.
+Token edits attempt Readthrough mode. Capability diagnostics are advisory: an
+experimental architecture can reach the strict transform planner and fail with
+a concrete implementation error. Preview/export equivalence is only established
+for positively validated Readthrough implementations.
 
 Run it from an MCP client over stdio:
 
@@ -44,7 +45,8 @@ mcp = FastMCP(
         "token-direction edits. Typical loop: (1) `generate` a baseline reply; "
         "(2) find the exact token with `find_token` and the layers to target with "
         "`list_layers`; (3) apply edits with `scale_token`/`replace_token` (layers "
-        "are required) — always pure-weights, faithful to an exported checkpoint; "
+        "are required) — Readthrough is attempted and may report a concrete "
+        "planner error on an experimental architecture; "
         "(4) `generate` again to see the effect, tuning each edit's `factor` or the "
         "global `set_intensity`; (5) `reset_edits` to start over. A model AND a "
         "Jacobian lens must be loaded from the J-Wash UI first; this server never "
@@ -158,10 +160,9 @@ def _add_rule(token, op, factor, replacement, layers):
             "No Jacobian lens loaded — load one in the Lens tab of J-Wash before "
             "editing tokens."
         )
-    # Force a pure-weights mode: read projection, or W_U abliteration on
-    # architectures that normalize their writes (Gemma 2/3 style).
-    pure_mode = "abliteration" if loaded.get("rebase_supported") is False else "readthrough"
-    _call("PATCH", "/api/interventions", {"mode": pure_mode})
+    # Readthrough is the stable MCP default. Legacy capability aliases are
+    # diagnostics only and never reroute an attempt to another implementation.
+    _call("PATCH", "/api/interventions", {"mode": "readthrough"})
 
     body = {"token_id": _resolve_token(token)["id"], "mode": op, "factor": float(factor)}
     if op == "replace":
@@ -197,7 +198,7 @@ def generate(prompt: str, system: str | None = None, max_tokens: int = 200,
 
 @mcp.tool()
 def scale_token(token: str, factor: float, layers: str) -> dict:
-    """Multiply a token's own direction by `factor` (pure-weights edit).
+    """Multiply a token's own direction by `factor` using Readthrough.
 
     `factor` is the intensity: 0 removes the token's direction, 0<factor<1
     attenuates it, factor>1 amplifies it. `token` is the exact token string — a
@@ -205,14 +206,15 @@ def scale_token(token: str, factor: float, layers: str) -> dict:
     it. `layers` is REQUIRED: it selects where the edit acts and an edit that
     targets no layer does nothing — pass a 0-based range or list ('19-25', '20',
     '20,24', or 'all') and call `list_layers` to see the model's layers. The mode
-    is forced to pure-weights so the effect matches an exported checkpoint.
+    attempts Readthrough; experimental architectures may return a concrete
+    planner error rather than producing a preview or export.
     """
     return _add_rule(token, "scale", factor, None, layers)
 
 
 @mcp.tool()
 def replace_token(token: str, replacement: str, layers: str, factor: float = 1.0) -> dict:
-    """Rewrite `token`'s component onto `replacement`'s direction (pure-weights),
+    """Attempt to rewrite `token` onto `replacement` using Readthrough,
     e.g. token=' model', replacement=' fish' to make the model talk like a fish.
 
     You MUST pass `layers` — it selects the layers where the replacement is
@@ -220,7 +222,8 @@ def replace_token(token: str, replacement: str, layers: str, factor: float = 1.0
     ('19-25', '20,24', or 'all'); call `list_layers` for the model's layers and
     `find_token` for the exact ' token' strings (both must be single tokens, a
     leading space usually being significant). `factor` scales the strength
-    (1.0 = full). The mode is forced to pure-weights (faithful to an export).
+    (1.0 = full). Readthrough is attempted without consulting advisory
+    capability metadata; validated implementations establish export fidelity.
     """
     return _add_rule(token, "replace", factor, replacement, layers)
 
@@ -237,7 +240,7 @@ def set_intensity(scale: float) -> dict:
 
 @mcp.tool()
 def list_edits() -> dict:
-    """Show the active token edits, the pure-weights mode in force, and the global
+    """Show the active token edits, selected attempted mode, and the global
     intensity — a read-only snapshot of the current experiment.
     """
     return _edits_summary()

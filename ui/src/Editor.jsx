@@ -218,7 +218,8 @@ const MODE_INFO = {
   },
   abliteration: {
     label: 'Abliteration', subtitle: 'Global projection',
-    help: 'Global projection transforms residual writes throughout the model.',
+    help: 'Selectable experimental mode. Active live attachment and export are not '
+      + 'implemented safely yet and return an explicit implementation error.',
   },
 }
 

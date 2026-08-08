@@ -162,6 +162,71 @@ def test_unusable_direction_tensor_fails_concretely_and_transactionally():
     assert iv.summary() == []
 
 
+def _direction_fixture(*, jacobian=None):
+    jl = dense_lens()
+    jl.tokenizer = SimpleNamespace(decode=lambda ids: str(ids[0]))
+    lens = SimpleNamespace(jacobians={} if jacobian is None else {0: jacobian})
+    return jl, SimpleNamespace(lens=lens)
+
+
+@pytest.mark.parametrize("failure", ["missing_layers", "unreadable_layers", "meta_head",
+                                      "wrong_head_width"])
+def test_concrete_direction_source_failures_do_not_mutate_add(failure):
+    jl, lens_manager = _direction_fixture()
+    if failure == "missing_layers":
+        del jl.layers
+    elif failure == "unreadable_layers":
+        jl.layers = object()
+    elif failure == "meta_head":
+        jl._lm_head.weight = torch.nn.Parameter(torch.empty(17, 8, device="meta"))
+    else:
+        jl._lm_head = torch.nn.Linear(7, 17, bias=False)
+    iv = Interventions()
+    before = iv.state_record()
+    with pytest.raises(ValueError):
+        iv.add(lens_manager, jl, token_id=1, layers=[0])
+    assert iv.state_record() == before
+
+
+@pytest.mark.parametrize("jacobian,match", [
+    ("not-a-tensor", "must be a tensor"),
+    (torch.ones(8), "must be 2-D"),
+    (torch.ones(7, 8), "input width"),
+    (torch.ones(8, 7), "output width"),
+    (torch.full((8, 8), float("nan")), "non-finite"),
+])
+def test_concrete_jacobian_failures_do_not_mutate_add(jacobian, match):
+    jl, lens_manager = _direction_fixture(jacobian=jacobian)
+    iv = Interventions()
+    before = iv.state_record()
+    with pytest.raises(ValueError, match=match):
+        iv.add(lens_manager, jl, token_id=1, layers=[0])
+    assert iv.state_record() == before
+
+
+@pytest.mark.parametrize("value,match", [
+    (float("inf"), "non-finite"),
+    (0.0, "cannot be normalized"),
+])
+def test_nonfinite_or_zero_head_direction_does_not_mutate_add(value, match):
+    jl, lens_manager = _direction_fixture()
+    with torch.no_grad():
+        jl._lm_head.weight[1].fill_(value)
+    iv = Interventions()
+    before = iv.state_record()
+    with pytest.raises(ValueError, match=match):
+        iv.add(lens_manager, jl, token_id=1, layers=[0])
+    assert iv.state_record() == before
+
+
+def test_empty_layers_remains_a_valid_inactive_rule():
+    jl, lens_manager = _direction_fixture()
+    iv = Interventions()
+    rules = iv.add(lens_manager, jl, token_id=1, layers=[])
+    assert rules[0]["layers"] == []
+    assert iv.active_rules_full() == []
+
+
 @pytest.mark.parametrize("quant", [None, "int8", "nf4"])
 def test_compatibility_metadata_uses_jl_quantization(quant):
     from core.model_manager import _rebase_capability_meta
@@ -348,6 +413,45 @@ def test_direction_patch_unknown_rule_without_lens_remains_404(monkeypatch):
         )
     assert exc.value.status_code == 404
     assert exc.value.detail == "unknown rule 999"
+
+
+def test_add_wrong_residual_width_is_422_and_transactional(monkeypatch):
+    import api.app as app
+    jl, lens_manager = _direction_fixture()
+    jl._lm_head = torch.nn.Linear(7, 17, bias=False)
+    iv = Interventions()
+    before = iv.state_record()
+    monkeypatch.setattr(app, "interventions", iv)
+    monkeypatch.setattr(app.lens_manager, "lens", lens_manager.lens)
+    _install_loaded_bundle(app, monkeypatch, jl=jl, profile={"modes": {}})
+    with pytest.raises(app.HTTPException) as exc:
+        app.api_interventions_add(SimpleNamespace(
+            token_id=1, mode="scale", factor=0.0, replacement_id=None, layers=[0]
+        ))
+    assert exc.value.status_code == 422
+    assert "does not match model residual width" in exc.value.detail
+    assert iv.state_record() == before
+
+
+def test_direction_patch_bad_jacobian_is_422_and_transactional(monkeypatch):
+    import api.app as app
+    jl, lens_manager = _direction_fixture(jacobian=torch.ones(7, 8))
+    iv = Interventions()
+    iv._rules = [_existing_rule()]
+    before = iv.state_record()
+    monkeypatch.setattr(app, "interventions", iv)
+    monkeypatch.setattr(app.lens_manager, "lens", lens_manager.lens)
+    _install_loaded_bundle(app, monkeypatch, jl=jl, profile={"modes": {}})
+    with pytest.raises(app.HTTPException) as exc:
+        app.api_interventions_patch(
+            1, SimpleNamespace(factor=None, layers=[0], enabled=None, token_id=None,
+                               replacement_id=None, mode=None)
+        )
+    assert exc.value.status_code == 422
+    assert "Jacobian input width" in exc.value.detail
+    assert iv.state_record()["revision"] == before["revision"]
+    assert iv.summary()[0]["layers"] == [0]
+    assert iv._rules[0]["dirs_a"][0] is before["rules"][0]["dirs_a"][0]
 
 
 def test_preset_unavailable_profile_does_not_preempt_mutation(monkeypatch):
