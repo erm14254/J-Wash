@@ -630,3 +630,74 @@ def test_cache_delete_claim_releases_on_404_and_nested_rejection(tmp_path, monke
     response = client.post("/api/edit/gguf-cache/delete", json={"name": "job"})
     assert response.status_code == 409 and app._gguf_delete_claim is None
     assert cache.exists()
+
+
+def test_stale_converter_completion_cannot_publish_or_mutate_successor(tmp_path, monkeypatch):
+    import subprocess
+    import threading
+    import api.app as app
+
+    entered = threading.Event(); release = threading.Event()
+    original_run = subprocess.run
+    def blocked_run(args, **_kwargs):
+        outfile = Path(args[args.index("--outfile") + 1])
+        outfile.parent.mkdir(parents=True, exist_ok=True)
+        outfile.write_bytes(b"stale-temp")
+        entered.set()
+        assert release.wait(2)
+        return SimpleNamespace(returncode=0, stderr="")
+    monkeypatch.setattr(subprocess, "run", blocked_run)
+    job_dir = tmp_path / "old"; hf_dir = job_dir / "hf"; hf_dir.mkdir(parents=True)
+    old = app._reserve_gguf_job("old")
+    worker = threading.Thread(
+        target=app._gguf_worker,
+        args=(old, "old", job_dir, "old", "bf16", hf_dir,
+              tmp_path / "convert.py", None, None),
+    )
+    worker.start()
+    assert entered.wait(2)
+    assert app._finish_gguf_job(old, error="superseded")
+    successor = app._reserve_gguf_job("successor")
+    before = app._gguf_state_snapshot()
+    release.set(); worker.join(2)
+    assert not worker.is_alive()
+    assert not (job_dir / "old-bf16.gguf").exists()
+    assert not list(job_dir.glob(".*.tmp-*.gguf"))
+    assert app._gguf_state_snapshot() == before
+    assert app._gguf_job_is_current(successor)
+    assert app._finish_gguf_job(successor, error="test complete")
+    monkeypatch.setattr(subprocess, "run", original_run)
+
+
+def test_cache_delete_serializes_with_jobs_and_releases_after_success(tmp_path, monkeypatch):
+    import api.app as app
+    from fastapi.testclient import TestClient
+
+    edits = tmp_path / "edits"; cache = edits / "job" / "hf"
+    cache.mkdir(parents=True); (cache / "config.json").write_text("{}")
+    monkeypatch.setattr(app.editing, "EDITS_DIR", edits)
+    client = TestClient(app.app)
+    token = app._reserve_gguf_job("active")
+    response = client.post("/api/edit/gguf-cache/delete", json={"name": "job"})
+    assert response.status_code == 409 and cache.exists()
+    assert app._finish_gguf_job(token, error="test complete")
+    response = client.post("/api/edit/gguf-cache/delete", json={"name": "job"})
+    assert response.status_code == 200 and not cache.exists()
+    assert app._gguf_delete_claim is None
+
+
+@pytest.mark.parametrize("evidence", ["config", "gguf"])
+def test_cache_delete_blocks_nested_export_evidence(evidence, tmp_path, monkeypatch):
+    import api.app as app
+    from fastapi.testclient import TestClient
+
+    cache = tmp_path / "edits" / "job" / "hf"; nested = cache / "nested"
+    nested.mkdir(parents=True); (cache / "config.json").write_text("{}")
+    if evidence == "config": (nested / "config.json").write_text("{}")
+    else: (nested / "published.gguf").write_bytes(b"valid")
+    monkeypatch.setattr(app.editing, "EDITS_DIR", tmp_path / "edits")
+    response = TestClient(app.app).post(
+        "/api/edit/gguf-cache/delete", json={"name": "job"}
+    )
+    assert response.status_code == 409 and cache.exists()
+    assert app._gguf_delete_claim is None

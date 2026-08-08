@@ -505,6 +505,33 @@ def test_publication_cancelled_worker_failure_is_http_409():
     assert outcome.http_status == 409
 
 
+def test_normal_export_preflight_propagates_recorded_revision(monkeypatch, tmp_path):
+    from api import app
+
+    calls = []
+    monkeypatch.setattr(
+        app, "resolve_local_dir",
+        lambda model_id, *, revision=None: (
+            calls.append((model_id, revision)) or str(tmp_path)
+        ),
+    )
+    monkeypatch.setattr(app.capabilities, "ensure_unquantized", lambda *_a, **_k: None)
+    monkeypatch.setattr(app.capabilities, "require", lambda *_a, **_k: None)
+    rule = {"layers": [0]}
+    snap = SimpleNamespace(
+        bundle=SimpleNamespace(
+            meta={"model_id": "owner/model", "revision": "snapshot-sha"},
+            jl=object(), capability_profile=object(),
+        ),
+        interventions={"active_rules": [rule], "scale": 1.0, "mode": "readthrough"},
+    )
+    outcome = app._export_preflight_resource(
+        snap, SimpleNamespace(format="full", name="export")
+    )
+    assert outcome.status is None
+    assert calls == [("owner/model", "snapshot-sha")]
+
+
 def test_dispatch_payload_cleared_on_cancellation_before_claim():
     import weakref
     from core.model_session import WorkerDispatch
