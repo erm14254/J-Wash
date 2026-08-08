@@ -16,7 +16,7 @@ from core.ablation import Interventions
 from core.model_manager import _rebase_capability_meta
 from core.model_session import LoadedModelBundle, ModelSessionCoordinator, OperationType
 from helpers import *
-from helpers import _deferred_threads, _gguf_test_tools
+from helpers import _deferred_threads, _gguf_test_tools, _track_test_worker
 
 
 def _set_gguf_state(app, state):
