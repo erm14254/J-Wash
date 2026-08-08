@@ -585,7 +585,11 @@ def test_superscript_reserved_names_fail_core_and_api(base, style, tmp_path):
     with pytest.raises(ValueError, match="reserved"):
         editing._safe_relative_parts(value)
     import api.app as app
-    app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
+    with app._gguf_lock:
+        assert app._gguf_owner is None and app._gguf_delete_claim is None
+        app._gguf_state.update(
+            state="idle", name=None, step=None, error=None, result=None
+        )
     with pytest.raises(app.HTTPException) as exc:
         asyncio.run(app.api_edit_export_gguf(SimpleNamespace(name=value, gguf_type="bf16")))
     assert exc.value.status_code == 422 and "reserved" in exc.value.detail

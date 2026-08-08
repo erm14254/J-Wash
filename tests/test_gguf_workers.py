@@ -19,6 +19,20 @@ from helpers import *
 from helpers import _deferred_threads, _gguf_test_tools
 
 
+def _set_gguf_state(app, state):
+    with app._gguf_lock:
+        assert app._gguf_owner is None and app._gguf_delete_claim is None
+        app._gguf_state.clear()
+        app._gguf_state.update(state)
+
+
+def _set_idle_gguf_state(app):
+    _set_gguf_state(app, {
+        "state": "idle", "name": None, "step": None,
+        "error": None, "result": None,
+    })
+
+
 def _install_loaded_bundle(app, monkeypatch, *, jl=None, profile="__default__", meta=None):
     supported = capabilities.decision(True, "supported")
     if profile == "__default__":
@@ -99,7 +113,7 @@ def test_api_gguf_preparation_uses_nested_hf_name(tmp_path, monkeypatch):
         return {"out_dir": str(target)}
     monkeypatch.setattr(app.editing, "export_rebase", fake_export)
     pending = _deferred_threads(monkeypatch, app)
-    app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
+    _set_idle_gguf_state(app)
     result = asyncio.run(app.api_edit_export_gguf(SimpleNamespace(name="job", gguf_type="bf16")))
     assert captured["name"] == "job/hf" and result["checkpoint"] == "baked"
     assert revisions == ["recorded-revision"]
@@ -116,7 +130,7 @@ def test_api_gguf_maps_generic_export_error_to_500(tmp_path, monkeypatch):
                         lambda _model, *, revision=None: tmp_path / "source")
     _mock_loaded_readthrough(app, monkeypatch)
     monkeypatch.setattr(app.editing, "export_rebase", lambda *_a, **_k: (_ for _ in ()).throw(OSError("disk failed")))
-    app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
+    _set_idle_gguf_state(app)
     with pytest.raises(app.HTTPException) as exc:
         asyncio.run(app.api_edit_export_gguf(SimpleNamespace(name="job", gguf_type="bf16")))
     assert exc.value.status_code == 500 and exc.value.detail == "disk failed"
@@ -150,7 +164,7 @@ def test_fresh_gguf_bake_requires_capability_profile(tmp_path, monkeypatch):
         AssertionError("export must not run without a capability profile")
     )
     monkeypatch.setattr(app.editing, "export_rebase", forbidden)
-    app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
+    _set_idle_gguf_state(app)
     with pytest.raises(app.HTTPException) as exc:
         asyncio.run(app.api_edit_export_gguf(
             SimpleNamespace(name="job", gguf_type="bf16")
@@ -172,7 +186,7 @@ def test_fresh_gguf_predispatch_failure_releases_bake_owner(tmp_path, monkeypatc
     monkeypatch.setattr(app.editing, "export_rebase",
                         lambda *_args, **_kwargs: (_ for _ in ()).throw(
                             AssertionError("pre-dispatch validation should reject first")))
-    app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
+    _set_idle_gguf_state(app)
 
     with pytest.raises(app.HTTPException) as exc:
         asyncio.run(app.api_edit_export_gguf(SimpleNamespace(name="job", gguf_type="bf16")))
@@ -209,7 +223,7 @@ def test_fresh_gguf_abliteration_rejected_after_terminal_reservation(tmp_path, m
     monkeypatch.setattr(app, "threading", SimpleNamespace(Thread=forbidden))
     original = {"state": "idle", "name": None, "step": None,
                 "error": None, "result": None}
-    app._gguf_state.update(original)
+    _set_gguf_state(app, original)
     with pytest.raises(app.HTTPException) as exc:
         asyncio.run(app.api_edit_export_gguf(
             SimpleNamespace(name="global", gguf_type="bf16")
@@ -233,7 +247,7 @@ def test_gguf_reserved_cache_hit_rejected_before_side_effects(name, tmp_path, mo
     monkeypatch.setattr(app.editing, "export_rebase", forbidden)
     monkeypatch.setattr(app, "threading", SimpleNamespace(Thread=forbidden))
     original_state = {"state": "idle", "name": None, "step": None, "error": None, "result": None}
-    app._gguf_state.update(original_state)
+    _set_gguf_state(app, original_state)
     response = TestClient(app.app).post("/api/edit/export-gguf", json={"name": name, "gguf_type": "bf16"})
     assert response.status_code == 422 and "reserved" in response.json()["detail"]
     assert sentinel.read_text() == '{"old": true}' and app._gguf_state == original_state
@@ -247,7 +261,7 @@ def test_gguf_reserved_cache_delete_preserves_sentinel(name, tmp_path, monkeypat
     cached = app.editing.EDITS_DIR / name / "hf"; cached.mkdir(parents=True)
     sentinel = cached / "keep.bin"; sentinel.write_bytes(b"keep")
     original_state = {"state": "idle", "name": None, "step": None, "error": None, "result": None}
-    app._gguf_state.update(original_state)
+    _set_gguf_state(app, original_state)
     response = TestClient(app.app).post("/api/edit/gguf-cache/delete", json={"name": name})
     assert response.status_code == 422 and "reserved" in response.json()["detail"]
     assert sentinel.read_bytes() == b"keep" and app._gguf_state == original_state
@@ -263,7 +277,7 @@ def test_gguf_valid_cached_reuse_and_delete(tmp_path, monkeypatch):
     monkeypatch.setattr(app.editing, "export_rebase",
                         lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("cache was not reused")))
     pending = _deferred_threads(monkeypatch, app)
-    app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
+    _set_idle_gguf_state(app)
     client = TestClient(app.app)
     response = client.post("/api/edit/export-gguf", json={"name": "job", "gguf_type": "bf16"})
     assert response.status_code == 200 and response.json()["checkpoint"] == "reused" and pending
@@ -303,7 +317,7 @@ def test_gguf_nested_worker_outputs_use_leaf_stem(
             kwargs["publication_guard"].publish(lambda: stage.replace(hf_dir))
         monkeypatch.setattr(app.editing, "export_rebase", fake_export)
     pending = _deferred_threads(monkeypatch, app)
-    app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
+    _set_idle_gguf_state(app)
     response = TestClient(app.app).post(
         "/api/edit/export-gguf", json={"name": name, "gguf_type": gguf_type})
     assert response.status_code == 200
@@ -371,7 +385,7 @@ def test_gguf_atomic_partial_failure_then_retry(name, cached, gguf_type, tmp_pat
             kwargs["publication_guard"].publish(lambda: stage.replace(hf_dir))
         monkeypatch.setattr(app.editing, "export_rebase", fake_export)
     pending = _deferred_threads(monkeypatch, app)
-    app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
+    _set_idle_gguf_state(app)
     client = TestClient(app.app)
     response = client.post("/api/edit/export-gguf", json={"name": name, "gguf_type": gguf_type})
     assert response.status_code == 200 and response.json()["state"]["state"] == "running"
