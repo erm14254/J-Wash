@@ -439,12 +439,12 @@ def resolve_source(model_id):
     return model_id
 
 
-def resolve_local_dir(model_id):
+def resolve_local_dir(model_id, *, revision=None):
     source = resolve_source(model_id)
     path = Path(source)
     if path.is_dir():
         return str(path)
-    cached = try_to_load_from_cache(source, "config.json")
+    cached = try_to_load_from_cache(source, "config.json", revision=revision)
     if isinstance(cached, str):
         return str(Path(cached).parent)
     return None

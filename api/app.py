@@ -11,6 +11,7 @@ import threading
 import time
 from threading import Event as ThreadingEvent
 import uuid
+import stat
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -197,7 +198,8 @@ def _worker_failure(exc, *, default_status=500, value_status=422):
             http_status=exc.status_code,
         )
     else:
-        status = value_status if isinstance(exc, ValueError) else default_status
+        status = (409 if isinstance(exc, editing.PublicationCancelled) else
+                  value_status if isinstance(exc, ValueError) else default_status)
         outcome = WorkerOutcome(failure_kind=kind, failure_message=message, http_status=status)
     try:
         exc.__traceback__ = exc.__context__ = exc.__cause__ = None
@@ -1125,7 +1127,7 @@ def api_status():
         "downloads": list(_downloads.values()),
         "convert": _convert_state,
         "fit": fit_manager.state,
-        "gguf": dict(_gguf_state),
+        "gguf": _gguf_state_snapshot(),
         "interventions": iv.get("summary", []),
         "interventions_scale": scale,
         "interventions_mode": mode,
@@ -1897,7 +1899,7 @@ async def _prepare_export_handoff(handoff, req):
         payload_seed = prepared.take()
         prepared = outcome = None
         publication_gate = editing.PublicationGate(
-            lambda: not manager.coordinator.is_cancelled(token) and manager.coordinator.is_current(token)
+            lambda coordinator=handoff.coordinator, owner=token: coordinator.can_publish(owner)
         )
         payload = dict(payload_seed)
         payload.update(publication_gate=publication_gate, format=req.format, name=req.name)
@@ -1951,7 +1953,7 @@ def _export_preflight_resource(snap, req):
         rules = intervention_snapshot["active_rules"]
         if not rules:
             return _route_http(422, "no active intervention to export (rules disabled or without layers?)")
-        source_dir = resolve_local_dir(meta["model_id"])
+        source_dir = resolve_local_dir(meta["model_id"], revision=meta.get("revision"))
         scale, mode = intervention_snapshot["scale"], intervention_snapshot["mode"]
         kwargs = {}
         if mode in ("readthrough", "exact"):
@@ -1998,7 +2000,7 @@ def _gguf_preflight_resource(snap):
             export_fn, kwargs = editing.export_abliteration, {}
         else:
             return _route_http(422, "export requires a pure-weights mode")
-        source_dir = resolve_local_dir(meta["model_id"])
+        source_dir = resolve_local_dir(meta["model_id"], revision=meta.get("revision"))
         return _route_value(PreparedWorkerPayload({
             "bundle": bundle, "meta": meta, "rules": rules, "source_dir": source_dir,
             "scale": scale, "kwargs": kwargs, "export_fn": export_fn,
@@ -2019,6 +2021,76 @@ def _gguf_preflight_resource(snap):
 # (2) convert_hf_to_gguf.py (+ llama-quantize for quantized types) in a
 # background thread, progress polled through /api/status.
 _gguf_state = {"state": "idle", "name": None, "step": None, "error": None, "result": None}
+_gguf_lock = threading.Lock()
+
+@dataclass(frozen=True)
+class _GGUFJobToken:
+    id: str
+    name: str
+
+_gguf_owner = None
+_gguf_delete_claim = None
+
+def _gguf_state_snapshot():
+    with _gguf_lock:
+        return dict(_gguf_state)
+
+def _reserve_gguf_job(name):
+    global _gguf_owner
+    token = _GGUFJobToken(uuid.uuid4().hex, name)
+    running_state = {
+        "state": "running", "name": name, "step": "checking checkpoint",
+        "error": None, "result": None,
+    }
+    with _gguf_lock:
+        if _gguf_owner is not None or _gguf_delete_claim is not None:
+            raise OperationConflict("a GGUF export or cache deletion is already in progress")
+        _gguf_owner = token
+        _gguf_state.clear()
+        _gguf_state.update(running_state)
+    return token
+
+def _gguf_job_is_current(token):
+    with _gguf_lock:
+        return _gguf_owner == token
+
+def _gguf_job_progress(token, step):
+    with _gguf_lock:
+        if _gguf_owner != token:
+            return False
+        _gguf_state["step"] = step
+        return True
+
+def _finish_gguf_job(token, *, result=None, error=None):
+    global _gguf_owner
+    with _gguf_lock:
+        if _gguf_owner != token:
+            return False
+        _gguf_state.update(state="done" if error is None else "error", step=None,
+                           error=error, result=result if error is None else None)
+        _gguf_owner = None
+        return True
+
+def _validate_gguf_artifact(path):
+    try:
+        details = path.stat(follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"GGUF producer succeeded without producing an output: {path}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"GGUF artifact is inaccessible: {path}") from exc
+    if not stat.S_ISREG(details.st_mode):
+        raise RuntimeError(f"GGUF artifact must be a regular nonempty file: {path}")
+    if details.st_size <= 0:
+        raise RuntimeError(f"GGUF producer produced an empty output: {path}")
+    return details
+
+def _publish_gguf_temp(token, temp_path, final_path):
+    _validate_gguf_artifact(temp_path)
+    with _gguf_lock:
+        if _gguf_owner != token:
+            return False
+        temp_path.replace(final_path)
+        return True
 
 GGUF_BASE_TYPES = ("bf16", "f16")
 GGUF_QUANT_TYPES = ("q8_0", "q6_k", "q5_k_m", "q4_k_m", "q3_k_m")
@@ -2054,19 +2126,28 @@ def _llamacpp_paths():
     return convert, quantize, (gguf_py if gguf_py.is_dir() else None)
 
 
-def _gguf_worker(job_name, job_dir, filename_stem, gguf_type,
+def _gguf_worker(token, job_name, job_dir, filename_stem, gguf_type,
                  hf_dir, convert, quantize, gguf_py):
     import subprocess
     import sys
+    if not _gguf_job_is_current(token):
+        return
     try:
         job_dir.mkdir(parents=True, exist_ok=True)
+        if not _gguf_job_is_current(token):
+            return
         base_type = gguf_type if gguf_type in GGUF_BASE_TYPES else "bf16"
         base_gguf = job_dir / f"{filename_stem}-{base_type}.gguf"
         env = dict(os.environ)
         if gguf_py is not None:  # vendored gguf package inside the llama.cpp repo
             env["PYTHONPATH"] = str(gguf_py) + os.pathsep + env.get("PYTHONPATH", "")
-        if not base_gguf.exists():
-            _gguf_state.update(step=f"converting to {base_type}")
+        if base_gguf.exists() or base_gguf.is_symlink():
+            if not _gguf_job_is_current(token):
+                return
+            _validate_gguf_artifact(base_gguf)
+        else:
+            if not _gguf_job_progress(token, f"converting to {base_type}"):
+                return
             temp_gguf = base_gguf.with_name(
                 f".{base_gguf.stem}.tmp-{uuid.uuid4().hex}.gguf"
             )
@@ -2082,23 +2163,21 @@ def _gguf_worker(job_name, job_dir, filename_stem, gguf_type,
                         raise RuntimeError(
                             f"convert_hf_to_gguf failed: {proc.stderr[-2000:]}"
                         )
-                    if not temp_gguf.is_file():
-                        raise RuntimeError(
-                            "convert_hf_to_gguf succeeded without producing an output"
-                        )
-                    if temp_gguf.stat().st_size <= 0:
-                        raise RuntimeError("convert_hf_to_gguf produced an empty output")
-                    temp_gguf.replace(base_gguf)
+                    if not _publish_gguf_temp(token, temp_gguf, base_gguf):
+                        return
                 finally:
                     temp_gguf.unlink(missing_ok=True)
         result_path = base_gguf
         if gguf_type not in GGUF_BASE_TYPES:
+            if not _gguf_job_is_current(token):
+                return
             if quantize is None:
                 raise RuntimeError(
                     "llama-quantize not found in the llama.cpp folder — only "
                     "bf16/f16 exports are possible"
                 )
-            _gguf_state.update(step=f"quantizing to {gguf_type}")
+            if not _gguf_job_progress(token, f"quantizing to {gguf_type}"):
+                return
             result_path = job_dir / f"{filename_stem}-{gguf_type}.gguf"
             temp_quantized = result_path.with_name(
                 f".{result_path.stem}.tmp-{uuid.uuid4().hex}.gguf"
@@ -2112,25 +2191,20 @@ def _gguf_worker(job_name, job_dir, filename_stem, gguf_type,
                     )
                     if proc.returncode != 0:
                         raise RuntimeError(f"llama-quantize failed: {proc.stderr[-2000:]}")
-                    if not temp_quantized.is_file():
-                        raise RuntimeError(
-                            "llama-quantize succeeded without producing an output"
-                        )
-                    if temp_quantized.stat().st_size <= 0:
-                        raise RuntimeError("llama-quantize produced an empty output")
-                    temp_quantized.replace(result_path)
+                    if not _publish_gguf_temp(token, temp_quantized, result_path):
+                        return
                 finally:
                     temp_quantized.unlink(missing_ok=True)
-        _gguf_state.update(
-            state="done", step=None, error=None,
-            result={
+        if not _gguf_job_is_current(token):
+            return
+        details = _validate_gguf_artifact(result_path)
+        _finish_gguf_job(token, result={
                 "gguf": str(result_path),
-                "size_bytes": result_path.stat().st_size,
+                "size_bytes": details.st_size,
                 "hf_cache": str(hf_dir),
-            },
-        )
+            })
     except Exception as exc:
-        _gguf_state.update(state="error", step=None, error=str(exc))
+        _finish_gguf_job(token, error=str(exc))
 
 
 def _make_gguf_bake_worker(dispatch):
@@ -2159,7 +2233,7 @@ async def _prepare_gguf_bake_handoff(handoff, export_name):
         payload_seed = prepared.take()
         prepared = outcome = None
         publication_gate = editing.PublicationGate(
-            lambda: not manager.coordinator.is_cancelled(token) and manager.coordinator.is_current(token)
+            lambda coordinator=handoff.coordinator, owner=token: coordinator.can_publish(owner)
         )
         payload = dict(payload_seed)
         payload.update(name=export_name, publication_gate=publication_gate)
@@ -2188,10 +2262,6 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
     validated_name = "/".join(name_parts)
-    job_dir = editing.EDITS_DIR.joinpath(*name_parts)
-    filename_stem = name_parts[-1]
-    if _gguf_state["state"] == "running":
-        raise HTTPException(409, "a GGUF export is already in progress")
     if req.gguf_type not in GGUF_BASE_TYPES + GGUF_QUANT_TYPES:
         raise HTTPException(422, f"unknown GGUF type: {req.gguf_type}")
     try:
@@ -2200,39 +2270,59 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
         raise HTTPException(422, str(exc))
     if req.gguf_type not in GGUF_BASE_TYPES and quantize is None:
         raise HTTPException(422, "llama-quantize not found — pick bf16 or f16")
-
+    job_dir = editing.EDITS_DIR.joinpath(*name_parts)
+    filename_stem = name_parts[-1]
     hf_dir = job_dir / "hf"
-    baked = "reused"
-    if not (hf_dir / "config.json").exists():
-        stop_event = ThreadingEvent()
-        try:
-            async with OperationHandoff.acquire_scope(
-                manager.coordinator, OperationType.GGUF_BAKE,
-                stop_event=stop_event, requires_loaded=True,
-            ) as handoff:
-                setup = await _prepare_gguf_bake_handoff(
-                    handoff, "/".join((*name_parts, "hf")),
+    try:
+        job_token = _reserve_gguf_job(validated_name)
+    except OperationConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    try:
+        baked = "reused"
+        if not (hf_dir / "config.json").exists():
+            _gguf_job_progress(job_token, "baking checkpoint")
+            stop_event = ThreadingEvent()
+            try:
+                async with OperationHandoff.acquire_scope(
+                    manager.coordinator, OperationType.GGUF_BAKE,
+                    stop_event=stop_event, requires_loaded=True,
+                ) as handoff:
+                    setup = await _prepare_gguf_bake_handoff(
+                        handoff, "/".join((*name_parts, "hf")),
+                    )
+            except OperationConflict as exc:
+                raise _conflict(exc)
+            except ModelStateError as exc:
+                raise HTTPException(
+                    422, "no model loaded (and no cached checkpoint for this name)"
+                ) from None
+            if setup.status is not None:
+                raise HTTPException(
+                    setup.status, setup.message or "GGUF bake setup failed"
                 )
-        except OperationConflict as exc:
-            raise _conflict(exc)
-        except ModelStateError as exc:
-            raise HTTPException(422, "no model loaded (and no cached checkpoint for this name)") from None
-        if setup.status is not None:
-            raise HTTPException(setup.status, setup.message or "GGUF bake setup failed") from None
-        task, dispatch, publication_gate = setup.task, setup.dispatch, setup.gate
-        _raise_worker_outcome(await _await_transferred_worker(
-            task, dispatch, on_cancel=publication_gate.cancel,
-        ))
-        baked = "baked"
-
-    _gguf_state.update(state="running", name=validated_name, step="starting", error=None, result=None)
-    threading.Thread(
-        target=_gguf_worker,
-        args=(validated_name, job_dir, filename_stem, req.gguf_type,
-              hf_dir, convert, quantize, gguf_py),
-        daemon=True,
-    ).start()
-    return {"started": True, "checkpoint": baked, "state": dict(_gguf_state)}
+            task, dispatch, publication_gate = setup.task, setup.dispatch, setup.gate
+            _raise_worker_outcome(await _await_transferred_worker(
+                task, dispatch, on_cancel=publication_gate.cancel,
+            ))
+            baked = "baked"
+        _gguf_job_progress(job_token, "starting")
+        worker = threading.Thread(
+            target=_gguf_worker,
+            args=(job_token, validated_name, job_dir, filename_stem, req.gguf_type,
+                  hf_dir, convert, quantize, gguf_py),
+            daemon=True,
+        )
+        worker.start()
+    except asyncio.CancelledError:
+        _finish_gguf_job(job_token, error="GGUF export request cancelled")
+        raise
+    except HTTPException as exc:
+        _finish_gguf_job(job_token, error=str(exc.detail))
+        raise
+    except BaseException as exc:
+        _finish_gguf_job(job_token, error=str(exc))
+        raise HTTPException(500, str(exc)) from exc
+    return {"started": True, "checkpoint": baked, "state": _gguf_state_snapshot()}
 
 
 class GGUFCacheRequest(BaseModel):
@@ -2247,15 +2337,27 @@ def api_gguf_cache_delete(req: GGUFCacheRequest):
         name_parts = editing.validate_export_name(req.name)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
-    validated_name = "/".join(name_parts)
     hf_dir = editing.EDITS_DIR.joinpath(*name_parts) / "hf"
-    if not hf_dir.is_dir():
-        raise HTTPException(404, f"no cached checkpoint for {req.name}")
-    if _gguf_state["state"] == "running" and _gguf_state["name"] == validated_name:
-        raise HTTPException(409, "a GGUF export is using this cache")
-    freed = sum(f.stat().st_size for f in hf_dir.rglob("*") if f.is_file())
-    shutil.rmtree(hf_dir)
-    return {"deleted": str(hf_dir), "freed_bytes": freed}
+    global _gguf_delete_claim
+    claim = uuid.uuid4().hex
+    with _gguf_lock:
+        if _gguf_owner is not None or _gguf_delete_claim is not None:
+            raise HTTPException(409, "a GGUF export or cache deletion is in progress")
+        _gguf_delete_claim = claim
+    try:
+        if not hf_dir.is_dir():
+            raise HTTPException(404, f"no cached checkpoint for {req.name}")
+        descendants = list(hf_dir.rglob("*"))
+        if any((p.suffix.lower() == ".gguf" and p.is_file()) or
+               (p.name == "config.json" and p.parent != hf_dir) for p in descendants):
+            raise HTTPException(409, "cache contains nested export artifacts")
+        freed = sum(f.stat().st_size for f in descendants if f.is_file())
+        shutil.rmtree(hf_dir)
+        return {"deleted": str(hf_dir), "freed_bytes": freed}
+    finally:
+        with _gguf_lock:
+            if _gguf_delete_claim == claim:
+                _gguf_delete_claim = None
 
 
 class GenerateSyncRequest(BaseModel):

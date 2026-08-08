@@ -421,6 +421,15 @@ class ModelSessionCoordinator:
         with self._lock:
             return self._operation == token
 
+    def can_publish(self, token: OperationToken | None) -> bool:
+        """Atomically test whether *token* still owns publication."""
+        with self._lock:
+            return (
+                token is not None
+                and self._operation == token
+                and token.id not in self._cancelled
+            )
+
     def request_cancel(self, token: OperationToken) -> bool:
         with self._lock:
             if self._operation != token:

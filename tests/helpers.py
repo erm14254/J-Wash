@@ -325,18 +325,65 @@ def _gguf_test_tools(tmp_path):
     return convert, quantize
 
 
-def _deferred_threads(monkeypatch, app):
+class GGUFTestWorkerRegistry:
+    def __init__(self):
+        self.real = []
+        self.deferred = []
+        self.releases = []
+
+    def register_real(self, worker, *release_callbacks, label=None):
+        self.real.append((label or repr(worker), worker))
+        self.releases.extend(release_callbacks)
+        return worker
+
+    def register_deferred(self, worker):
+        self.deferred.append(worker)
+        return worker
+
+    def drain(self, timeout=2):
+        for release in reversed(self.releases):
+            release()
+        for _label, worker in self.real:
+            worker.join(timeout)
+        live = [(label, worker) for label, worker in self.real if worker.is_alive()]
+        incomplete = [worker for worker in self.deferred if worker.incomplete]
+        return live, incomplete
+
+    def clear(self):
+        self.real.clear(); self.deferred.clear(); self.releases.clear()
+
+
+def _deferred_threads(monkeypatch, app, registry):
     pending = []
     class DeferredThread:
         def __init__(self, *, target, args, daemon):
             self.target, self.args, self.daemon = target, args, daemon
+            self.started = self.finished = False
             pending.append(self)
+            registry.register_deferred(self)
         def start(self):
-            pass
+            self.started = True
         def run(self):
-            self.target(*self.args)
+            if self.finished:
+                return
+            self.started = True
+            try:
+                self.target(*self.args)
+            finally:
+                self.finished = True
+        def join(self, timeout=None):
+            return None
+        def is_alive(self):
+            return False
+        @property
+        def incomplete(self):
+            return self.started and not self.finished
     monkeypatch.setattr(app, "threading", SimpleNamespace(Thread=DeferredThread))
     return pending
+
+
+def _track_test_worker(registry, worker, *release_callbacks, label=None):
+    return registry.register_real(worker, *release_callbacks, label=label)
 
 
 def make_hardlinked_indexed_source(model, path):
