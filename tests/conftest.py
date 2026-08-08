@@ -1,6 +1,16 @@
 import pytest
 import torch
 import sys
+from helpers import GGUFTestWorkerRegistry
+
+
+@pytest.fixture
+def gguf_test_workers():
+    registry = GGUFTestWorkerRegistry()
+    yield registry
+    assert registry.real == []
+    assert registry.deferred == []
+    assert registry.releases == []
 
 
 @pytest.fixture(autouse=True)
@@ -21,7 +31,7 @@ def synthetic_decoder_specs(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def restore_api_gguf_state():
+def restore_api_gguf_state(gguf_test_workers, monkeypatch):
     app = sys.modules.get("api.app")
     original = (app._gguf_state_snapshot() if app is not None else
                 {"state": "idle", "name": None, "step": None,
@@ -29,22 +39,14 @@ def restore_api_gguf_state():
     yield
     app = sys.modules.get("api.app")
     if app is not None:
-        workers = list(getattr(app, "_gguf_test_workers", ()))
-        for worker in workers:
-            for release in getattr(worker, "_jwash_release_callbacks", ()):
-                release()
-        for worker in workers:
-            worker.join(timeout=2)
-        live = [worker for worker in workers if worker.is_alive()]
-        incomplete = [worker for worker in workers
-                      if getattr(worker, "incomplete", False)]
+        live, incomplete = gguf_test_workers.drain(timeout=2)
         worker_failures = []
         if live:
             worker_failures.append(f"live GGUF test worker(s): {live!r}")
         if incomplete:
             worker_failures.append(f"incomplete deferred GGUF work: {incomplete!r}")
         if live:
-            pytest.fail("; ".join(worker_failures))
+            pytest.exit("; ".join(worker_failures), returncode=2)
         leaked_owner = leaked_delete = None
         with app._gguf_lock:
             leaked_owner = app._gguf_owner
@@ -53,6 +55,7 @@ def restore_api_gguf_state():
             app._gguf_delete_claim = None
             app._gguf_state.clear()
             app._gguf_state.update(original)
+        gguf_test_workers.clear()
         leaks = []
         if leaked_owner is not None:
             leaks.append(f"GGUF job owner leaked: {leaked_owner!r}")

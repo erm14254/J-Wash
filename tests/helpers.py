@@ -325,18 +325,42 @@ def _gguf_test_tools(tmp_path):
     return convert, quantize
 
 
-def _deferred_threads(monkeypatch, app):
+class GGUFTestWorkerRegistry:
+    def __init__(self):
+        self.real = []
+        self.deferred = []
+        self.releases = []
+
+    def register_real(self, worker, *release_callbacks, label=None):
+        self.real.append((label or repr(worker), worker))
+        self.releases.extend(release_callbacks)
+        return worker
+
+    def register_deferred(self, worker):
+        self.deferred.append(worker)
+        return worker
+
+    def drain(self, timeout=2):
+        for release in reversed(self.releases):
+            release()
+        for _label, worker in self.real:
+            worker.join(timeout)
+        live = [(label, worker) for label, worker in self.real if worker.is_alive()]
+        incomplete = [worker for worker in self.deferred if worker.incomplete]
+        return live, incomplete
+
+    def clear(self):
+        self.real.clear(); self.deferred.clear(); self.releases.clear()
+
+
+def _deferred_threads(monkeypatch, app, registry):
     pending = []
-    tracked = getattr(app, "_gguf_test_workers", None)
-    if tracked is None:
-        tracked = []
-        monkeypatch.setattr(app, "_gguf_test_workers", tracked, raising=False)
     class DeferredThread:
         def __init__(self, *, target, args, daemon):
             self.target, self.args, self.daemon = target, args, daemon
             self.started = self.finished = False
             pending.append(self)
-            tracked.append(self)
+            registry.register_deferred(self)
         def start(self):
             self.started = True
         def run(self):
@@ -358,14 +382,8 @@ def _deferred_threads(monkeypatch, app):
     return pending
 
 
-def _track_test_worker(app, worker, *release_callbacks):
-    tracked = getattr(app, "_gguf_test_workers", None)
-    if tracked is None:
-        tracked = []
-        app._gguf_test_workers = tracked
-    worker._jwash_release_callbacks = tuple(release_callbacks)
-    tracked.append(worker)
-    return worker
+def _track_test_worker(registry, worker, *release_callbacks, label=None):
+    return registry.register_real(worker, *release_callbacks, label=label)
 
 
 def make_hardlinked_indexed_source(model, path):

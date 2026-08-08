@@ -17,6 +17,7 @@ from core.model_manager import _rebase_capability_meta
 from core.model_session import LoadedModelBundle, ModelSessionCoordinator, OperationType
 from helpers import *
 from helpers import _deferred_threads, _gguf_test_tools, _track_test_worker
+from helpers import GGUFTestWorkerRegistry
 
 
 def _set_gguf_state(app, state):
@@ -31,6 +32,14 @@ def _set_idle_gguf_state(app):
         "state": "idle", "name": None, "step": None,
         "error": None, "result": None,
     })
+
+
+def test_gguf_worker_registry_is_per_instance_and_clears_references():
+    first, second = GGUFTestWorkerRegistry(), GGUFTestWorkerRegistry()
+    marker = object(); first.releases.append(marker)
+    assert second.real == [] and second.deferred == [] and second.releases == []
+    first.clear()
+    assert first.real == [] and first.deferred == [] and first.releases == []
 
 
 def _install_loaded_bundle(app, monkeypatch, *, jl=None, profile="__default__", meta=None):
@@ -92,7 +101,7 @@ def _mock_loaded_readthrough(app, monkeypatch, *, meta=None):
     monkeypatch.setattr(app.interventions, "_scale", 1.0)
 
 
-def test_api_gguf_preparation_uses_nested_hf_name(tmp_path, monkeypatch):
+def test_api_gguf_preparation_uses_nested_hf_name(tmp_path, monkeypatch, gguf_test_workers):
     import api.app as app
     captured = {}
     monkeypatch.setattr(app.editing, "EDITS_DIR", tmp_path / "edits")
@@ -112,7 +121,7 @@ def test_api_gguf_preparation_uses_nested_hf_name(tmp_path, monkeypatch):
         kwargs["publication_guard"].publish(lambda: stage.replace(target))
         return {"out_dir": str(target)}
     monkeypatch.setattr(app.editing, "export_rebase", fake_export)
-    pending = _deferred_threads(monkeypatch, app)
+    pending = _deferred_threads(monkeypatch, app, gguf_test_workers)
     _set_idle_gguf_state(app)
     result = asyncio.run(app.api_edit_export_gguf(SimpleNamespace(name="job", gguf_type="bf16")))
     assert captured["name"] == "job/hf" and result["checkpoint"] == "baked"
@@ -218,7 +227,8 @@ def test_fresh_gguf_bake_requires_capability_profile(tmp_path, monkeypatch):
     assert exc.value.detail == "Capability data is unavailable for this model."
 
 
-def test_fresh_gguf_predispatch_failure_releases_bake_owner(tmp_path, monkeypatch):
+def test_fresh_gguf_predispatch_failure_releases_bake_owner(
+        tmp_path, monkeypatch, gguf_test_workers):
     import api.app as app
     from fastapi.testclient import TestClient
 
@@ -242,7 +252,7 @@ def test_fresh_gguf_predispatch_failure_releases_bake_owner(tmp_path, monkeypatc
     cached = app.editing.EDITS_DIR / "job" / "hf"
     cached.mkdir(parents=True)
     (cached / "config.json").write_text("{}")
-    pending = _deferred_threads(monkeypatch, app)
+    pending = _deferred_threads(monkeypatch, app, gguf_test_workers)
     response = TestClient(app.app).post(
         "/api/edit/export-gguf", json={"name": "job", "gguf_type": "bf16"})
 
@@ -312,7 +322,7 @@ def test_gguf_reserved_cache_delete_preserves_sentinel(name, tmp_path, monkeypat
     assert sentinel.read_bytes() == b"keep" and app._gguf_state == original_state
 
 
-def test_gguf_valid_cached_reuse_and_delete(tmp_path, monkeypatch):
+def test_gguf_valid_cached_reuse_and_delete(tmp_path, monkeypatch, gguf_test_workers):
     import api.app as app
     from fastapi.testclient import TestClient
     monkeypatch.setattr(app.editing, "EDITS_DIR", tmp_path / "edits")
@@ -321,7 +331,7 @@ def test_gguf_valid_cached_reuse_and_delete(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "_llamacpp_paths", lambda: (tmp_path / "convert.py", None, None))
     monkeypatch.setattr(app.editing, "export_rebase",
                         lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("cache was not reused")))
-    pending = _deferred_threads(monkeypatch, app)
+    pending = _deferred_threads(monkeypatch, app, gguf_test_workers)
     _set_idle_gguf_state(app)
     client = TestClient(app.app)
     response = client.post("/api/edit/export-gguf", json={"name": "job", "gguf_type": "bf16"})
@@ -342,7 +352,8 @@ def test_gguf_valid_cached_reuse_and_delete(tmp_path, monkeypatch):
     ],
 )
 def test_gguf_nested_worker_outputs_use_leaf_stem(
-        name, cached, gguf_type, expected_checkpoint, expected_files, tmp_path, monkeypatch):
+        name, cached, gguf_type, expected_checkpoint, expected_files, tmp_path,
+        monkeypatch, gguf_test_workers):
     import api.app as app
     from fastapi.testclient import TestClient
     edits = tmp_path / "edits"; monkeypatch.setattr(app.editing, "EDITS_DIR", edits)
@@ -361,7 +372,7 @@ def test_gguf_nested_worker_outputs_use_leaf_stem(
             stage.mkdir(parents=True); (stage / "config.json").write_text("{}")
             kwargs["publication_guard"].publish(lambda: stage.replace(hf_dir))
         monkeypatch.setattr(app.editing, "export_rebase", fake_export)
-    pending = _deferred_threads(monkeypatch, app)
+    pending = _deferred_threads(monkeypatch, app, gguf_test_workers)
     _set_idle_gguf_state(app)
     response = TestClient(app.app).post(
         "/api/edit/export-gguf", json={"name": name, "gguf_type": gguf_type})
@@ -387,7 +398,8 @@ def test_gguf_nested_worker_outputs_use_leaf_stem(
         ("job", True, "bf16"),
     ],
 )
-def test_gguf_atomic_partial_failure_then_retry(name, cached, gguf_type, tmp_path, monkeypatch):
+def test_gguf_atomic_partial_failure_then_retry(
+        name, cached, gguf_type, tmp_path, monkeypatch, gguf_test_workers):
     import api.app as app
     from fastapi.testclient import TestClient
     edits = tmp_path / "edits"; monkeypatch.setattr(app.editing, "EDITS_DIR", edits)
@@ -429,7 +441,7 @@ def test_gguf_atomic_partial_failure_then_retry(name, cached, gguf_type, tmp_pat
             (stage / "config.json").write_text('{"baked": true}')
             kwargs["publication_guard"].publish(lambda: stage.replace(hf_dir))
         monkeypatch.setattr(app.editing, "export_rebase", fake_export)
-    pending = _deferred_threads(monkeypatch, app)
+    pending = _deferred_threads(monkeypatch, app, gguf_test_workers)
     _set_idle_gguf_state(app)
     client = TestClient(app.app)
     response = client.post("/api/edit/export-gguf", json={"name": name, "gguf_type": gguf_type})
@@ -601,7 +613,8 @@ def test_stale_gguf_updates_and_worker_entry_cannot_touch_successor(tmp_path):
 
 
 @pytest.mark.parametrize("same_name", [True, False])
-def test_simultaneous_gguf_reservation_has_exactly_one_owner(same_name):
+def test_simultaneous_gguf_reservation_has_exactly_one_owner(
+        same_name, gguf_test_workers):
     import threading
     import api.app as app
 
@@ -614,13 +627,17 @@ def test_simultaneous_gguf_reservation_has_exactly_one_owner(same_name):
         except Exception as exc:
             results.append(("lost", exc))
     names = ("job", "job" if same_name else "other")
-    threads = [_track_test_worker(app, threading.Thread(target=reserve, args=(name,)))
+    threads = [_track_test_worker(
+        gguf_test_workers, threading.Thread(target=reserve, args=(name,)),
+        barrier.abort, label=f"reservation-{name}")
                for name in names]
-    for thread in threads: thread.start()
-    barrier.wait(timeout=2)
-    for thread in threads:
-        thread.join(2)
-        assert not thread.is_alive()
+    try:
+        for thread in threads: thread.start()
+        barrier.wait(timeout=2)
+    finally:
+        for thread in threads: thread.join(2)
+        barrier.abort()
+    assert all(not thread.is_alive() for thread in threads)
     winners = [value for status, value in results if status == "won"]
     losers = [value for status, value in results if status == "lost"]
     assert len(winners) == len(losers) == 1
@@ -692,7 +709,8 @@ def test_cache_delete_claim_releases_on_404_and_nested_rejection(tmp_path, monke
     assert cache.exists()
 
 
-def test_stale_converter_completion_cannot_publish_or_mutate_successor(tmp_path, monkeypatch):
+def test_stale_converter_completion_cannot_publish_or_mutate_successor(
+        tmp_path, monkeypatch, gguf_test_workers):
     import subprocess
     import threading
     import api.app as app
@@ -709,11 +727,11 @@ def test_stale_converter_completion_cannot_publish_or_mutate_successor(tmp_path,
     monkeypatch.setattr(subprocess, "run", blocked_run)
     job_dir = tmp_path / "old"; hf_dir = job_dir / "hf"; hf_dir.mkdir(parents=True)
     old = app._reserve_gguf_job("old")
-    worker = _track_test_worker(app, threading.Thread(
+    worker = _track_test_worker(gguf_test_workers, threading.Thread(
         target=app._gguf_worker,
         args=(old, "old", job_dir, "old", "bf16", hf_dir,
               tmp_path / "convert.py", None, None),
-    ), release.set)
+    ), release.set, label="stale-converter")
     successor = None
     try:
         worker.start()
@@ -766,7 +784,8 @@ def test_cache_delete_blocks_nested_export_evidence(evidence, tmp_path, monkeypa
     assert app._gguf_delete_claim is None
 
 
-def test_held_delete_claim_blocks_job_and_second_delete(tmp_path, monkeypatch):
+def test_held_delete_claim_blocks_job_and_second_delete(
+        tmp_path, monkeypatch, gguf_test_workers):
     import shutil
     import threading
     import api.app as app
@@ -782,13 +801,13 @@ def test_held_delete_claim_blocks_job_and_second_delete(tmp_path, monkeypatch):
         return original(path)
     monkeypatch.setattr(shutil, "rmtree", blocked)
     worker = _track_test_worker(
-        app,
+        gguf_test_workers,
         threading.Thread(
             target=lambda: results.append(app.api_gguf_cache_delete(
                 app.GGUFCacheRequest(name="job")
             )),
         ),
-        release.set,
+        release.set, label="held-delete",
     )
     try:
         worker.start(); assert entered.wait(2)
