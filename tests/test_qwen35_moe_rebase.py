@@ -95,10 +95,16 @@ def test_bounded_read_transform_matches_math(dtype, budget):
     )
     expected = rebase.apply_read(source.float(), u, v)[0].to(dtype)
     assert got.shape == source.shape and got.dtype == source.dtype
-    assert torch.equal(got, expected)
+    if dtype == torch.float32:
+        # Chunking changes the GEMM batch shape, so float32 accumulation need
+        # not be bitwise identical to the single unbounded matrix multiply.
+        # Keep this tight: only ordinary float32 roundoff is accepted.
+        torch.testing.assert_close(got, expected, rtol=1e-6, atol=1e-6)
+    else:
+        assert torch.equal(got, expected)
     assert max(observed) <= budget and sum(observed) == 15
     expected_delta = (rebase.apply_read(source.float(), u, v)[0] - source.float()).abs().max()
-    assert delta == pytest.approx(float(expected_delta))
+    assert delta == pytest.approx(float(expected_delta), rel=1e-6, abs=1e-6)
 
 
 def test_build_plan_raw_key_and_exact_noop_precedence():
