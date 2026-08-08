@@ -205,3 +205,50 @@ def test_tied_embedding_source_contract_fails_before_first_staged_save(
     assert not (editing.EDITS_DIR / "tied-corrupt").exists()
     assert not [p for p in editing.EDITS_DIR.glob(".tied-corrupt.tmp-*")
                 if not p.name.endswith(".lease")]
+
+
+def test_multishard_indexed_tied_export_uses_authoritative_embedding_owner(
+        tmp_path, monkeypatch):
+    jl = dense_lens(); jl._lm_head.weight = jl._embed_tokens.weight
+    jl._hf_model.config = SimpleNamespace(tie_word_embeddings=True)
+    direction = torch.randn(8); direction /= direction.norm()
+    rules = [{"id": 1, "token_id": 1, "token": "x", "mode": "scale", "factor": 0.5,
+              "replacement_id": None, "replacement": None, "layers": [0],
+              "dirs_a": {0: direction}, "dirs_b": None}]
+    source = tmp_path / "source"; source.mkdir()
+    state = {k: v.detach().clone() for k, v in jl._hf_model.state_dict().items()
+             if k != "lm_head.weight"}
+    embed_key = "model.embed_tokens.weight"; lm_head_key = "lm_head.weight"
+    names = ["model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors"]
+    groups = [{}, {}]; weight_map = {}
+    for index, (key, value) in enumerate(state.items()):
+        owner = 1 if key == embed_key else index % 2
+        groups[owner][key] = value; weight_map[key] = names[owner]
+    for name, group in zip(names, groups): save_file(group, str(source / name))
+    total = sum(value.numel() * value.element_size() for value in state.values())
+    index_path = source / "model.safetensors.index.json"
+    index_path.write_text(json.dumps({"metadata": {"total_size": total},
+                                      "weight_map": weight_map}))
+    (source / "config.json").write_text(json.dumps({"tie_word_embeddings": True}))
+    source_bytes = {path.name: path.read_bytes() for path in source.glob("*.safetensors")}
+    monkeypatch.setattr(editing, "EDITS_DIR", tmp_path / "edits")
+    result = editing.export_rebase(rules, jl, {"dtype": "fp32"}, fmt="full",
+                                   name="tied-success", source_dir=source)
+    out = Path(result["out_dir"]); final_index = json.loads(
+        (out / "model.safetensors.index.json").read_text()
+    )
+    owner = weight_map[embed_key]
+    assert final_index["weight_map"][lm_head_key] == owner
+    occurrences = []
+    for name in names:
+        with safe_open(str(out / name), framework="pt") as handle:
+            if lm_head_key in handle.keys():
+                occurrences.append(name)
+                head = handle.get_tensor(lm_head_key)
+    assert occurrences == [owner]
+    assert head.shape == state[embed_key].shape and head.dtype == state[embed_key].dtype
+    staged_index, staged_paths = editing._indexed_shards(out)
+    _, logical_total = editing._validate_index_contents(staged_index, staged_paths)
+    assert final_index["metadata"]["total_size"] == logical_total
+    assert source_bytes == {path.name: path.read_bytes()
+                            for path in source.glob("*.safetensors")}

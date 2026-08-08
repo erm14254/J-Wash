@@ -31,10 +31,20 @@ def restore_api_gguf_state():
     if app is not None:
         workers = list(getattr(app, "_gguf_test_workers", ()))
         for worker in workers:
+            for release in getattr(worker, "_jwash_release_callbacks", ()):
+                release()
+        for worker in workers:
             worker.join(timeout=2)
         live = [worker for worker in workers if worker.is_alive()]
+        incomplete = [worker for worker in workers
+                      if getattr(worker, "incomplete", False)]
+        worker_failures = []
         if live:
-            pytest.fail(f"GGUF test worker(s) did not drain: {live!r}")
+            worker_failures.append(f"live GGUF test worker(s): {live!r}")
+        if incomplete:
+            worker_failures.append(f"incomplete deferred GGUF work: {incomplete!r}")
+        if live:
+            pytest.fail("; ".join(worker_failures))
         leaked_owner = leaked_delete = None
         with app._gguf_lock:
             leaked_owner = app._gguf_owner
@@ -49,7 +59,9 @@ def restore_api_gguf_state():
         if leaked_delete is not None:
             leaks.append(f"GGUF cache-delete claim leaked: {leaked_delete!r}")
         if leaks:
-            pytest.fail("; ".join(leaks))
+            worker_failures.extend(leaks)
+        if worker_failures:
+            pytest.fail("; ".join(worker_failures))
 
 @pytest.fixture(scope="module")
 def tiny():

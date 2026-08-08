@@ -136,6 +136,144 @@ def test_public_export_builds_one_semantic_inventory(tiny, tmp_path, monkeypatch
     assert calls == 1
 
 
+@pytest.mark.parametrize("corruption", ["rank", "leading", "residual"])
+def test_full_unindexed_active_reader_source_contract(
+        tiny, corruption, tmp_path, monkeypatch):
+    model = copy.deepcopy(tiny).float()
+    source = tmp_path / "source"; make_source(model, source)
+    shard = next(source.glob("*.safetensors")); state = load_file(str(shard))
+    transforms, info = rebase.build_plan(rules_for(model), lens(model), 1.0)
+    mapper = editing._disk_mapper(info["embed_key"], set(state))
+    memory_key = next(key for key, entry in transforms.items()
+                      if entry[0] == "read" and key != info["lm_head_key"])
+    key = mapper(memory_key); original = state[key]
+    if corruption == "rank": replacement = original.reshape(-1)
+    elif corruption == "leading": replacement = torch.zeros(
+        *original.shape[:-2], original.shape[-2] + 1, original.shape[-1]
+    )
+    else: replacement = torch.zeros(*original.shape[:-1], original.shape[-1] + 1)
+    state[key] = replacement
+    save_file(state, str(shard)); source_bytes = shard.read_bytes()
+    monkeypatch.setattr(editing, "EDITS_DIR", tmp_path / "edits")
+    with pytest.raises(ValueError, match="source shape"):
+        editing.export_rebase(rules_for(model), lens(model), {"dtype": "fp32"},
+                              fmt="full", name="corrupt-reader", source_dir=source)
+    assert shard.read_bytes() == source_bytes
+    assert not (editing.EDITS_DIR / "corrupt-reader").exists()
+    assert not [p for p in editing.EDITS_DIR.glob(".corrupt-reader.tmp-*")
+                if not p.name.endswith(".lease")]
+
+
+def test_full_runtime_bf16_disk_f32_preserves_disk_dtype(tiny, tmp_path, monkeypatch):
+    disk_model = copy.deepcopy(tiny).float()
+    runtime_model = copy.deepcopy(tiny).to(torch.bfloat16)
+    source = tmp_path / "source"; make_source(disk_model, source, dtype=torch.float32)
+    transforms, info = rebase.build_plan(
+        rules_for(runtime_model), lens(runtime_model), 1.0
+    )
+    source_state = load_file(str(next(source.glob("*.safetensors"))))
+    mapper = editing._disk_mapper(info["embed_key"], set(source_state))
+    transformed_key = mapper(next(iter(transforms)))
+    assert source_state[transformed_key].dtype == torch.float32
+    monkeypatch.setattr(editing, "EDITS_DIR", tmp_path / "edits")
+    result = editing.export_rebase(
+        rules_for(runtime_model), lens(runtime_model), {"dtype": "bf16"},
+        fmt="full", name="mixed-dtype", source_dir=source,
+    )
+    output = load_file(str(next(Path(result["out_dir"]).glob("*.safetensors"))))
+    assert output[transformed_key].dtype == torch.float32
+
+
+def test_full_packed_reader_rejects_same_rank_leading_shape(tiny, tmp_path, monkeypatch):
+    model = copy.deepcopy(tiny).float(); source = tmp_path / "source"
+    make_source(model, source)
+    shard = next(source.glob("*.safetensors")); state = load_file(str(shard))
+    transforms, info = rebase.build_plan(rules_for(model), lens(model), 1.0)
+    mapper = editing._disk_mapper(info["embed_key"], set(state))
+    memory_key = next(key for key in transforms if "experts.gate_up_proj" in key)
+    key = mapper(memory_key); original = state[key]
+    state[key] = torch.zeros(original.shape[0] + 1, *original.shape[1:], dtype=original.dtype)
+    save_file(state, str(shard)); source_bytes = shard.read_bytes()
+    monkeypatch.setattr(editing, "EDITS_DIR", tmp_path / "edits")
+    with pytest.raises(ValueError, match="source shape"):
+        editing.export_rebase(rules_for(model), lens(model), {"dtype": "fp32"},
+                              fmt="full", name="packed-corrupt", source_dir=source)
+    assert shard.read_bytes() == source_bytes
+    assert not (editing.EDITS_DIR / "packed-corrupt").exists()
+
+
+def _dense_export_case():
+    jl = dense_lens(); direction = torch.randn(8); direction /= direction.norm()
+    rules = [{"id": 1, "token_id": 1, "token": "x", "mode": "scale", "factor": 0.5,
+              "replacement_id": None, "replacement": None, "layers": [0],
+              "dirs_a": {0: direction}, "dirs_b": None}]
+    return jl, rules
+
+
+@pytest.mark.parametrize("case", ["exact_writer", "explicit_head"])
+def test_full_dense_source_contract_rejects_writer_or_explicit_head(
+        case, tmp_path, monkeypatch):
+    jl, rules = _dense_export_case(); source = tmp_path / "source"; source.mkdir()
+    state = {k: v.detach().clone() for k, v in jl._hf_model.state_dict().items()}
+    transforms, _ = rebase.build_plan(rules, jl, 1.0, exact=case == "exact_writer")
+    if case == "exact_writer":
+        key = next(key for key, entry in transforms.items() if entry[0] == "write")
+        value = state[key]
+        state[key] = torch.zeros(value.shape[0], value.shape[1] + 1)
+    else:
+        value = state["lm_head.weight"]
+        state["lm_head.weight"] = torch.zeros(value.shape[0] + 1, value.shape[1])
+    shard = source / "model.safetensors"; save_file(state, str(shard))
+    (source / "config.json").write_text("{}")
+    source_bytes = shard.read_bytes()
+    monkeypatch.setattr(editing, "EDITS_DIR", tmp_path / "edits")
+    with pytest.raises(ValueError, match="source shape"):
+        editing.export_rebase(rules, jl, {"dtype": "fp32"}, fmt="full",
+                              name=case, source_dir=source,
+                              exact=case == "exact_writer")
+    assert shard.read_bytes() == source_bytes
+    assert not (editing.EDITS_DIR / case).exists()
+
+
+def test_full_export_revalidates_source_replaced_after_header_preflight(
+        tiny, tmp_path, monkeypatch):
+    model = copy.deepcopy(tiny).float(); source = tmp_path / "source"
+    make_source(model, source)
+    shard = next(source.glob("*.safetensors")); valid = load_file(str(shard))
+    transforms, info = rebase.build_plan(rules_for(model), lens(model), 1.0)
+    mapper = editing._disk_mapper(info["embed_key"], set(valid))
+    target = mapper(next(key for key in transforms if key != info["lm_head_key"]))
+    original_open = editing.safe_open; replaced = []
+
+    class OpenProxy:
+        def __init__(self, path, framework):
+            self.path = Path(path); self.inner = original_open(path, framework=framework)
+            self.handle = None; self.saw_header = False
+        def __enter__(self):
+            self.handle = self.inner.__enter__(); return self
+        def __exit__(self, *args):
+            result = self.inner.__exit__(*args)
+            if self.saw_header and not replaced:
+                corrupted = dict(valid)
+                corrupted[target] = corrupted[target].reshape(-1)
+                save_file(corrupted, str(shard)); replaced.append(True)
+            return result
+        def keys(self): return self.handle.keys()
+        def get_tensor(self, key): return self.handle.get_tensor(key)
+        def get_slice(self, key):
+            if key == target and not replaced: self.saw_header = True
+            return self.handle.get_slice(key)
+
+    monkeypatch.setattr(editing, "safe_open",
+                        lambda path, framework="pt": OpenProxy(path, framework))
+    monkeypatch.setattr(editing, "EDITS_DIR", tmp_path / "edits")
+    with pytest.raises(ValueError, match="source shape"):
+        editing.export_rebase(rules_for(model), lens(model), {"dtype": "fp32"},
+                              fmt="full", name="mutated-after-header", source_dir=source)
+    assert replaced == [True]
+    assert not (editing.EDITS_DIR / "mutated-after-header").exists()
+
+
 def test_packed_export_rejections_are_early_and_clean(tiny, tmp_path, monkeypatch):
     monkeypatch.setattr(editing, "EDITS_DIR", tmp_path); jl = lens(tiny); rules = rules_for(tiny)
     def forbidden(): raise AssertionError("full state traversal occurred")

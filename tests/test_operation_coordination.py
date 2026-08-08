@@ -532,6 +532,75 @@ def test_normal_export_preflight_propagates_recorded_revision(monkeypatch, tmp_p
     assert calls == [("owner/model", "snapshot-sha")]
 
 
+@pytest.mark.parametrize("mode", ["cancel", "stale"])
+def test_production_export_builder_rejects_cancelled_or_stale_late_publication(
+        mode, monkeypatch, tmp_path):
+    from api import app
+
+    coordinator = ModelSessionCoordinator()
+    monkeypatch.setattr(app.manager, "coordinator", coordinator)
+    stage = tmp_path / "stage"; final = tmp_path / "final"
+    ready = threading.Event(); release = threading.Event(); received = []
+
+    def fake_export(*_args, publication_guard=None, **_kwargs):
+        received.append(publication_guard)
+        stage.write_text("staged")
+        ready.set()
+        try:
+            assert release.wait(2)
+            publication_guard.publish(lambda: stage.replace(final))
+        finally:
+            stage.unlink(missing_ok=True)
+
+    monkeypatch.setattr(app.editing, "export_rebase", fake_export)
+    monkeypatch.setattr(
+        app, "_export_preflight_resource",
+        lambda *_a, **_k: app._route_value(app.PreparedWorkerPayload({
+            "bundle": SimpleNamespace(jl=object()), "meta": {}, "rules": [],
+            "source_dir": str(tmp_path), "scale": 1.0, "kwargs": {},
+            "export_fn": app.editing.export_rebase,
+        })),
+    )
+
+    async def scenario():
+        handoff = app.OperationHandoff(coordinator, stop_event=threading.Event())
+        old, _ = handoff.acquire(OperationType.EXPORT)
+        setup = await app._prepare_export_handoff(
+            handoff, SimpleNamespace(format="full", name="x")
+        )
+        waiter = asyncio.create_task(app._await_transferred_worker(
+            setup.task, setup.dispatch, on_cancel=setup.gate.cancel,
+        ))
+        assert await asyncio.to_thread(ready.wait, 2)
+        successor = None
+        try:
+            if mode == "cancel":
+                waiter.cancel()
+                while setup.gate.state == "pending":
+                    await asyncio.sleep(0)
+            else:
+                assert coordinator.release(old)
+                successor, _ = coordinator.acquire(
+                    OperationType.UNLOAD, include_bundle=False
+                )
+        finally:
+            release.set()
+        if mode == "cancel":
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+            assert coordinator.status_snapshot().operation is None
+        else:
+            outcome = await waiter
+            assert outcome.http_status == 409
+            assert coordinator.is_current(successor)
+            assert coordinator.release(successor)
+        assert received == [setup.gate]
+        assert setup.gate.state == "cancelled-before-publication"
+
+    asyncio.run(scenario())
+    assert not final.exists() and not stage.exists()
+
+
 def test_dispatch_payload_cleared_on_cancellation_before_claim():
     import weakref
     from core.model_session import WorkerDispatch

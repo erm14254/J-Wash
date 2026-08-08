@@ -348,12 +348,24 @@ def _deferred_threads(monkeypatch, app):
             finally:
                 self.finished = True
         def join(self, timeout=None):
-            if self.started and not self.finished:
-                self.run()
+            return None
         def is_alive(self):
+            return False
+        @property
+        def incomplete(self):
             return self.started and not self.finished
     monkeypatch.setattr(app, "threading", SimpleNamespace(Thread=DeferredThread))
     return pending
+
+
+def _track_test_worker(app, worker, *release_callbacks):
+    tracked = getattr(app, "_gguf_test_workers", None)
+    if tracked is None:
+        tracked = []
+        app._gguf_test_workers = tracked
+    worker._jwash_release_callbacks = tuple(release_callbacks)
+    tracked.append(worker)
+    return worker
 
 
 def make_hardlinked_indexed_source(model, path):

@@ -136,6 +136,51 @@ def test_api_gguf_maps_generic_export_error_to_500(tmp_path, monkeypatch):
     assert exc.value.status_code == 500 and exc.value.detail == "disk failed"
 
 
+def test_production_fresh_gguf_builder_caller_cancel_rejects_late_cache_publish(
+        tmp_path, monkeypatch):
+    import api.app as app
+
+    edits = tmp_path / "edits"; monkeypatch.setattr(app.editing, "EDITS_DIR", edits)
+    monkeypatch.setattr(app, "_llamacpp_paths", lambda: (tmp_path / "convert.py", None, None))
+    monkeypatch.setattr(app, "resolve_local_dir",
+                        lambda _model, *, revision=None: str(tmp_path / "source"))
+    _mock_loaded_readthrough(app, monkeypatch)
+    ready = __import__("threading").Event(); release = __import__("threading").Event()
+    stage = edits / "job" / ".hf.test-stage"; final = edits / "job" / "hf"
+    received = []
+    def fake_export(*_args, publication_guard=None, **_kwargs):
+        received.append(publication_guard)
+        stage.mkdir(parents=True); (stage / "config.json").write_text("{}")
+        ready.set()
+        try:
+            assert release.wait(2)
+            publication_guard.publish(lambda: stage.replace(final))
+        finally:
+            import shutil
+            shutil.rmtree(stage, ignore_errors=True)
+    monkeypatch.setattr(app.editing, "export_rebase", fake_export)
+
+    async def scenario():
+        task = asyncio.create_task(app.api_edit_export_gguf(
+            SimpleNamespace(name="job", gguf_type="bf16")
+        ))
+        assert await asyncio.to_thread(ready.wait, 2)
+        try:
+            task.cancel()
+            while received[0].state == "pending":
+                await asyncio.sleep(0)
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert received and received[0].state == "cancelled-before-publication"
+    assert not final.exists() and not stage.exists()
+    assert app.manager.coordinator.status_snapshot().operation is None
+    assert app._gguf_owner is None
+
+
 def test_fresh_gguf_bake_requires_capability_profile(tmp_path, monkeypatch):
     import api.app as app
     monkeypatch.setattr(app.editing, "EDITS_DIR", tmp_path / "edits")
@@ -569,7 +614,8 @@ def test_simultaneous_gguf_reservation_has_exactly_one_owner(same_name):
         except Exception as exc:
             results.append(("lost", exc))
     names = ("job", "job" if same_name else "other")
-    threads = [threading.Thread(target=reserve, args=(name,)) for name in names]
+    threads = [_track_test_worker(app, threading.Thread(target=reserve, args=(name,)))
+               for name in names]
     for thread in threads: thread.start()
     barrier.wait(timeout=2)
     for thread in threads:
@@ -663,17 +709,20 @@ def test_stale_converter_completion_cannot_publish_or_mutate_successor(tmp_path,
     monkeypatch.setattr(subprocess, "run", blocked_run)
     job_dir = tmp_path / "old"; hf_dir = job_dir / "hf"; hf_dir.mkdir(parents=True)
     old = app._reserve_gguf_job("old")
-    worker = threading.Thread(
+    worker = _track_test_worker(app, threading.Thread(
         target=app._gguf_worker,
         args=(old, "old", job_dir, "old", "bf16", hf_dir,
               tmp_path / "convert.py", None, None),
-    )
-    worker.start()
-    assert entered.wait(2)
-    assert app._finish_gguf_job(old, error="superseded")
-    successor = app._reserve_gguf_job("successor")
-    before = app._gguf_state_snapshot()
-    release.set(); worker.join(2)
+    ), release.set)
+    successor = None
+    try:
+        worker.start()
+        assert entered.wait(2)
+        assert app._finish_gguf_job(old, error="superseded")
+        successor = app._reserve_gguf_job("successor")
+        before = app._gguf_state_snapshot()
+    finally:
+        release.set(); worker.join(2)
     assert not worker.is_alive()
     assert not (job_dir / "old-bf16.gguf").exists()
     assert not list(job_dir.glob(".*.tmp-*.gguf"))
@@ -715,3 +764,88 @@ def test_cache_delete_blocks_nested_export_evidence(evidence, tmp_path, monkeypa
     )
     assert response.status_code == 409 and cache.exists()
     assert app._gguf_delete_claim is None
+
+
+def test_held_delete_claim_blocks_job_and_second_delete(tmp_path, monkeypatch):
+    import shutil
+    import threading
+    import api.app as app
+
+    cache = tmp_path / "edits" / "job" / "hf"
+    cache.mkdir(parents=True); (cache / "config.json").write_text("{}")
+    monkeypatch.setattr(app.editing, "EDITS_DIR", tmp_path / "edits")
+    entered = threading.Event(); release = threading.Event(); results = []
+    original = shutil.rmtree
+    def blocked(path):
+        entered.set()
+        assert release.wait(2)
+        return original(path)
+    monkeypatch.setattr(shutil, "rmtree", blocked)
+    worker = _track_test_worker(
+        app,
+        threading.Thread(
+            target=lambda: results.append(app.api_gguf_cache_delete(
+                app.GGUFCacheRequest(name="job")
+            )),
+        ),
+        release.set,
+    )
+    try:
+        worker.start(); assert entered.wait(2)
+        claim = app._gguf_delete_claim
+        with pytest.raises(Exception, match="already in progress"):
+            app._reserve_gguf_job("blocked")
+        with pytest.raises(app.HTTPException) as raised:
+            app.api_gguf_cache_delete(app.GGUFCacheRequest(name="job"))
+        assert raised.value.status_code == 409
+        assert app._gguf_delete_claim == claim
+    finally:
+        release.set(); worker.join(2)
+    assert not worker.is_alive()
+    assert app._gguf_delete_claim is None and results
+
+
+@pytest.mark.parametrize("body", ["pass\n", "import pathlib, sys\npathlib.Path(sys.argv[2]).write_bytes(b'')\n"])
+def test_quantizer_success_rejects_missing_or_empty_output(body, tmp_path):
+    import api.app as app
+
+    job_dir = tmp_path / "job"; hf_dir = job_dir / "hf"; hf_dir.mkdir(parents=True)
+    base = job_dir / "job-bf16.gguf"; base.write_bytes(b"VALID-BASE")
+    quantize = make_python_cli_launcher(tmp_path, "llama-quantize", body)
+    token = app._reserve_gguf_job("job")
+    app._gguf_worker(token, "job", job_dir, "job", "q4_k_m", hf_dir,
+                     tmp_path / "unused.py", quantize, None)
+    assert app._gguf_owner is None and app._gguf_state["state"] == "error"
+    assert base.read_bytes() == b"VALID-BASE"
+    assert not (job_dir / "job-q4_k_m.gguf").exists()
+    assert not list(job_dir.glob(".*.tmp-*.gguf"))
+
+
+@pytest.mark.parametrize("kind", ["empty", "directory", "symlink"])
+def test_invalid_reused_base_quantized_skips_converter_and_quantizer(
+        kind, tmp_path):
+    import api.app as app
+
+    job_dir = tmp_path / "job"; hf_dir = job_dir / "hf"; hf_dir.mkdir(parents=True)
+    base = job_dir / "job-bf16.gguf"
+    if kind == "empty": base.write_bytes(b"")
+    elif kind == "directory": base.mkdir()
+    else:
+        target = tmp_path / "target.gguf"; target.write_bytes(b"target")
+        try: base.symlink_to(target)
+        except OSError: pytest.skip("symlinks unavailable")
+    convert_marker = tmp_path / "converter-called"
+    convert = tmp_path / "convert.py"
+    convert.write_text(f"import pathlib\npathlib.Path({str(convert_marker)!r}).write_text('called')\n")
+    quant_marker = tmp_path / "quantizer-called"
+    quantize = make_python_cli_launcher(
+        tmp_path, "llama-quantize",
+        f"import pathlib\npathlib.Path({str(quant_marker)!r}).write_text('called')\n",
+    )
+    token = app._reserve_gguf_job("job")
+    app._gguf_worker(token, "job", job_dir, "job", "q4_k_m", hf_dir,
+                     convert, quantize, None)
+    assert app._gguf_owner is None and app._gguf_state["state"] == "error"
+    assert base.exists() or base.is_symlink()
+    assert not convert_marker.exists() and not quant_marker.exists()
+    assert not (job_dir / "job-q4_k_m.gguf").exists()
