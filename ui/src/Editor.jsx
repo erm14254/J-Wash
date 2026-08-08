@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { fmtTok } from './tok'
 import { createEditorMutationState, isEditorMutationCancellation, throwIfEditorMutationCancelled } from './editorMutationState.js'
-import { selectedExportState, shouldOpenAdvanced } from './capabilityState.js'
+import { selectedExportState } from './capabilityState.js'
 
 // Default layer slice for a new rule, as fractions of the model's layer count
 // (aligned with core/ablation.py): 56 layers -> 33 to 44.
@@ -178,29 +178,23 @@ function ruleTitle(r) {
 
 // Four independent rows mirror the authoritative server decisions.
 function ModeSelector({ state, onChange }) {
-  const [advanced, setAdvanced] = useState(shouldOpenAdvanced(state.selectedMode))
-  useEffect(() => {
-    if (shouldOpenAdvanced(state.selectedMode)) setAdvanced(true)
-  }, [state.selectedMode])
   const rows = (ids) => ids.map((id) => {
     const item = state.modes[id]
     const info = MODE_INFO[id]
     const reasonId = `mode-${id}-reason`
     return <label key={id} className={`cap-row ${item.selected ? 'selected' : ''}`}>
       <input type="radio" name="intervention-mode" checked={item.selected}
-        disabled={!item.enabled} aria-describedby={!item.enabled ? reasonId : undefined}
+        disabled={!item.enabled} aria-describedby={reasonId}
         onChange={() => onChange(id)} />
       <span><strong>{info.label}</strong><span className="src">{info.subtitle}</span>
-        {!item.decision.supported && <span id={reasonId} className="cap-reason">{item.decision.reason}</span>}
+        {!item.decision.supported && <span id={reasonId} className="cap-advisory">⚠ Experimental: {item.decision.reason}</span>}
         {item.decision.supported && !item.enabled && <span id={reasonId} className="cap-local">Refreshing or another operation is in progress.</span>}
       </span>
     </label>
   })
   return (
     <div className="mode-selector" role="radiogroup" aria-label="intervention mode">
-      {rows(['standard', 'readthrough'])}
-      <button type="button" className="advanced-toggle" aria-expanded={advanced} onClick={() => setAdvanced(!advanced)}>Advanced {advanced ? '▾' : '▸'}</button>
-      {advanced && rows(['exact', 'abliteration'])}
+      {rows(['standard', 'readthrough', 'exact', 'abliteration'])}
     </div>
   )
 }
@@ -334,9 +328,9 @@ export default function Editor({
   }
 
   useEffect(() => {
-    if (capabilityState.valid) return
+    if (capabilityState.sessionReady) return
     resetPendingWrites()
-  }, [capabilityState.valid, capabilityState.sessionId])
+  }, [capabilityState.sessionReady, capabilityState.sessionId])
 
   useEffect(() => () => resetPendingWrites({ renew: false }), [])
 
@@ -774,7 +768,9 @@ export default function Editor({
                 <input type="radio" name="export-format" checked={exportFmt === id}
                   onChange={() => onExportFmtChange(id)} />
                 <span><strong>{label}</strong>
-                  <span className={item.serverEnabled ? 'cap-local' : 'cap-reason'}>Model/mode: {item.decision.reason}</span>
+                  <span className={item.decision.supported ? 'cap-local' : 'cap-advisory'}>
+                    {item.decision.supported ? 'Validated' : '⚠ Experimental'}: {item.decision.reason}
+                  </span>
                   {!item.local.ready && <span className="cap-local">Local: {item.local.reason}</span>}
                 </span>
               </label>

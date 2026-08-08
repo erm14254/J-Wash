@@ -128,6 +128,7 @@ button.danger { border-color: var(--danger); color: var(--danger); }
 .cap-row.selected { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
 .cap-row > span { display: flex; flex-direction: column; gap: 2px; }
 .cap-reason { color: var(--danger); font-size: 11px; }
+.cap-advisory { color: #c58b19; font-size: 11px; }
 .cap-local { color: var(--muted); font-size: 11px; }
 .mode-selector { display: flex; flex-direction: column; gap: 5px; }
 .advanced-toggle { align-self: flex-start; margin-top: 3px; }

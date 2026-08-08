@@ -1106,9 +1106,7 @@ def compute_abliteration(rules, jl, scale=1.0):
         as per-rule rank-1 factors (delta = B·A), exact, for the LoRA export.
         For the embed, delta = (B·A)ᵀ (PEFT lookup convention).
     """
-    from core.capabilities import ensure_unquantized, PUBLIC_REASONS
-    ensure_unquantized(jl)
-    raise ValueError(PUBLIC_REASONS["global_projection_unvalidated"])
+    raise ValueError("Global Projection computation is not safely implemented")
     # layers=[] = disabled rule, in this mode too (consistent with the preview)
     rules = [r for r in rules if r["layers"]]
     if not rules:
@@ -1199,15 +1197,17 @@ def _abliteration_warnings(rules):
     return warns
 
 
-def export_abliteration(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.0):
+def export_abliteration(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.0,
+                        publication_guard=None):
     """Pure-weight export (global abliteration). Formats: ``full`` (full
     checkpoint), ``layers`` (safetensors of only the modified matrices) and
     ``lora`` (exact PEFT adapter, rank = n_rules; embed omitted if embeddings
     are tied). Unties ``lm_head`` (full/layers) if the model has tied embeddings,
     to preserve the original un-embedding."""
-    from core.capabilities import ensure_unquantized, PUBLIC_REASONS
-    ensure_unquantized(jl, model_meta)
-    raise ValueError(PUBLIC_REASONS["global_projection_unvalidated"])
+    raise ValueError(
+        "Global Projection export is not safely implemented: transactional "
+        "publication and target verification are incomplete"
+    )
     parts = validate_export_name(name)
     name = "/".join(parts)
     out_dir = EDITS_DIR.joinpath(*parts)
@@ -1609,8 +1609,6 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
     rejected and never modified.  All construction occurs in a unique sibling
     staging directory which is removed on every failure.
     """
-    from core.capabilities import ensure_unquantized
-    ensure_unquantized(jl, model_meta)
     inventory = rebase.model_preflight(jl, exact=exact)
     if inventory.packed and fmt in ("layers", "lora"):
         raise ValueError(
@@ -1661,8 +1659,6 @@ def _export_rebase_impl(rules, jl, model_meta, *, fmt, name, source_dir=None,
     time, so tied embeddings need no untying). The bake is done streaming, one
     float32 CPU matrix at a time. Tied-embeddings model (full/layers): the embed
     stays INTACT, it's lm_head (untied) that receives the final read transform."""
-    from core.capabilities import ensure_unquantized
-    ensure_unquantized(jl, model_meta)
     method = "rebase-exact" if exact else "rebase-readthrough"
     if fmt not in ("full", "layers", "lora"):
         raise ValueError(f"unknown format for {method}: {fmt}")
@@ -1684,8 +1680,7 @@ def _export_rebase_impl_from_inventory(rules, jl, model_meta, *, fmt, name, sour
 
     # The cached fact drives API eligibility; repeat this cheap topology fact at
     # deep execution so direct callers with legacy metadata cannot bypass it.
-    packed_model = (bool(model_meta.get("has_packed_read_parameters"))
-                    or inventory.packed)
+    packed_model = inventory.packed
     packed = [target for target in info["targets"].values()
               if not target.lora_supported]
     if (packed_model or packed) and fmt == "lora":

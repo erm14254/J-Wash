@@ -24,7 +24,7 @@ from pydantic import BaseModel
 import config
 from core import editing, registry
 from core import capabilities
-from core.ablation import Interventions
+from core.ablation import Interventions, UnknownInterventionRule
 from core.neighbors import TokenNeighbors
 from core import fitting
 from core.fitting import FitManager
@@ -1490,7 +1490,6 @@ def _interventions_add_resource(token, snap, req):
         bundle = _bundle_from_snapshot_or_legacy(snap)
         if lens_manager.lens is None:
             return _route_http(422, "model and lens required")
-        capabilities.require(bundle.capability_profile, "modes", "standard", loaded=True)
         def mutate():
             return interventions.add(
                 lens_manager,
@@ -1544,10 +1543,6 @@ def _interventions_patch_resource(token, snap, rule_id, req, needs_dirs, effectf
         effectful_patch = needs_dirs
     if effectful_patch:
         bundle = _bundle_from_snapshot_or_legacy(snap)
-        try:
-            capabilities.require(bundle.capability_profile, "modes", "standard", loaded=True)
-        except ValueError as exc:
-            return _route_http(422, str(exc))
     try:
         def mutate():
             return interventions.update(
@@ -1563,8 +1558,10 @@ def _interventions_patch_resource(token, snap, rule_id, req, needs_dirs, effectf
             )
         rules, _ = _run_intervention_transaction(token, snap, mutate)
         return _route_value({"rules": list(rules or [])})
-    except ValueError as exc:
+    except UnknownInterventionRule as exc:
         return _route_http(404, str(exc))
+    except ValueError as exc:
+        return _route_http(422, str(exc))
     except HTTPException as exc:
         return _route_http(exc.status_code, exc.detail)
     except Exception as exc:
@@ -1579,12 +1576,17 @@ def api_interventions_scale(req: InterventionsScale):
     prior_mode = "standard"
     resulting_session_id = None
     try:
-        token, snap = manager.coordinator.acquire(OperationType.INTERVENTION_UPDATE)
+        token, snap = manager.coordinator.acquire(
+            OperationType.INTERVENTION_UPDATE,
+            requires_loaded=True if req.mode is not None else None,
+        )
         prior_mode = (_coordinated_interventions(snap) or {}).get("mode", "standard")
         resulting_session_id = snap.model_session_id
         outcome = _interventions_scale_resource(token, snap, req)
     except OperationConflict as exc:
         raise _conflict(exc)
+    except ModelStateError as exc:
+        raise HTTPException(422, str(exc))
     finally:
         snap = None
         if token is not None:
@@ -1597,9 +1599,6 @@ def api_interventions_scale(req: InterventionsScale):
 
 def _interventions_scale_resource(token, snap, req):
     try:
-        if req.mode is not None:
-            profile = snap.bundle.capability_profile if snap.bundle is not None else None
-            capabilities.require(profile, "modes", req.mode, loaded=snap.loaded)
         def mutate():
             return interventions.set_scale_and_mode(scale=req.scale, mode=req.mode)
         (scale, mode), _ = _run_intervention_transaction(token, snap, mutate)
@@ -1807,8 +1806,6 @@ def _presets_apply_resource(token, snap, preset):
         bundle = _bundle_from_snapshot_or_legacy(snap)
         if lens_manager.lens is None:
             return _route_http(422, "model and lens required")
-        capabilities.require(bundle.capability_profile, "modes", "standard", loaded=True)
-        capabilities.ensure_unquantized(bundle.jl, dict(bundle.meta))
         warnings = []
         if preset.get("model_id") and preset["model_id"] != bundle.meta["model_id"]:
             warnings.append(
@@ -1878,8 +1875,7 @@ def _make_export_worker(dispatch):
     def worker():
         def execute(payload):
             call_kwargs = dict(payload["kwargs"])
-            if payload["export_fn"] is editing.export_rebase:
-                call_kwargs["publication_guard"] = payload["publication_gate"]
+            call_kwargs["publication_guard"] = payload["publication_gate"]
             return payload["export_fn"](
                 payload["rules"], payload["bundle"].jl, payload["meta"],
                 fmt=payload["format"], name=payload["name"],
@@ -1957,8 +1953,6 @@ def _export_preflight_resource(snap, req):
             return _route_http(422, "no active intervention to export (rules disabled or without layers?)")
         source_dir = resolve_local_dir(meta["model_id"])
         scale, mode = intervention_snapshot["scale"], intervention_snapshot["mode"]
-        capabilities.ensure_unquantized(bundle.jl, meta)
-        capabilities.require(bundle.capability_profile, "exports", req.format, mode, loaded=True)
         kwargs = {}
         if mode in ("readthrough", "exact"):
             export_fn = editing.export_rebase
@@ -1998,8 +1992,6 @@ def _gguf_preflight_resource(snap):
         if not rules:
             return _route_http(422, "no active intervention to export")
         scale, mode = intervention_snapshot["scale"], intervention_snapshot["mode"]
-        capabilities.ensure_unquantized(bundle.jl, meta)
-        capabilities.require(bundle.capability_profile, "exports", "gguf", mode, loaded=True)
         if mode in ("readthrough", "exact"):
             export_fn, kwargs = editing.export_rebase, {"exact": mode == "exact"}
         elif mode == "abliteration":
@@ -2145,8 +2137,7 @@ def _make_gguf_bake_worker(dispatch):
     def worker():
         def execute(payload):
             call_kwargs = dict(payload["kwargs"])
-            if payload["export_fn"] is editing.export_rebase:
-                call_kwargs["publication_guard"] = payload["publication_gate"]
+            call_kwargs["publication_guard"] = payload["publication_gate"]
             return payload["export_fn"](
                 payload["rules"], payload["bundle"].jl, payload["meta"],
                 fmt="full", name=payload["name"], source_dir=payload["source_dir"],

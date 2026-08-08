@@ -737,13 +737,6 @@ class ModelManager:
         gen_id = None
         try:
             if ablator is not None:
-                if context is not None and (ablator_snapshot or {}).get("active_rules"):
-                    capabilities.require(
-                        context.capability_profile,
-                        "modes",
-                        (ablator_snapshot or {}).get("mode"),
-                        loaded=True,
-                    )
                 attachment = ablator.attach(jl, snapshot=ablator_snapshot)
             is_gpt_oss = "gpt-oss" in (meta or {}).get("model_id", "").lower()
             template_kwargs = {}

@@ -178,10 +178,10 @@ def test_mode_notification_is_exact_and_scale_or_rejection_emit_none(monkeypatch
     }
     assert events == [coordinator.status_snapshot().model_session_id]
 
-    with pytest.raises(app_module.HTTPException) as exc:
-        app_module.api_interventions_scale(SimpleNamespace(scale=None, mode="abliteration"))
-    assert exc.value.status_code == 422
-    assert events == [coordinator.status_snapshot().model_session_id]
+    assert app_module.api_interventions_scale(
+        SimpleNamespace(scale=None, mode="abliteration")
+    ) == {"scale": 2.0, "mode": "abliteration"}
+    assert events == [coordinator.status_snapshot().model_session_id] * 2
 
 
 class _SessionSequence:

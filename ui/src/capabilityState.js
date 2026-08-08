@@ -5,7 +5,7 @@ export const FALLBACK_DECISION = Object.freeze({
   source: 'client-fallback',
   supported: false,
   reason_code: null,
-  reason: 'Authoritative capability status is unavailable. Refresh and try again.',
+  reason: 'Capability diagnostics are unavailable; this operation has not been validated.',
 })
 
 function validDecision(value) {
@@ -22,48 +22,45 @@ export function activeRuleCount(rules) {
 }
 
 export function readCapabilityState(status, options = {}) {
-  const { fresh = true, llamaCppConfigured = false, lensAvailable = false,
+  const { fresh = true, llamaCppConfigured = null, lensAvailable = false,
     busy = false, rules = [], transitionPending = false } = options
   const caps = status?.capabilities
   const selectedMode = status?.interventions_mode
-  const structural = fresh && caps && MODE_IDS.includes(selectedMode)
-    && caps.exports?.mode === selectedMode
-    && MODE_IDS.every((id) => validDecision(caps.modes?.[id]))
-    && EXPORT_IDS.every((id) => validDecision(caps.exports?.[id]))
-  const valid = !!structural
+  const sessionReady = !!(fresh && status?.loaded && Number.isInteger(status?.model_session_id)
+    && MODE_IDS.includes(selectedMode))
+  const diagnosticsValid = !!(caps && MODE_IDS.every((id) => validDecision(caps.modes?.[id])))
+  const exportsSynchronized = !!(caps?.exports && caps.exports.mode === selectedMode
+    && EXPORT_IDS.every((id) => validDecision(caps.exports?.[id])))
+  const valid = diagnosticsValid && exportsSynchronized
   const blocked = busy || transitionPending
-  const decisions = valid ? caps : { modes: {}, exports: {} }
+  const decisions = caps || { modes: {}, exports: {} }
   const modes = Object.fromEntries(MODE_IDS.map((id) => {
-    const decision = valid ? decisions.modes[id] : FALLBACK_DECISION
-    return [id, { decision, enabled: valid && decision.supported && !blocked, selected: id === selectedMode }]
+    const decision = validDecision(decisions.modes?.[id]) ? decisions.modes[id] : FALLBACK_DECISION
+    return [id, { decision, enabled: sessionReady && !blocked, selected: id === selectedMode }]
   }))
-  const selectedDecision = valid ? decisions.modes[selectedMode] : FALLBACK_DECISION
-  const standardDecision = valid ? decisions.modes.standard : FALLBACK_DECISION
-  const editingEnabled = valid && standardDecision.supported && selectedDecision.supported
-    && lensAvailable && !blocked
+  const editingEnabled = sessionReady && lensAvailable && !blocked
   let localReason = null
-  if (valid && !lensAvailable) localReason = 'Load a lens to edit interventions.'
-  else if (valid && blocked) localReason = transitionPending
+  if (!sessionReady) localReason = 'Load a model and wait for fresh session status.'
+  else if (!lensAvailable) localReason = 'Load a lens to edit interventions.'
+  else if (blocked) localReason = transitionPending
     ? 'Refreshing authoritative capability status.' : 'Another operation is in progress.'
-  const blockingDecision = !valid ? FALLBACK_DECISION
-    : !standardDecision.supported ? standardDecision
-      : !selectedDecision.supported ? selectedDecision : null
   const active = activeRuleCount(rules)
   const formats = Object.fromEntries(EXPORT_IDS.map((id) => {
-    const decision = valid ? decisions.exports[id] : FALLBACK_DECISION
+    const decision = validDecision(decisions.exports?.[id]) ? decisions.exports[id] : FALLBACK_DECISION
     const reasons = []
     if (!active) reasons.push('Add at least one enabled rule with one or more layers.')
-    if (id === 'gguf' && !llamaCppConfigured) reasons.push('Configure llama.cpp in Options.')
+    if (id === 'gguf' && llamaCppConfigured === false) reasons.push('Configure llama.cpp in Options.')
+    if (!sessionReady) reasons.push('Load a model and wait for fresh session status.')
     if (blocked) reasons.push(transitionPending ? 'Refreshing authoritative capability status.' : 'Another operation is in progress.')
     const local = { ready: reasons.length === 0, reason: reasons.join(' ') || null }
-    const serverEnabled = valid && decision.supported === true
-    return [id, { decision, serverEnabled, local, enabled: serverEnabled && local.ready }]
+    return [id, { decision, diagnosticValidated: decision.supported === true,
+      local, enabled: sessionReady && local.ready }]
   }))
   const cleanup = !busy && !transitionPending
   return {
-    valid, sessionId: status?.model_session_id ?? null, selectedMode,
-    exportsSynchronized: valid, fallbackDecision: FALLBACK_DECISION, modes,
-    editing: { enabled: editingEnabled, blockingDecision, localReason }, formats,
+    valid, diagnosticsValid, sessionReady, sessionId: status?.model_session_id ?? null, selectedMode,
+    exportsSynchronized, fallbackDecision: FALLBACK_DECISION, modes,
+    editing: { enabled: editingEnabled, localReason }, formats,
     actions: {
       changeScale: editingEnabled, addRule: editingEnabled,
       changeRuleDirections: editingEnabled, changeFactor: editingEnabled,
@@ -81,8 +78,4 @@ export function isCapabilityRefreshEvent(message) {
 
 export function selectedExportState(capabilityState, exportId) {
   return { id: exportId, ...capabilityState.formats[exportId] }
-}
-
-export function shouldOpenAdvanced(selectedMode) {
-  return selectedMode === 'exact' || selectedMode === 'abliteration'
 }
