@@ -435,6 +435,76 @@ def test_publication_gate_rename_wins_before_cancellation():
     assert gate.state == "published"
 
 
+def test_handoff_publication_current_owner_is_exactly_once(tmp_path):
+    from api import app
+
+    coordinator = ModelSessionCoordinator()
+    handoff = app.OperationHandoff(coordinator, stop_event=threading.Event())
+    token, _ = handoff.acquire(OperationType.EXPORT)
+    gate = PublicationGate(
+        lambda owner=token, coordinator=handoff.coordinator:
+        coordinator.can_publish(owner)
+    )
+    stage = tmp_path / "stage"; final = tmp_path / "final"
+    stage.write_text("complete")
+    gate.publish(lambda: stage.replace(final))
+    second = []
+    with pytest.raises(PublicationCancelled):
+        gate.publish(lambda: second.append(True))
+    assert final.read_text() == "complete" and not stage.exists()
+    assert second == [] and gate.state == "published"
+    assert coordinator.release(token)
+
+
+def test_handoff_publication_cancelled_owner_never_renames(tmp_path):
+    from api import app
+
+    coordinator = ModelSessionCoordinator()
+    handoff = app.OperationHandoff(coordinator, stop_event=threading.Event())
+    token, _ = handoff.acquire(OperationType.EXPORT)
+    gate = PublicationGate(
+        lambda owner=token, coordinator=handoff.coordinator:
+        coordinator.can_publish(owner)
+    )
+    stage = tmp_path / "stage"; final = tmp_path / "final"
+    stage.write_text("partial")
+    assert gate.cancel()
+    with pytest.raises(PublicationCancelled):
+        gate.publish(lambda: stage.replace(final))
+    stage.unlink()
+    assert not final.exists() and gate.state == "cancelled-before-publication"
+    assert coordinator.release(token)
+
+
+def test_handoff_stale_late_publication_cannot_disturb_successor(tmp_path):
+    from api import app
+
+    coordinator = ModelSessionCoordinator()
+    handoff = app.OperationHandoff(coordinator, stop_event=threading.Event())
+    old, _ = handoff.acquire(OperationType.EXPORT)
+    gate = PublicationGate(
+        lambda owner=old, coordinator=handoff.coordinator:
+        coordinator.can_publish(owner)
+    )
+    assert coordinator.release(old)
+    successor, _ = coordinator.acquire(OperationType.UNLOAD, include_bundle=False)
+    stage = tmp_path / "late"; final = tmp_path / "final"
+    stage.write_text("late")
+    with pytest.raises(PublicationCancelled):
+        gate.publish(lambda: stage.replace(final))
+    stage.unlink()
+    assert not final.exists() and coordinator.is_current(successor)
+    assert not coordinator.release(old)
+    assert coordinator.is_current(successor)
+    assert coordinator.release(successor)
+
+
+def test_publication_cancelled_worker_failure_is_http_409():
+    from api import app
+    outcome = app._worker_failure(PublicationCancelled("stale publication"))
+    assert outcome.http_status == 409
+
+
 def test_dispatch_payload_cleared_on_cancellation_before_claim():
     import weakref
     from core.model_session import WorkerDispatch

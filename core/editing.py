@@ -1317,8 +1317,7 @@ def export_abliteration(rules, jl, model_meta, *, fmt, name, source_dir=None, sc
             raise ValueError("full checkpoint: no safetensors in the source")
 
         lm_head_value = None  # original un-embedding (if tied) = original embed from disk
-        embed_shard_name = (source_index["weight_map"].get(embed_key)
-                            if source_index is not None else None)
+        embed_shard_name = None
         seen = set()
         for shard in shards:
             ino = shard.stat().st_ino
@@ -1538,7 +1537,7 @@ def _safe_relative_parts(name):
     return validate_export_name(name)
 
 
-def apply_transform_bounded(entry, tensor, *, spec=None, disk_key=None,
+def apply_transform_bounded(entry, tensor, *, spec, disk_key=None,
                             row_budget=REBASE_EXPORT_ROW_BUDGET, observer=None):
     """Apply a read transform with bounded float32 row temporaries.
 
@@ -1546,25 +1545,46 @@ def apply_transform_bounded(entry, tensor, *, spec=None, disk_key=None,
     transforms are ordinary dense matrices and retain the established path.
     """
     label = disk_key or getattr(spec, "memory_key", "<tensor>")
+    if not isinstance(tensor, torch.Tensor):
+        raise ValueError(f"{label}: transformed source must be a torch.Tensor")
+    if not isinstance(spec, rebase.SourceTensorSpec):
+        raise ValueError(f"{label}: a valid SourceTensorSpec is required")
     if not isinstance(entry, (tuple, list)) or len(entry) != 3:
         raise ValueError(f"{label}: malformed transform entry")
     kind, X, Y = entry
     if kind not in ("read", "write"):
         raise ValueError(f"{label}: unknown transform kind {kind!r}")
-    if spec is not None:
-        if spec.transform_kind != kind:
-            raise ValueError(f"{label}: transform role {kind!r} conflicts with {spec.site} spec")
-        if tuple(tensor.shape) != tuple(spec.shape):
-            raise ValueError(
-                f"{label}: source shape {tuple(tensor.shape)} does not match validated shape {tuple(spec.shape)}"
-            )
+    valid_sites = {"reader": "read", "final_head": "read", "writer": "write"}
+    if spec.site not in valid_sites:
+        raise ValueError(f"{label}: unknown source spec site {spec.site!r}")
+    if spec.transform_kind != kind or valid_sites[spec.site] != kind:
+        raise ValueError(f"{label}: transform role {kind!r} conflicts with {spec.site} spec")
+    if not isinstance(spec.shape, tuple) or not spec.shape:
+        raise ValueError(f"{label}: source spec shape must be a nonempty tuple")
+    rank = len(spec.shape)
+    axis = spec.residual_axis + rank if spec.residual_axis < 0 else spec.residual_axis
+    if axis < 0 or axis >= rank:
+        raise ValueError(f"{label}: source spec residual axis is out of range")
+    expected_axis = rank - 1 if kind == "read" else 0
+    if axis != expected_axis:
+        raise ValueError(f"{label}: source spec residual axis conflicts with {kind} orientation")
+    if tensor.ndim != rank or tuple(tensor.shape) != spec.shape:
+        raise ValueError(
+            f"{label}: source shape {tuple(tensor.shape)} does not match validated shape {spec.shape}"
+        )
     if tensor.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
         raise ValueError(f"{label}: transformed source dtype {tensor.dtype} is not supported")
-    if not isinstance(X, torch.Tensor) or not isinstance(Y, torch.Tensor) or X.ndim != 2 or Y.ndim != 2:
-        raise ValueError(f"{label}: transform X and Y must both be rank-2")
+    if not isinstance(X, torch.Tensor):
+        raise ValueError(f"{label}: transform X must be a tensor")
+    if not isinstance(Y, torch.Tensor):
+        raise ValueError(f"{label}: transform Y must be a tensor")
+    if X.ndim != 2:
+        raise ValueError(f"{label}: transform X must be rank-2")
+    if Y.ndim != 2:
+        raise ValueError(f"{label}: transform Y must be rank-2")
     if X.shape[1] != Y.shape[1]:
         raise ValueError(f"{label}: transform X/Y low-rank dimensions disagree")
-    residual = tensor.shape[-1] if kind == "read" else tensor.shape[0]
+    residual = spec.shape[axis]
     if X.shape[0] != residual or Y.shape[0] != residual:
         raise ValueError(f"{label}: transform residual dimensions do not match source orientation")
     original_shape, original_dtype = tuple(tensor.shape), tensor.dtype
@@ -1873,22 +1893,60 @@ def _export_rebase_impl_from_inventory(rules, jl, model_meta, *, fmt, name, sour
                 f"{len(missing_source)} parameter(s) to transform absent from the source "
                 f"checkpoint (e.g. {sample}) — export cancelled before writing"
             )
-        # Metadata-only structural preflight for active physical sources.  The
-        # payload boundary repeats this check to protect mutable local sources.
+        # Metadata-only structural preflight for every active physical source.
+        # For a tied checkpoint without a disk head, the embedding is the
+        # explicit physical source of the logical head transform.
+        tied_fallback = info["tied"] and lm_head_key not in disk_keys
+        tied_owner = None
+        if tied_fallback:
+            if embed_key not in disk_keys:
+                raise ValueError("cannot untie: embed not found in the source")
+            if source_index is not None:
+                tied_owner = source_index["weight_map"].get(embed_key)
+                if tied_owner is None:
+                    raise ValueError("cannot untie: index does not own the embedding source")
+            else:
+                owners = []
+                for shard in shards:
+                    with safe_open(str(shard), framework="pt") as f:
+                        if embed_key in f.keys():
+                            owners.append(shard.name)
+                if len(owners) != 1:
+                    raise ValueError(
+                        f"cannot untie: embedding source ownership is ambiguous ({len(owners)} shards)"
+                    )
+                tied_owner = owners[0]
+
+        def validate_source_header(shard, physical_key, spec, logical_key):
+            with safe_open(str(shard), framework="pt") as f:
+                if physical_key not in f.keys():
+                    raise ValueError(
+                        f"{logical_key}: physical source {physical_key!r} is absent from {shard.name}"
+                    )
+                tensor_slice = f.get_slice(physical_key)
+                if tuple(tensor_slice.get_shape()) != tuple(spec.shape):
+                    raise ValueError(
+                        f"{physical_key}: source shape {tuple(tensor_slice.get_shape())} "
+                        f"does not match validated shape {tuple(spec.shape)}"
+                    )
+                if tensor_slice.get_dtype() not in {"F16", "BF16", "F32", "F64"}:
+                    raise ValueError(
+                        f"{physical_key}: transformed source dtype "
+                        f"{tensor_slice.get_dtype()} is not supported"
+                    )
+
         for shard in shards:
             with safe_open(str(shard), framework="pt") as f:
-                for key in set(f.keys()) & set(transforms):
-                    tensor_slice = f.get_slice(key)
-                    spec = source_specs[key]
-                    if tuple(tensor_slice.get_shape()) != tuple(spec.shape):
-                        raise ValueError(
-                            f"{key}: source shape {tuple(tensor_slice.get_shape())} "
-                            f"does not match validated shape {tuple(spec.shape)}"
-                        )
-                    if tensor_slice.get_dtype() not in {"F16", "BF16", "F32", "F64"}:
-                        raise ValueError(
-                            f"{key}: transformed source dtype {tensor_slice.get_dtype()} is not supported"
-                        )
+                direct_keys = set(f.keys()) & set(transforms)
+            for key in direct_keys:
+                validate_source_header(shard, key, source_specs[key], key)
+        if tied_fallback:
+            owner_path = next((shard for shard in shards if shard.name == tied_owner), None)
+            if owner_path is None:
+                raise ValueError(f"cannot untie: embedding owner shard {tied_owner!r} is absent")
+            validate_source_header(
+                owner_path, embed_key, source_specs[lm_head_key], lm_head_key
+            )
         if any(key.startswith("mtp.") for key in disk_keys):
             warnings.append(
                 "MTP weights were preserved but not transformed. Ordinary Transformers "
@@ -1897,8 +1955,7 @@ def _export_rebase_impl_from_inventory(rules, jl, model_meta, *, fmt, name, sour
             )
 
         lm_head_written = False
-        embed_shard_name = (source_index["weight_map"].get(embed_key)
-                            if source_index is not None else None)
+        embed_shard_name = tied_owner if tied_fallback else None
         if (source_index is not None and info["tied"]
                 and lm_head_key not in disk_keys):
             if embed_shard_name is None:

@@ -327,14 +327,31 @@ def _gguf_test_tools(tmp_path):
 
 def _deferred_threads(monkeypatch, app):
     pending = []
+    tracked = getattr(app, "_gguf_test_workers", None)
+    if tracked is None:
+        tracked = []
+        monkeypatch.setattr(app, "_gguf_test_workers", tracked, raising=False)
     class DeferredThread:
         def __init__(self, *, target, args, daemon):
             self.target, self.args, self.daemon = target, args, daemon
+            self.started = self.finished = False
             pending.append(self)
+            tracked.append(self)
         def start(self):
-            pass
+            self.started = True
         def run(self):
-            self.target(*self.args)
+            if self.finished:
+                return
+            self.started = True
+            try:
+                self.target(*self.args)
+            finally:
+                self.finished = True
+        def join(self, timeout=None):
+            if self.started and not self.finished:
+                self.run()
+        def is_alive(self):
+            return self.started and not self.finished
     monkeypatch.setattr(app, "threading", SimpleNamespace(Thread=DeferredThread))
     return pending
 

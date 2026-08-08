@@ -160,3 +160,48 @@ def test_transaction_rolls_back_index_write_failure(tmp_path, monkeypatch):
         path for path in editing.EDITS_DIR.glob(".index-failure.tmp-*")
         if not path.name.endswith(".lease")
     ]
+
+
+@pytest.mark.parametrize("indexed", [False, True])
+@pytest.mark.parametrize("corruption", ["rank", "shape", "integer"])
+def test_tied_embedding_source_contract_fails_before_first_staged_save(
+        indexed, corruption, tmp_path, monkeypatch):
+    jl = dense_lens(); jl._lm_head.weight = jl._embed_tokens.weight
+    jl._hf_model.config = SimpleNamespace(tie_word_embeddings=True)
+    direction = torch.randn(8); direction /= direction.norm()
+    rules = [{"id": 1, "token_id": 1, "token": "x", "mode": "scale", "factor": 0.5,
+              "replacement_id": None, "replacement": None, "layers": [0],
+              "dirs_a": {0: direction}, "dirs_b": None}]
+    source = tmp_path / "source"; source.mkdir()
+    state = {k: v.detach().clone() for k, v in jl._hf_model.state_dict().items()
+             if k != "lm_head.weight"}
+    embed_key = jl.layout.path + ".embed_tokens.weight"
+    embed = state[embed_key]
+    if corruption == "rank":
+        state[embed_key] = embed.reshape(-1)
+    elif corruption == "shape":
+        state[embed_key] = embed.reshape(2, -1)
+    else:
+        state[embed_key] = embed.to(torch.int32)
+    shard = source / "model.safetensors"; save_file(state, str(shard))
+    (source / "config.json").write_text(json.dumps({"tie_word_embeddings": True}))
+    if indexed:
+        total = sum(value.numel() * value.element_size() for value in state.values())
+        (source / "model.safetensors.index.json").write_text(json.dumps({
+            "metadata": {"total_size": total},
+            "weight_map": {key: shard.name for key in state},
+        }))
+    source_bytes = shard.read_bytes()
+    writes = []
+    original_save = editing.save_file
+    monkeypatch.setattr(editing, "save_file",
+                        lambda *args, **kwargs: writes.append(args[1]) or original_save(*args, **kwargs))
+    monkeypatch.setattr(editing, "EDITS_DIR", tmp_path / "edits")
+    with pytest.raises(ValueError, match="source shape|dtype"):
+        editing.export_rebase(rules, jl, {"dtype": "bf16"}, fmt="full",
+                              name="tied-corrupt", source_dir=source)
+    assert writes == []
+    assert shard.read_bytes() == source_bytes
+    assert not (editing.EDITS_DIR / "tied-corrupt").exists()
+    assert not [p for p in editing.EDITS_DIR.glob(".tied-corrupt.tmp-*")
+                if not p.name.endswith(".lease")]

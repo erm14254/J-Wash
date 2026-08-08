@@ -21,11 +21,85 @@ def test_bounded_read_transform_matches_math(shape, budget):
     torch.manual_seed(4); source = torch.randn(*shape, dtype=torch.bfloat16)
     U, V = torch.randn(8, 3), torch.randn(8, 3); seen = []
     got, delta = editing.apply_transform_bounded(
-        ("read", U, V), source, row_budget=budget, observer=seen.append)
+        ("read", U, V), source,
+        spec=rebase.SourceTensorSpec("reader", shape, "read", -1, "reader"),
+        disk_key="reader", row_budget=budget, observer=seen.append)
     expected = rebase.apply_read(source.float(), U, V)[0].to(source.dtype)
     assert torch.equal(got, expected)
     assert got.shape == source.shape and got.dtype == source.dtype
     assert seen and max(seen) <= budget and delta > 0
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64])
+@pytest.mark.parametrize("site", ["reader", "final_head"])
+def test_transform_contract_valid_read_dtypes_and_sites(dtype, site):
+    source = torch.randn(3, 8, dtype=dtype)
+    X, Y = torch.randn(8, 2), torch.randn(8, 2)
+    spec = rebase.SourceTensorSpec("disk.read", (3, 8), "read", -1, site)
+    result, _ = editing.apply_transform_bounded(
+        ("read", X, Y), source, spec=spec, disk_key="disk.read"
+    )
+    assert result.shape == source.shape and result.dtype == source.dtype
+
+
+def test_transform_contract_valid_write():
+    source = torch.randn(8, 5)
+    spec = rebase.SourceTensorSpec("disk.write", (8, 5), "write", 0, "writer")
+    result, _ = editing.apply_transform_bounded(
+        ("write", torch.randn(8, 2), torch.randn(8, 2)), source,
+        spec=spec, disk_key="disk.write",
+    )
+    assert result.shape == source.shape and result.dtype == source.dtype
+
+
+@pytest.mark.parametrize(
+    ("entry", "source", "spec", "message"),
+    [
+        (("read", torch.randn(8, 2), torch.randn(8, 2)), object(),
+         rebase.SourceTensorSpec("k", (2, 8), "read", -1, "reader"), "torch.Tensor"),
+        (("read", torch.randn(8, 2), torch.randn(8, 2)), torch.randn(2, 8), None,
+         "SourceTensorSpec"),
+        (("read", torch.randn(8, 2)), torch.randn(2, 8),
+         rebase.SourceTensorSpec("k", (2, 8), "read", -1, "reader"), "malformed"),
+        (("unknown", torch.randn(8, 2), torch.randn(8, 2)), torch.randn(2, 8),
+         rebase.SourceTensorSpec("k", (2, 8), "read", -1, "reader"), "unknown"),
+        (("write", torch.randn(8, 2), torch.randn(8, 2)), torch.randn(2, 8),
+         rebase.SourceTensorSpec("k", (2, 8), "read", -1, "reader"), "conflicts"),
+        (("read", torch.randn(8, 2), torch.randn(8, 2)), torch.randn(4, 4),
+         rebase.SourceTensorSpec("k", (2, 8), "read", -1, "reader"), "source shape"),
+        (("read", torch.randn(8, 2), torch.randn(8, 2)), torch.randn(1, 2, 8),
+         rebase.SourceTensorSpec("k", (2, 8), "read", -1, "reader"), "source shape"),
+        (("read", torch.randn(8, 2), torch.randn(8, 2)), torch.randn(2, 7),
+         rebase.SourceTensorSpec("k", (2, 8), "read", -1, "reader"), "source shape"),
+        (("write", torch.randn(8, 2), torch.randn(8, 2)), torch.randn(8, 4),
+         rebase.SourceTensorSpec("k", (8, 5), "write", 0, "writer"), "source shape"),
+        (("read", torch.randn(8, 2), torch.randn(8, 2)), torch.randn(2, 8),
+         rebase.SourceTensorSpec("k", (2, 8), "read", 0, "reader"), "axis"),
+        (("read", torch.randn(8, 2), torch.randn(8, 2)), torch.randn(2, 8),
+         rebase.SourceTensorSpec("k", (2, 8), "read", -1, "writer"), "conflicts"),
+        (("read", "x", torch.randn(8, 2)), torch.randn(2, 8),
+         rebase.SourceTensorSpec("k", (2, 8), "read", -1, "reader"), "X must"),
+        (("read", torch.randn(8, 2), "y"), torch.randn(2, 8),
+         rebase.SourceTensorSpec("k", (2, 8), "read", -1, "reader"), "Y must"),
+        (("read", torch.randn(8), torch.randn(8, 2)), torch.randn(2, 8),
+         rebase.SourceTensorSpec("k", (2, 8), "read", -1, "reader"), "X must be rank"),
+        (("read", torch.randn(8, 2), torch.randn(8)), torch.randn(2, 8),
+         rebase.SourceTensorSpec("k", (2, 8), "read", -1, "reader"), "Y must be rank"),
+        (("read", torch.randn(8, 2), torch.randn(8, 3)), torch.randn(2, 8),
+         rebase.SourceTensorSpec("k", (2, 8), "read", -1, "reader"), "low-rank"),
+        (("read", torch.randn(7, 2), torch.randn(8, 2)), torch.randn(2, 8),
+         rebase.SourceTensorSpec("k", (2, 8), "read", -1, "reader"), "residual"),
+        (("read", torch.randn(8, 2), torch.randn(7, 2)), torch.randn(2, 8),
+         rebase.SourceTensorSpec("k", (2, 8), "read", -1, "reader"), "residual"),
+        (("read", torch.randn(8, 2), torch.randn(8, 2)), torch.ones(2, 8, dtype=torch.int32),
+         rebase.SourceTensorSpec("k", (2, 8), "read", -1, "reader"), "dtype"),
+        (("read", torch.randn(8, 2), torch.randn(8, 2)), torch.ones(2, 8, dtype=torch.bool),
+         rebase.SourceTensorSpec("k", (2, 8), "read", -1, "reader"), "dtype"),
+    ],
+)
+def test_transform_contract_rejects_invalid_inputs(entry, source, spec, message):
+    with pytest.raises(ValueError, match=message):
+        editing.apply_transform_bounded(entry, source, spec=spec, disk_key="disk.key")
 
 
 def test_full_export_observer_covers_every_bounded_row(tiny, tmp_path, monkeypatch):

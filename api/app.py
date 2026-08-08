@@ -2046,13 +2046,21 @@ def _gguf_state_snapshot():
 def _reserve_gguf_job(name):
     global _gguf_owner
     token = _GGUFJobToken(uuid.uuid4().hex, name)
+    running_state = {
+        "state": "running", "name": name, "step": "checking checkpoint",
+        "error": None, "result": None,
+    }
     with _gguf_lock:
         if _gguf_owner is not None or _gguf_delete_claim is not None:
             raise OperationConflict("a GGUF export or cache deletion is already in progress")
         _gguf_owner = token
         _gguf_state.clear()
-        _gguf_state.update(state="running", name=name, step="checking checkpoint", error=None, result=None)
+        _gguf_state.update(running_state)
     return token
+
+def _gguf_job_is_current(token):
+    with _gguf_lock:
+        return _gguf_owner == token
 
 def _gguf_job_progress(token, step):
     with _gguf_lock:
@@ -2130,14 +2138,20 @@ def _gguf_worker(token, job_name, job_dir, filename_stem, gguf_type,
                  hf_dir, convert, quantize, gguf_py):
     import subprocess
     import sys
+    if not _gguf_job_is_current(token):
+        return
     try:
         job_dir.mkdir(parents=True, exist_ok=True)
+        if not _gguf_job_is_current(token):
+            return
         base_type = gguf_type if gguf_type in GGUF_BASE_TYPES else "bf16"
         base_gguf = job_dir / f"{filename_stem}-{base_type}.gguf"
         env = dict(os.environ)
         if gguf_py is not None:  # vendored gguf package inside the llama.cpp repo
             env["PYTHONPATH"] = str(gguf_py) + os.pathsep + env.get("PYTHONPATH", "")
         if base_gguf.exists() or base_gguf.is_symlink():
+            if not _gguf_job_is_current(token):
+                return
             _validate_gguf_artifact(base_gguf)
         else:
             if not _gguf_job_progress(token, f"converting to {base_type}"):
@@ -2163,6 +2177,8 @@ def _gguf_worker(token, job_name, job_dir, filename_stem, gguf_type,
                     temp_gguf.unlink(missing_ok=True)
         result_path = base_gguf
         if gguf_type not in GGUF_BASE_TYPES:
+            if not _gguf_job_is_current(token):
+                return
             if quantize is None:
                 raise RuntimeError(
                     "llama-quantize not found in the llama.cpp folder — only "
@@ -2187,6 +2203,8 @@ def _gguf_worker(token, job_name, job_dir, filename_stem, gguf_type,
                         return
                 finally:
                     temp_quantized.unlink(missing_ok=True)
+        if not _gguf_job_is_current(token):
+            return
         details = _validate_gguf_artifact(result_path)
         _finish_gguf_job(token, result={
                 "gguf": str(result_path),
@@ -2261,16 +2279,15 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
         raise HTTPException(422, str(exc))
     if req.gguf_type not in GGUF_BASE_TYPES and quantize is None:
         raise HTTPException(422, "llama-quantize not found — pick bf16 or f16")
+    job_dir = editing.EDITS_DIR.joinpath(*name_parts)
+    filename_stem = name_parts[-1]
+    hf_dir = job_dir / "hf"
     try:
         job_token = _reserve_gguf_job(validated_name)
     except OperationConflict as exc:
         raise HTTPException(409, str(exc)) from exc
-    job_dir = editing.EDITS_DIR.joinpath(*name_parts)
-    filename_stem = name_parts[-1]
-
-    hf_dir = job_dir / "hf"
-    baked = "reused"
     try:
+        baked = "reused"
         if not (hf_dir / "config.json").exists():
             _gguf_job_progress(job_token, "baking checkpoint")
             stop_event = ThreadingEvent()
@@ -2329,13 +2346,13 @@ def api_gguf_cache_delete(req: GGUFCacheRequest):
         name_parts = editing.validate_export_name(req.name)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
+    hf_dir = editing.EDITS_DIR.joinpath(*name_parts) / "hf"
     global _gguf_delete_claim
     claim = uuid.uuid4().hex
     with _gguf_lock:
         if _gguf_owner is not None or _gguf_delete_claim is not None:
             raise HTTPException(409, "a GGUF export or cache deletion is in progress")
         _gguf_delete_claim = claim
-    hf_dir = editing.EDITS_DIR.joinpath(*name_parts) / "hf"
     try:
         if not hf_dir.is_dir():
             raise HTTPException(404, f"no cached checkpoint for {req.name}")

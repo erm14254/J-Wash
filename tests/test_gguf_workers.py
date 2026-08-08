@@ -50,9 +50,9 @@ def _install_loaded_bundle(app, monkeypatch, *, jl=None, profile="__default__", 
     return bundle
 
 
-def _mock_loaded_readthrough(app, monkeypatch):
+def _mock_loaded_readthrough(app, monkeypatch, *, meta=None):
     rules = [{"id": 1, "layers": [0], "enabled": True, "mode": "scale", "factor": 0.0}]
-    _install_loaded_bundle(app, monkeypatch)
+    _install_loaded_bundle(app, monkeypatch, meta=meta)
     app.manager.coordinator.bootstrap_interventions_for_test({
         "revision": 1,
         "model_session_id": app.manager.coordinator.status_snapshot().model_session_id,
@@ -88,7 +88,8 @@ def test_api_gguf_preparation_uses_nested_hf_name(tmp_path, monkeypatch):
         app, "resolve_local_dir",
         lambda _model, *, revision=None: revisions.append(revision) or tmp_path / "source",
     )
-    _mock_loaded_readthrough(app, monkeypatch)
+    _mock_loaded_readthrough(app, monkeypatch,
+                             meta={"revision": "recorded-revision"})
     def fake_export(*_args, **kwargs):
         captured["name"] = kwargs["name"]
         target = app.editing.EDITS_DIR / kwargs["name"]
@@ -101,7 +102,7 @@ def test_api_gguf_preparation_uses_nested_hf_name(tmp_path, monkeypatch):
     app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
     result = asyncio.run(app.api_edit_export_gguf(SimpleNamespace(name="job", gguf_type="bf16")))
     assert captured["name"] == "job/hf" and result["checkpoint"] == "baked"
-    assert revisions == [None]
+    assert revisions == ["recorded-revision"]
     assert (app.editing.EDITS_DIR / "job" / "hf" / "config.json").exists()
     pending[0].run()
     assert app._gguf_owner is None
@@ -517,3 +518,115 @@ def test_gguf_atomic_rejects_missing_or_empty_converter_output(body, message, tm
     if os.name != "nt":
         leases = list(job_dir.glob(".*.lease"))
         assert leases and all(path.is_file() for path in leases)
+
+
+def test_stale_gguf_updates_and_worker_entry_cannot_touch_successor(tmp_path):
+    import api.app as app
+
+    old = app._reserve_gguf_job("old")
+    assert app._finish_gguf_job(old, error="finished")
+    successor = app._reserve_gguf_job("successor")
+    before = app._gguf_state_snapshot()
+    job_dir = tmp_path / "must-not-exist"
+    app._gguf_worker(
+        old, "old", job_dir, "old", "bf16", tmp_path / "hf",
+        tmp_path / "convert.py", None, None,
+    )
+    assert not job_dir.exists()
+    assert not app._gguf_job_progress(old, "stale")
+    assert not app._finish_gguf_job(old, result={"bad": True})
+    assert not app._finish_gguf_job(old, error="stale")
+    assert app._gguf_state_snapshot() == before
+    assert app._gguf_job_is_current(successor)
+    assert app._finish_gguf_job(successor, error="test complete")
+
+
+@pytest.mark.parametrize("same_name", [True, False])
+def test_simultaneous_gguf_reservation_has_exactly_one_owner(same_name):
+    import threading
+    import api.app as app
+
+    barrier = threading.Barrier(3)
+    results = []
+    def reserve(name):
+        barrier.wait(timeout=2)
+        try:
+            results.append(("won", app._reserve_gguf_job(name)))
+        except Exception as exc:
+            results.append(("lost", exc))
+    names = ("job", "job" if same_name else "other")
+    threads = [threading.Thread(target=reserve, args=(name,)) for name in names]
+    for thread in threads: thread.start()
+    barrier.wait(timeout=2)
+    for thread in threads:
+        thread.join(2)
+        assert not thread.is_alive()
+    winners = [value for status, value in results if status == "won"]
+    losers = [value for status, value in results if status == "lost"]
+    assert len(winners) == len(losers) == 1
+    assert app._gguf_job_is_current(winners[0])
+    assert app._finish_gguf_job(winners[0], error="test complete")
+
+
+@pytest.mark.parametrize("phase", ["construct", "start"])
+def test_gguf_thread_setup_failure_releases_exact_owner(phase, tmp_path, monkeypatch):
+    import api.app as app
+    from fastapi.testclient import TestClient
+
+    edits = tmp_path / "edits"
+    cached = edits / "job" / "hf"
+    cached.mkdir(parents=True)
+    (cached / "config.json").write_text("{}")
+    monkeypatch.setattr(app.editing, "EDITS_DIR", edits)
+    monkeypatch.setattr(app, "_llamacpp_paths", lambda: (tmp_path / "convert.py", None, None))
+
+    class BrokenThread:
+        def __init__(self, **_kwargs):
+            if phase == "construct":
+                raise RuntimeError("constructor failed")
+        def start(self):
+            raise RuntimeError("start failed")
+    monkeypatch.setattr(app, "threading", SimpleNamespace(Thread=BrokenThread))
+    response = TestClient(app.app).post(
+        "/api/edit/export-gguf", json={"name": "job", "gguf_type": "bf16"}
+    )
+    assert response.status_code == 500
+    assert app._gguf_owner is None
+    assert app._gguf_state["state"] == "error"
+    assert "failed" in app._gguf_state["error"]
+
+
+@pytest.mark.parametrize("kind", ["empty", "directory", "symlink"])
+def test_invalid_reused_gguf_base_is_preserved(kind, tmp_path, monkeypatch):
+    import api.app as app
+
+    job_dir = tmp_path / "job"; hf_dir = job_dir / "hf"; hf_dir.mkdir(parents=True)
+    base = job_dir / "job-bf16.gguf"
+    if kind == "empty": base.write_bytes(b"")
+    elif kind == "directory": base.mkdir()
+    else:
+        target = tmp_path / "target.gguf"; target.write_bytes(b"valid-target")
+        try: base.symlink_to(target)
+        except OSError: pytest.skip("symlinks unavailable")
+    token = app._reserve_gguf_job("job")
+    app._gguf_worker(token, "job", job_dir, "job", "bf16", hf_dir,
+                     tmp_path / "converter.py", None, None)
+    assert app._gguf_owner is None and app._gguf_state["state"] == "error"
+    assert base.exists() or base.is_symlink()
+
+
+def test_cache_delete_claim_releases_on_404_and_nested_rejection(tmp_path, monkeypatch):
+    import api.app as app
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr(app.editing, "EDITS_DIR", tmp_path / "edits")
+    client = TestClient(app.app)
+    response = client.post("/api/edit/gguf-cache/delete", json={"name": "missing"})
+    assert response.status_code == 404 and app._gguf_delete_claim is None
+    cache = app.editing.EDITS_DIR / "job" / "hf"
+    nested = cache / "nested"; nested.mkdir(parents=True)
+    (cache / "config.json").write_text("{}")
+    (nested / "config.json").write_text("{}")
+    response = client.post("/api/edit/gguf-cache/delete", json={"name": "job"})
+    assert response.status_code == 409 and app._gguf_delete_claim is None
+    assert cache.exists()

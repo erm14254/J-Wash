@@ -29,6 +29,12 @@ def restore_api_gguf_state():
     yield
     app = sys.modules.get("api.app")
     if app is not None:
+        workers = list(getattr(app, "_gguf_test_workers", ()))
+        for worker in workers:
+            worker.join(timeout=2)
+        live = [worker for worker in workers if worker.is_alive()]
+        if live:
+            pytest.fail(f"GGUF test worker(s) did not drain: {live!r}")
         leaked_owner = leaked_delete = None
         with app._gguf_lock:
             leaked_owner = app._gguf_owner

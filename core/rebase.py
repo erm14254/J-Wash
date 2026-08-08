@@ -1264,6 +1264,8 @@ def _build_plan_from_inventory(rules, jl, scale, *, exact=False, inventory):
     U, V = cums[n_layers]
     Ug, Vg = gamma_pair(inventory.final_norm, U, V)
     lm_head_key, _head, _head_weight = inventory.final_head
+    if lm_head_key in transforms or lm_head_key in source_specs:
+        raise ValueError(f"duplicate transform key: {lm_head_key}")
     transforms[lm_head_key] = ("read", Ug, Vg)
     source_specs[lm_head_key] = SourceTensorSpec(
         lm_head_key, tuple(_head_weight.shape), "read", -1, "final_head"
