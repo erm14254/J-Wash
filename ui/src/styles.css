@@ -123,14 +123,15 @@ button.danger { border-color: var(--danger); color: var(--danger); }
 .tabs button { flex: 1; padding: 5px 0; font-size: 12px; border-radius: 6px 6px 0 0; border-bottom: 2px solid transparent; }
 .tabs button.tab-on { border-bottom-color: var(--accent); color: var(--accent); font-weight: 600; }
 
-.exp-tag {
-  font-size: 9px; color: var(--danger); border: 1px solid var(--danger);
-  border-radius: 6px; padding: 0 5px; vertical-align: middle; letter-spacing: .05em;
-}
-/* export greyed out when the "per-layer steering" mode doesn't produce a faithful checkpoint */
 .exp-grid { display: flex; flex-direction: column; gap: 7px; transition: opacity .18s; }
-.exp-grid-off { opacity: .4; pointer-events: none; }
-.exp-disabled-note { color: var(--danger); }
+.cap-row { display: flex; gap: 8px; align-items: flex-start; padding: 7px; border: 1px solid var(--border); border-radius: 5px; }
+.cap-row.selected { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.cap-row > span { display: flex; flex-direction: column; gap: 2px; }
+.cap-reason { color: var(--danger); font-size: 11px; }
+.cap-local { color: var(--muted); font-size: 11px; }
+.mode-selector { display: flex; flex-direction: column; gap: 5px; }
+.advanced-toggle { align-self: flex-start; margin-top: 3px; }
+.lv-ablate:disabled { cursor: not-allowed; opacity: .45; }
 
 .diff-btn { padding: 0 6px; font-size: 11px; margin-left: 6px; }
 .diff-table { border-collapse: collapse; font-size: 11px; }
@@ -372,40 +373,6 @@ button.danger { border-color: var(--danger); color: var(--danger); }
 }
 .ed-toggle-on { border-color: var(--accent) !important; color: var(--accent); }
 
-/* Mode toggle: steering (exploration) ↔ read projection (exportable).
-   Sliding thumb, two halves tiling the track (4px insets, seam at the center). */
-.mode-toggle {
-  position: relative; display: grid; grid-template-columns: 1fr 1fr;
-  background: var(--panel2); border: 1px solid var(--border); border-radius: 10px;
-  padding: 4px; isolation: isolate; user-select: none;
-}
-.mt-thumb {
-  position: absolute; z-index: 0; top: 4px; bottom: 4px; left: 4px;
-  width: calc(50% - 4px); border-radius: 7px;
-  transition: transform .24s cubic-bezier(.34,1.2,.44,1), background .2s, box-shadow .2s;
-}
-.mt-steer .mt-thumb {
-  transform: translateX(0);
-  background: linear-gradient(135deg, rgba(108,184,224,.92), rgba(108,184,224,.6));
-  box-shadow: 0 2px 12px rgba(108,184,224,.4);
-}
-.mt-read .mt-thumb {
-  transform: translateX(100%);
-  background: linear-gradient(135deg, rgba(126,201,126,.94), rgba(126,201,126,.62));
-  box-shadow: 0 2px 12px rgba(126,201,126,.4);
-}
-.mt-opt {
-  position: relative; z-index: 1; background: none; border: none; border-radius: 7px;
-  display: flex; flex-direction: column; align-items: center; gap: 3px;
-  padding: 9px 6px 8px; cursor: pointer; color: var(--muted);
-  transition: color .18s; text-align: center; line-height: 1.15;
-}
-.mt-opt:hover:not(.mt-on) { color: var(--text); }
-.mt-opt svg { opacity: .92; margin-bottom: 1px; }
-.mt-lab { font-size: 12px; font-weight: 600; }
-.mt-sub { font-size: 9.5px; letter-spacing: .02em; opacity: .82; }
-.mt-on { color: #14161a; }
-.mt-on .mt-sub { opacity: .74; }
 
 .ed-rule { border: 1px solid var(--border); border-radius: 6px; padding: 5px 7px; }
 .ed-rule-off { opacity: .5; }

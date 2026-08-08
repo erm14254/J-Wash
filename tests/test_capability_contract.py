@@ -7,7 +7,7 @@ import torch
 
 from core import capabilities, editing, rebase
 from core.ablation import Interventions
-from core.model_session import LoadedModelBundle, ModelSessionCoordinator, OperationType
+from core.model_session import GenerationContext, LoadedModelBundle, ModelSessionCoordinator, OperationType
 from helpers import dense_lens
 
 
@@ -317,3 +317,235 @@ def test_intervention_patch_returns_the_committed_pair(monkeypatch):
     )
     assert response == {"scale": 2.25, "mode": "readthrough"}
     assert iv.state_snapshot() == (2.25, "readthrough")
+
+
+def _existing_rule():
+    return {
+        "id": 1, "token_id": 1, "token": "a", "mode": "scale", "factor": 0.0,
+        "replacement_id": None, "replacement": None, "layers": [0], "enabled": True,
+        "dirs_a": {0: object()}, "dirs_b": None,
+    }
+
+
+def test_direction_patch_unavailable_profile_is_canonical_422_and_transactional(monkeypatch):
+    import api.app as app
+    jl = dense_lens()
+    iv = Interventions()
+    iv._rules = [_existing_rule()]
+    before = iv.state_record()
+    monkeypatch.setattr(app, "interventions", iv)
+    _install_loaded_bundle(app, monkeypatch, jl=jl, profile={"modes": {}})
+    with pytest.raises(app.HTTPException) as exc:
+        app.api_interventions_patch(
+            1, SimpleNamespace(factor=None, layers=[1], enabled=None, token_id=None,
+                               replacement_id=None, mode=None)
+        )
+    assert exc.value.status_code == 422
+    assert exc.value.detail == capabilities.PUBLIC_REASONS["capability_data_unavailable"]
+    assert iv.state_record() == before
+
+
+def test_direction_patch_unknown_rule_with_valid_profile_remains_404(monkeypatch):
+    import api.app as app
+    jl = dense_lens()
+    jl.tokenizer = SimpleNamespace(decode=lambda ids: str(ids[0]))
+    iv = Interventions()
+    monkeypatch.setattr(app, "interventions", iv)
+    monkeypatch.setattr(app.lens_manager, "lens", SimpleNamespace(jacobians={}))
+    _install_loaded_bundle(app, monkeypatch, jl=jl, profile=_profile())
+    with pytest.raises(app.HTTPException) as exc:
+        app.api_interventions_patch(
+            999, SimpleNamespace(factor=None, layers=[1], enabled=None, token_id=None,
+                                 replacement_id=None, mode=None)
+        )
+    assert exc.value.status_code == 404
+    assert exc.value.detail == "unknown rule 999"
+
+
+def test_preset_unavailable_profile_rejects_before_any_mutation(monkeypatch):
+    import api.app as app
+    iv = Interventions()
+    iv._rules = [_existing_rule()]
+    iv._scale = 2.5
+    before = iv.state_record()
+    monkeypatch.setattr(app, "interventions", iv)
+    monkeypatch.setattr(app.lens_manager, "lens", SimpleNamespace(jacobians={}))
+    _install_loaded_bundle(app, monkeypatch, jl=dense_lens(), profile={"modes": {}})
+    monkeypatch.setattr(app.editing, "load_preset", lambda _name: {
+        "scale": 9.0, "rules": [{"token_id": 2, "mode": "scale", "factor": 0.0}],
+    })
+    with pytest.raises(app.HTTPException) as exc:
+        app.api_presets_apply("unavailable")
+    assert exc.value.status_code == 422
+    assert exc.value.detail == capabilities.PUBLIC_REASONS["capability_data_unavailable"]
+    assert iv.state_record() == before
+
+
+def test_cleanup_disable_delete_and_clear_survive_unavailable_profile(monkeypatch):
+    import api.app as app
+    iv = Interventions()
+    iv._rules = [_existing_rule(), {**_existing_rule(), "id": 2}]
+    monkeypatch.setattr(app, "interventions", iv)
+    _install_loaded_bundle(app, monkeypatch, profile={"modes": {}})
+
+    disabled = app.api_interventions_patch(
+        1, SimpleNamespace(factor=None, layers=None, enabled=False, token_id=None,
+                           replacement_id=None, mode=None)
+    )
+    assert next(rule for rule in disabled["rules"] if rule["id"] == 1)["enabled"] is False
+    removed = app.api_interventions_remove(1)
+    assert [rule["id"] for rule in removed["rules"]] == [2]
+    cleared = app.api_interventions_clear()
+    assert cleared == {"rules": []}
+
+
+@pytest.mark.parametrize("patch,field,expected", [
+    ({"factor": 0.75}, "factor", 0.0),
+    ({"enabled": True}, "enabled", False),
+    ({"enabled": False, "factor": 0.75}, "factor", 0.0),
+])
+def test_effectful_factor_enable_and_combined_patches_require_capability(
+        monkeypatch, patch, field, expected):
+    import api.app as app
+    rule = _existing_rule()
+    if "enabled" in patch and patch["enabled"] is True:
+        rule["enabled"] = False
+    iv = Interventions()
+    iv._rules = [rule]
+    before = iv.state_record()
+    monkeypatch.setattr(app, "interventions", iv)
+    _install_loaded_bundle(app, monkeypatch, profile={"modes": {}})
+    request = dict(factor=None, layers=None, enabled=None, token_id=None,
+                   replacement_id=None, mode=None)
+    request.update(patch)
+    with pytest.raises(app.HTTPException) as exc:
+        app.api_interventions_patch(1, SimpleNamespace(**request))
+    assert exc.value.status_code == 422
+    assert exc.value.detail == capabilities.PUBLIC_REASONS["capability_data_unavailable"]
+    assert iv.state_record() == before
+    assert iv.summary()[0][field] == expected
+
+
+def test_standard_editing_does_not_require_readthrough_support(monkeypatch):
+    import api.app as app
+    profile = _profile()
+    profile["modes"]["readthrough"] = capabilities.decision(False, "architecture_unsupported")
+    profile["modes"]["exact"] = capabilities.decision(False, "architecture_unsupported")
+    jl = dense_lens()
+    jl.tokenizer = SimpleNamespace(decode=lambda ids: str(ids[0]))
+    iv = Interventions()
+    iv._rules = [_existing_rule()]
+    monkeypatch.setattr(app, "interventions", iv)
+    monkeypatch.setattr(app.lens_manager, "lens", SimpleNamespace(jacobians={0: torch.eye(8)}))
+    _install_loaded_bundle(app, monkeypatch, jl=jl, profile=profile)
+    token, snap = app.manager.coordinator.acquire(OperationType.INTERVENTION_UPDATE)
+    try:
+        response = app._interventions_patch_resource(
+            token, snap, 1,
+            SimpleNamespace(factor=None, layers=[0], enabled=None, token_id=None,
+                            replacement_id=None, mode=None), True,
+        )
+    finally:
+        app.manager.coordinator.release(token)
+    assert response.status is None
+    assert response.value["rules"][0]["layers"] == [0]
+
+
+@pytest.mark.parametrize("active", [True, False])
+def test_generation_unavailable_profile_only_blocks_actual_active_rules(monkeypatch, active):
+    import api.app as app
+
+    class NormalGenerationSeam(RuntimeError):
+        pass
+
+    class Tokenizer:
+        def apply_chat_template(self, *_args, **_kwargs):
+            raise NormalGenerationSeam("normal generation reached")
+
+    class Ablator:
+        def __init__(self):
+            self.attach_calls = 0
+
+        def attach(self, *_args, **_kwargs):
+            self.attach_calls += 1
+            return SimpleNamespace(close=lambda: None)
+
+    rule = _existing_rule()
+    intervention_snapshot = {
+        "mode": "standard", "rules": [rule],
+        "active_rules": [rule] if active else [],
+    }
+    jl = SimpleNamespace()
+    bundle = LoadedModelBundle.from_parts(
+        object(), Tokenizer(), jl, {"model_id": "m", "quant": None}, {"modes": {}},
+    )
+    context = GenerationContext(
+        token=object(), model_session_id=7, bundle=bundle, hf_model=object(),
+        tokenizer=bundle.tokenizer, jl=jl, meta=bundle.meta,
+        capability_profile=bundle.capability_profile, lens=None,
+        intervention_snapshot=intervention_snapshot, stop_event=threading.Event(),
+    )
+    ablator = Ablator()
+    if active:
+        with pytest.raises(ValueError, match="Capability data is unavailable"):
+            app.manager.generate([], {}, threading.Event(), lambda _event: None,
+                                 lens=context, ablator=ablator)
+        assert ablator.attach_calls == 0
+    else:
+        with pytest.raises(NormalGenerationSeam, match="normal generation reached"):
+            app.manager.generate([], {}, threading.Event(), lambda _event: None,
+                                 lens=context, ablator=ablator)
+        assert ablator.attach_calls == 1
+
+
+@pytest.mark.parametrize("mode,profile,allowed", [
+    ("readthrough", {
+        "declared_quantization": None, "has_packed_read_parameters": False,
+        "modes": {
+            "standard": capabilities.decision(True, "supported"),
+            "readthrough": capabilities.decision(False, "architecture_unsupported"),
+            "exact": capabilities.decision(False, "architecture_unsupported"),
+            "abliteration": capabilities.decision(False, "global_projection_unvalidated"),
+        },
+    }, False),
+    ("standard", {
+        "declared_quantization": None, "has_packed_read_parameters": False,
+        "modes": {
+            "standard": capabilities.decision(True, "supported"),
+            "readthrough": capabilities.decision(False, "architecture_unsupported"),
+            "exact": capabilities.decision(False, "architecture_unsupported"),
+            "abliteration": capabilities.decision(False, "global_projection_unvalidated"),
+        },
+    }, True),
+])
+def test_generation_guard_uses_captured_selected_mode(monkeypatch, mode, profile, allowed):
+    import api.app as app
+    class Seam(RuntimeError): pass
+    class Tokenizer:
+        def apply_chat_template(self, *_args, **_kwargs): raise Seam("normal seam")
+    class Ablator:
+        def __init__(self): self.calls = 0
+        def attach(self, *_args, **_kwargs):
+            self.calls += 1
+            return SimpleNamespace(close=lambda: None)
+    snapshot = {"mode": mode, "active_rules": [_existing_rule()], "rules": [_existing_rule()]}
+    bundle = LoadedModelBundle.from_parts(
+        object(), Tokenizer(), SimpleNamespace(), {"model_id": "m", "quant": None}, profile,
+    )
+    context = GenerationContext(
+        token=object(), model_session_id=9, bundle=bundle, hf_model=object(),
+        tokenizer=bundle.tokenizer, jl=bundle.jl, meta=bundle.meta,
+        capability_profile=bundle.capability_profile, lens=None,
+        intervention_snapshot=snapshot, stop_event=threading.Event(),
+    )
+    ablator = Ablator()
+    if allowed:
+        with pytest.raises(Seam, match="normal seam"):
+            app.manager.generate([], {}, threading.Event(), lambda _event: None,
+                                 lens=context, ablator=ablator)
+        assert ablator.calls == 1
+    else:
+        with pytest.raises(ValueError, match="not been validated"):
+            app.manager.generate([], {}, threading.Event(), lambda _event: None,
+                                 lens=context, ablator=ablator)
+        assert ablator.calls == 0

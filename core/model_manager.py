@@ -14,6 +14,7 @@ from huggingface_hub import scan_cache_dir, try_to_load_from_cache
 
 import config
 import jlens
+from core import capabilities
 from core.lens_manager import ActivationCatcher
 from core.model_session import GenerationContext, LoadedModelBundle, ModelSessionCoordinator, OperationConflict, OperationType
 
@@ -733,8 +734,16 @@ class ModelManager:
         attachment = None
         ok = False
         lens_attempt_resolved = False
+        gen_id = None
         try:
             if ablator is not None:
+                if context is not None and (ablator_snapshot or {}).get("active_rules"):
+                    capabilities.require(
+                        context.capability_profile,
+                        "modes",
+                        (ablator_snapshot or {}).get("mode"),
+                        loaded=True,
+                    )
                 attachment = ablator.attach(jl, snapshot=ablator_snapshot)
             is_gpt_oss = "gpt-oss" in (meta or {}).get("model_id", "").lower()
             template_kwargs = {}
@@ -774,7 +783,6 @@ class ModelManager:
                 input_ids = torch.cat([input_ids, final_prefix], dim=1)
 
             read_from = 0
-            gen_id = None
             generation_run_id = uuid.uuid4().hex
             if lens is not None and lens.lens is not None:
                 reader = ActivationCatcher(jl.layers, lens.layers)

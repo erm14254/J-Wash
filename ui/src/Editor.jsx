@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { fmtTok } from './tok'
+import { createEditorMutationState, isEditorMutationCancellation, throwIfEditorMutationCancelled } from './editorMutationState.js'
+import { selectedExportState, shouldOpenAdvanced } from './capabilityState.js'
 
 // Default layer slice for a new rule, as fractions of the model's layer count
 // (aligned with core/ablation.py): 56 layers -> 33 to 44.
@@ -17,8 +19,8 @@ async function jsonFetch(url, options) {
   return body
 }
 
-const patchJson = (url, body) =>
-  jsonFetch(url, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+const patchJson = (url, body, options = {}) =>
+  jsonFetch(url, { ...options, method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
 
 /* Layer selector: clickable cells, shift+click = range, shortcuts. */
 export function LayerPicker({ all, value, onChange, compact, defaults, fitted }) {
@@ -174,94 +176,63 @@ function ruleTitle(r) {
   return lines.join('\n')
 }
 
-// Two-position toggle: steering (exploration) ↔ the pure-weights mode the
-// architecture supports (read projection, or global projection on write-norm
-// models like Gemma). The "exact" mode stays reachable through the API; if it
-// is active, the thumb sits on the pure side and a click brings it back.
-function ModeToggle({ mode, onChange, pureMode = 'readthrough' }) {
-  const isPure = mode !== 'standard'
+// Four independent rows mirror the authoritative server decisions.
+function ModeSelector({ state, onChange }) {
+  const [advanced, setAdvanced] = useState(shouldOpenAdvanced(state.selectedMode))
+  useEffect(() => {
+    if (shouldOpenAdvanced(state.selectedMode)) setAdvanced(true)
+  }, [state.selectedMode])
+  const rows = (ids) => ids.map((id) => {
+    const item = state.modes[id]
+    const info = MODE_INFO[id]
+    const reasonId = `mode-${id}-reason`
+    return <label key={id} className={`cap-row ${item.selected ? 'selected' : ''}`}>
+      <input type="radio" name="intervention-mode" checked={item.selected}
+        disabled={!item.enabled} aria-describedby={!item.enabled ? reasonId : undefined}
+        onChange={() => onChange(id)} />
+      <span><strong>{info.label}</strong><span className="src">{info.subtitle}</span>
+        {!item.decision.supported && <span id={reasonId} className="cap-reason">{item.decision.reason}</span>}
+        {item.decision.supported && !item.enabled && <span id={reasonId} className="cap-local">Refreshing or another operation is in progress.</span>}
+      </span>
+    </label>
+  })
   return (
-    <div className={`mode-toggle ${isPure ? 'mt-read' : 'mt-steer'}`} role="radiogroup"
-      aria-label="intervention mode">
-      <div className="mt-thumb" />
-      <button type="button" className={`mt-opt ${!isPure ? 'mt-on' : ''}`}
-        aria-pressed={!isPure}
-        onClick={() => mode !== 'standard' && onChange('standard')}>
-        <svg viewBox="0 0 14 14" width="15" height="15" aria-hidden="true">
-          <path d="M2.5 1v5M2.5 10.6V13M7 1v1.4M7 7V13M11.5 1v7.4M11.5 13v-2"
-            stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" fill="none" />
-          <circle cx="2.5" cy="8.3" r="1.7" fill="currentColor" />
-          <circle cx="7" cy="4.7" r="1.7" fill="currentColor" />
-          <circle cx="11.5" cy="10.7" r="1.7" fill="currentColor" />
-        </svg>
-        <span className="mt-lab">Per-layer steering</span>
-        <span className="mt-sub">preview only</span>
-      </button>
-      <button type="button" className={`mt-opt ${isPure ? 'mt-on' : ''}`}
-        aria-pressed={isPure}
-        onClick={() => mode !== pureMode && onChange(pureMode)}>
-        <svg viewBox="0 0 14 14" width="15" height="15" aria-hidden="true">
-          <path d="M1.2 7S3.4 3.2 7 3.2 12.8 7 12.8 7 10.6 10.8 7 10.8 1.2 7 1.2 7Z"
-            fill="none" stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round" />
-          <circle cx="7" cy="7" r="1.9" fill="currentColor" />
-        </svg>
-        <span className="mt-lab">{pureMode === 'abliteration' ? 'Global projection' : 'Read projection'}</span>
-        <span className="mt-sub">pure-weights · exportable</span>
-      </button>
+    <div className="mode-selector" role="radiogroup" aria-label="intervention mode">
+      {rows(['standard', 'readthrough'])}
+      <button type="button" className="advanced-toggle" aria-expanded={advanced} onClick={() => setAdvanced(!advanced)}>Advanced {advanced ? '▾' : '▸'}</button>
+      {advanced && rows(['exact', 'abliteration'])}
     </div>
   )
 }
 
 const MODE_INFO = {
   standard: {
-    label: 'Per-layer steering (preview only)',
-    tag: 'not exportable',
-    help: 'J-space hooks on the chosen layers: the most expressive way to explore, '
-      + 'but the export bake only captures ~1-2 % of the effect. Switch to '
-      + '"read projection" to export what you see.',
-    exportHelp: 'no export in this mode — switch to "read projection" for a '
-      + 'faithful pure-weights bake.',
+    label: 'Standard', subtitle: 'Per-layer steering',
+    help: 'J-space hooks apply on the chosen layers.',
   },
   readthrough: {
-    label: 'Read projection (faithful bake)',
-    tag: 'pure-weights',
+    label: 'Readthrough', subtitle: 'Read projection',
     help: 'every read of the residual downstream of the chosen layers (q/k/v, gate/up, lm_head) '
       + 'sees the transformed residual: the preview = the exported checkpoint. Recommended for '
       + 'removals and replacements. Regenerate after a change.',
-    exportHelp: 'change of basis of the downstream reads + lm_head (untied if embeddings are tied). '
-      + 'Formats: full checkpoint (standard safetensors), modified layers, or LoRA '
-      + '(exact low-rank diff vs the original weights).',
   },
   exact: {
-    label: 'Exact compensated (soft factors)',
-    tag: 'pure-weights',
+    label: 'Exact', subtitle: 'Exact compensated',
     help: 'read projection + counter-transform of the downstream writes: reproduces a '
       + 'hook applied exactly once. ⚠ a full zap/replace makes the inverse singular '
       + '(regularized ≈ read projection) — reserve this mode for partial factors.',
-    exportHelp: 'downstream reads + writes transformed, lm_head untied if needed. '
-      + 'Formats: full checkpoint, modified layers, or LoRA (exact low-rank diff).',
   },
   abliteration: {
-    label: 'Global projection (W_U abliteration)',
-    tag: 'pure-weights',
-    help: 'W_U projection on every residual write (embed + all layers): the pure-weights '
-      + 'mode for architectures where the read projection is unavailable (write norms, '
-      + 'Gemma style). Faithful for full removals/replacements; the rules\' layers are '
-      + 'ignored (global projection).',
-    exportHelp: 'global abliteration × scale: removes/redirects the direction in embed + '
-      + 'every o_proj/down_proj. Formats: full checkpoint, modified layers, or LoRA '
-      + '(exact delta; embed omitted if embeddings are tied). ⚠ amplifying (factor > 1) '
-      + 'stays approximate.',
+    label: 'Abliteration', subtitle: 'Global projection',
+    help: 'Global projection transforms residual writes throughout the model.',
   },
 }
 
 export default function Editor({
   open, onClose, rules, scale, mode, lensMeta, nLayers, genId, generationRunId, busy,
-  prefill, onPrefillConsumed, onRules, onScale, onMode, onNotice,
-  rebaseSupported = true, autoLayerRadius, llamaCppSet = false, ggufState,
+  prefill, onPrefillConsumed, onRules, onScale, onModeChange, onNotice,
+  capabilityState, exportFmt, onExportFmtChange, autoLayerRadius, llamaCppSet = false, ggufState,
 }) {
-  // pure-weights mode this architecture can bake (cf. ModeToggle)
-  const pureMode = rebaseSupported === false ? 'abliteration' : 'readthrough'
   const layerRadius = autoLayerRadius ?? AUTO_LAYER_RADIUS_DEFAULT
   // All the model's layers; those outside the lens use the direct logit lens.
   const allLayers = useMemo(() => {
@@ -288,27 +259,45 @@ export default function Editor({
   // --- optimistic factor editing + debounced PATCH with flush ---
   const [localFactors, setLocalFactors] = useState({})
   const pendingRef = useRef(new Map()) // ruleId -> {timer, body}
+  const mutationStateRef = useRef(createEditorMutationState())
+
+  function resetPendingWrites({ renew = true } = {}) {
+    mutationStateRef.current.invalidate()
+    if (renew) mutationStateRef.current = createEditorMutationState()
+    pendingRef.current.clear()
+    scaleTimer.current = null
+    setLocalFactors({})
+    setScaleEdit(null)
+  }
+
+  function reportMutationError(error) {
+    if (!isEditorMutationCancellation(error)) onNotice(String(error.message || error))
+  }
 
   function firePatch(id) {
     const entry = pendingRef.current.get(id)
     if (!entry) return Promise.resolve()
     pendingRef.current.delete(id)
-    clearTimeout(entry.timer)
-    return patchJson(`/api/interventions/${id}`, entry.body)
-      .then((r) => {
+    mutationStateRef.current.cancelTimer(entry.timer)
+    const state = mutationStateRef.current
+    return state.request(
+      (signal) => patchJson(`/api/interventions/${id}`, entry.body, { signal }),
+      (r) => {
         onRules(r.rules)
         setLocalFactors((prev) => { const n = { ...prev }; delete n[id]; return n })
-      })
+      },
+    )
       .catch((err) => {
+        if (isEditorMutationCancellation(err)) return
         setLocalFactors((prev) => { const n = { ...prev }; delete n[id]; return n })
-        onNotice(String(err.message || err))
+        reportMutationError(err)
       })
   }
 
   function schedulePatch(id, body) {
     const prev = pendingRef.current.get(id)
-    if (prev) { clearTimeout(prev.timer); body = { ...prev.body, ...body } }
-    const timer = setTimeout(() => firePatch(id), 350)
+    if (prev) { mutationStateRef.current.cancelTimer(prev.timer); body = { ...prev.body, ...body } }
+    const timer = mutationStateRef.current.schedule(() => firePatch(id), 350)
     pendingRef.current.set(id, { timer, body })
   }
 
@@ -319,26 +308,37 @@ export default function Editor({
 
   function setGlobalScale(v) {
     setScaleEdit(v)
-    clearTimeout(scaleTimer.current)
-    scaleTimer.current = setTimeout(() => flushScale(v), 300)
+    if (scaleTimer.current != null) mutationStateRef.current.cancelTimer(scaleTimer.current)
+    scaleTimer.current = mutationStateRef.current.schedule(() => flushScale(v), 300)
   }
 
   function flushScale(v) {
-    clearTimeout(scaleTimer.current)
+    if (scaleTimer.current != null) mutationStateRef.current.cancelTimer(scaleTimer.current)
     scaleTimer.current = null
-    return patchJson('/api/interventions', { scale: +v })
-      .then((r) => { onScale(r.scale); setScaleEdit(null) })
-      .catch((err) => { setScaleEdit(null); onNotice(String(err.message || err)) })
+    const state = mutationStateRef.current
+    return state.request(
+      (signal) => patchJson('/api/interventions', { scale: +v }, { signal }),
+      (r) => { onScale(r.scale); setScaleEdit(null) },
+    )
+      .catch((err) => {
+        if (isEditorMutationCancellation(err)) return
+        setScaleEdit(null)
+        reportMutationError(err)
+      })
   }
 
   function setMode(next) {
-    patchJson('/api/interventions', { mode: next })
-      .then((r) => {
-        onMode(r.mode)
-        onNotice(`${MODE_INFO[r.mode]?.label || r.mode} — regenerate to see the effect.`, 'ok')
-      })
+    onModeChange(next)
+      .then(() => onNotice(`${MODE_INFO[next]?.label || next} — regenerate to see the effect.`, 'ok'))
       .catch((err) => onNotice(String(err.message || err)))
   }
+
+  useEffect(() => {
+    if (capabilityState.valid) return
+    resetPendingWrites()
+  }, [capabilityState.valid, capabilityState.sessionId])
+
+  useEffect(() => () => resetPendingWrites({ renew: false }), [])
 
   async function flushAll() {
     const jobs = [...pendingRef.current.keys()].map(firePatch)
@@ -354,11 +354,16 @@ export default function Editor({
 
   async function applyGroup(body) {
     try {
-      let last = null
-      for (const id of selIds) last = await patchJson(`/api/interventions/${id}`, body)
-      if (last) onRules(last.rules)
-      onNotice(`${selIds.length} rule(s) updated`, 'ok')
-    } catch (err) { onNotice(String(err.message || err)) }
+      const state = mutationStateRef.current
+      await state.request(async (signal) => {
+        let last = null
+        for (const id of selIds) last = await patchJson(`/api/interventions/${id}`, body, { signal })
+        return last
+      }, (last) => {
+        if (last) onRules(last.rules)
+        onNotice(`${selIds.length} rule(s) updated`, 'ok')
+      })
+    } catch (err) { reportMutationError(err) }
   }
 
   // --- per-rule layers (inline picker) ---
@@ -456,40 +461,42 @@ export default function Editor({
     onPrefillConsumed()
   }, [prefill])
 
-  async function resolveId(field) {
+  async function resolveId(field, signal) {
     if (field.id != null) return field.id
-    const body = await jsonFetch(`/api/token-lookup?q=${encodeURIComponent(field.text.trim())}`)
+    const body = await jsonFetch(`/api/token-lookup?q=${encodeURIComponent(field.text.trim())}`, { signal })
     if (!body.candidates.length) throw new Error(`no single token for "${field.text}"`)
     return (body.candidates.find((c) => c.str.startsWith(' ')) || body.candidates[0]).id
   }
 
   async function addRule() {
+    const state = mutationStateRef.current
     try {
-      const tokenId = await resolveId(addToken)
-      const replId = addMode === 'replace' ? await resolveId(addRepl) : null
-      if (editRuleId != null) {
-        // rewrite the existing rule in place (directions re-resolved server-side)
-        const resp = await patchJson(`/api/interventions/${editRuleId}`, {
-          token_id: tokenId, mode: addMode, factor: +addFactor,
-          replacement_id: replId, layers: addLayers,
-        })
-        onRules(resp.rules)
-        resetAddForm()
-        onNotice('rule updated — regenerate to see the effect', 'ok')
-        return
-      }
-      const r = await jsonFetch('/api/interventions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      await state.request(async (signal) => {
+        const tokenId = await resolveId(addToken, signal)
+        const replId = addMode === 'replace' ? await resolveId(addRepl, signal) : null
+        throwIfEditorMutationCancelled(signal)
+        if (editRuleId != null) {
+          return patchJson(`/api/interventions/${editRuleId}`, {
+            token_id: tokenId, mode: addMode, factor: +addFactor,
+            replacement_id: replId, layers: addLayers,
+          }, { signal })
+        }
+        return jsonFetch('/api/interventions', {
+          method: 'POST', signal,
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
           token_id: tokenId, mode: addMode, factor: +addFactor,
           replacement_id: replId, layers: addLayers.length ? addLayers : null,
-        }),
+          }),
+        })
+      }, (result) => {
+        onRules(result.rules)
+        resetAddForm()
+        onNotice(editRuleId != null
+          ? 'rule updated — regenerate to see the effect'
+          : 'rule added — regenerate to see the effect', 'ok')
       })
-      onRules(r.rules)
-      resetAddForm()
-      onNotice('rule added — regenerate to see the effect', 'ok')
-    } catch (err) { onNotice(String(err.message || err)) }
+    } catch (err) { reportMutationError(err) }
   }
 
   // --- presets ---
@@ -510,23 +517,22 @@ export default function Editor({
 
   async function applyPreset(name) {
     try {
-      const r = await jsonFetch(`/api/presets/${encodeURIComponent(name)}/apply`, { method: 'POST' })
-      onRules(r.rules)
-      if (r.scale != null) onScale(r.scale)
-      const warn = (r.warnings || []).join(' ; ')
-      onNotice(warn || `preset "${name}" applied`, warn ? 'err' : 'ok')
-    } catch (err) { onNotice(String(err.message || err)) }
+      const state = mutationStateRef.current
+      await state.request(
+        (signal) => jsonFetch(`/api/presets/${encodeURIComponent(name)}/apply`, { method: 'POST', signal }),
+        (result) => {
+          onRules(result.rules)
+          if (result.scale != null) onScale(result.scale)
+          const warn = (result.warnings || []).join(' ; ')
+          onNotice(warn || `preset "${name}" applied`, warn ? 'err' : 'ok')
+        },
+      )
+    } catch (err) { reportMutationError(err) }
   }
 
   // --- export ---
-  const [exportFmt, setExportFmt] = useState('full')
   const [exportName, setExportName] = useState('')
   const [ggufType, setGgufType] = useState('q4_k_m')
-  useEffect(() => {
-    // llama.cpp path removed from Options: don't leave an orphan gguf format
-    if (!llamaCppSet && exportFmt === 'gguf') setExportFmt('full')
-  }, [llamaCppSet, exportFmt])
-
   async function doExport() {
     onNotice('exporting...', 'ok')
     try {
@@ -584,8 +590,10 @@ export default function Editor({
           <h3>Global multiplier</h3>
           <div className="row">
             <input type="range" min="0" max="3" step="0.05" value={scaleShown}
+              disabled={!capabilityState.actions.changeScale}
               onChange={(e) => setGlobalScale(+e.target.value)} style={{ flex: 1 }} />
             <input type="number" step="0.05" value={scaleShown}
+              disabled={!capabilityState.actions.changeScale}
               onChange={(e) => setGlobalScale(e.target.value)}
               style={{ width: 64, flexShrink: 0 }} />
           </div>
@@ -594,7 +602,7 @@ export default function Editor({
             {+scaleShown === 1 ? ' (neutral)' : +scaleShown === 0 ? ' (all disabled)' : ''}
           </div>
           <div style={{ marginTop: 10 }}>
-            <ModeToggle mode={mode || 'standard'} onChange={setMode} pureMode={pureMode} />
+            <ModeSelector state={capabilityState} onChange={setMode} />
           </div>
           <div className="src" style={{ marginTop: 8 }}>{MODE_INFO[mode]?.help || ''}</div>
         </div>
@@ -612,18 +620,23 @@ export default function Editor({
                     setSelected(next)
                   }} />
                 <button className="ed-rule-toggle"
+                  disabled={r.enabled === false ? !capabilityState.actions.enableRule : !capabilityState.actions.disableRule}
                   title={r.enabled === false ? 'rule disabled — click to enable (layers kept)' : 'rule active — click to disable without losing the layers'}
                   onClick={async () => {
                     try {
-                      const resp = await patchJson(`/api/interventions/${r.id}`, { enabled: r.enabled === false })
-                      onRules(resp.rules)
-                    } catch (err) { onNotice(String(err.message || err)) }
+                      const state = mutationStateRef.current
+                      await state.request(
+                        (signal) => patchJson(`/api/interventions/${r.id}`, { enabled: r.enabled === false }, { signal }),
+                        (resp) => onRules(resp.rules),
+                      )
+                    } catch (err) { reportMutationError(err) }
                   }}>{r.enabled === false ? '○' : '●'}</button>
                 <span className="ed-rule-tok" title={ruleTitle(r)}>
                   «{fmtTok(r.token)}»{r.mode === 'replace' ? ` → «${fmtTok(r.replacement)}»` : ''}
                 </span>
                 <span className="src">×</span>
                 <input type="number" step="0.05" className="ed-rule-factor"
+                  disabled={!capabilityState.actions.changeFactor}
                   value={localFactors[r.id] ?? r.factor}
                   onChange={(e) => {
                     setLocalFactors((prev) => ({ ...prev, [r.id]: e.target.value }))
@@ -632,24 +645,34 @@ export default function Editor({
                 <RuleLayerBar all={allLayers} layers={r.layers}
                   onClick={() => setExpandedRule(expandedRule === r.id ? null : r.id)} />
                 <button className="ed-rule-del" title="edit this rule (token, replacement, mode, factor, layers) in the form below"
+                  disabled={!capabilityState.actions.changeRuleDirections}
                   onClick={() => startEditRule(r)}>✎</button>
-                <button className="ed-rule-del" title="delete this rule" onClick={async () => {
+                <button className="ed-rule-del" title="delete this rule"
+                  disabled={!capabilityState.actions.removeRule} onClick={async () => {
                   try {
-                    const resp = await jsonFetch(`/api/interventions/${r.id}`, { method: 'DELETE' })
-                    onRules(resp.rules)
-                    if (editRuleId === r.id) resetAddForm()
-                  } catch (err) { onNotice(String(err.message || err)) }
+                    const state = mutationStateRef.current
+                    await state.request(
+                      (signal) => jsonFetch(`/api/interventions/${r.id}`, { method: 'DELETE', signal }),
+                      (resp) => {
+                        onRules(resp.rules)
+                        if (editRuleId === r.id) resetAddForm()
+                      },
+                    )
+                  } catch (err) { reportMutationError(err) }
                 }}>✕</button>
               </div>
               {expandedRule === r.id && (
                 <div className="ed-rule-layers">
                   <LayerPicker all={allLayers} value={r.layers} defaults={defaultLayers} fitted={fittedSet}
-                    onChange={async (layers) => {
+                    onChange={capabilityState.actions.changeRuleDirections ? async (layers) => {
                       try {
-                        const resp = await patchJson(`/api/interventions/${r.id}`, { layers })
-                        onRules(resp.rules)
-                      } catch (err) { onNotice(String(err.message || err)) }
-                    }} />
+                        const state = mutationStateRef.current
+                        await state.request(
+                          (signal) => patchJson(`/api/interventions/${r.id}`, { layers }, { signal }),
+                          (resp) => onRules(resp.rules),
+                        )
+                      } catch (err) { reportMutationError(err) }
+                    } : () => {}} />
                 </div>
               )}
             </div>
@@ -660,11 +683,14 @@ export default function Editor({
               {selIds.length > 0 && (
                 <button onClick={() => setSelected(new Set())}>deselect all</button>
               )}
-              <button onClick={async () => {
+              <button disabled={!capabilityState.actions.clearRules} onClick={async () => {
                 try {
-                  const resp = await jsonFetch('/api/interventions', { method: 'DELETE' })
-                  onRules(resp.rules)
-                } catch (err) { onNotice(String(err.message || err)) }
+                  const state = mutationStateRef.current
+                  await state.request(
+                    (signal) => jsonFetch('/api/interventions', { method: 'DELETE', signal }),
+                    (resp) => onRules(resp.rules),
+                  )
+                } catch (err) { reportMutationError(err) }
               }}>remove all</button>
             </div>
           )}
@@ -678,13 +704,14 @@ export default function Editor({
               onChange={setGroupLayers} />
             <div className="row">
               <button className="primary"
+                disabled={!capabilityState.actions.changeRuleDirections}
                 onClick={() => applyGroup({ layers: groupLayers })}>Apply layers</button>
             </div>
             <div className="row">
               <label>factor</label>
               <input type="number" step="0.05" value={groupFactor} placeholder="—"
                 onChange={(e) => setGroupFactor(e.target.value)} />
-              <button disabled={groupFactor === ''}
+              <button disabled={groupFactor === '' || !capabilityState.actions.changeFactor}
                 onClick={() => applyGroup({ factor: +groupFactor })}>Apply</button>
             </div>
             <button onClick={() => setSelected(new Set())}>deselect</button>
@@ -712,7 +739,7 @@ export default function Editor({
           <LayerPicker all={allLayers} value={addLayers} defaults={defaultLayers} fitted={fittedSet}
             onChange={setAddLayers} />
           <button className="primary"
-            disabled={!addToken.text.trim() || (addMode === 'replace' && !addRepl.text.trim()) || !addLayers.length || !!busy}
+            disabled={!capabilityState.actions.addRule || !addToken.text.trim() || (addMode === 'replace' && !addRepl.text.trim()) || !addLayers.length || !!busy}
             onClick={addRule}>{editRuleId != null ? 'Update' : 'Add'}</button>
         </div>
 
@@ -724,7 +751,7 @@ export default function Editor({
                 <span className="preset-name">{p.name} · {p.n_rules} rule(s)</span>
                 {p.model_id && <span className="src preset-model">{p.model_id.replace(/^local\//, '')}</span>}
               </span>
-              <button disabled={!!busy} onClick={() => applyPreset(p.name)}>Apply</button>
+              <button disabled={!capabilityState.actions.applyPreset} onClick={() => applyPreset(p.name)}>Apply</button>
               <button onClick={async () => {
                 await jsonFetch(`/api/presets/${encodeURIComponent(p.name)}`, { method: 'DELETE' }).catch(() => {})
                 refreshPresets()
@@ -739,26 +766,19 @@ export default function Editor({
         </div>
 
         <div className="ed-section">
-          <h3>Export the edit
-            <span className="exp-tag">{MODE_INFO[mode]?.tag || ''}</span>
-          </h3>
-          {mode === 'standard' ? (
-            <div className="src exp-disabled-note" style={{ marginBottom: 6 }}>
-              ⚠ export disabled in "per-layer steering": no bake reproduces the
-              per-layer hooks faithfully. Switch the mode to
-              "{pureMode === 'abliteration' ? 'global projection' : 'read projection'}"
-              above for a faithful checkpoint.
-            </div>
-          ) : null}
-          <div className={mode === 'standard' ? 'exp-grid exp-grid-off' : 'exp-grid'}>
-            <div className="row"><label>format</label>
-              <select value={exportFmt} onChange={(e) => setExportFmt(e.target.value)} disabled={mode === 'standard'}>
-                <option value="full">full checkpoint</option>
-                <option value="layers">modified layers (safetensors)</option>
-                <option value="lora">LoRA (PEFT)</option>
-                {llamaCppSet && <option value="gguf">GGUF (via llama.cpp)</option>}
-              </select>
-            </div>
+          <h3>Export the edit</h3>
+          <div className="exp-grid" role="radiogroup" aria-label="export format">
+            {Object.entries({ full: 'Full checkpoint', layers: 'Layers', lora: 'LoRA', gguf: 'GGUF' }).map(([id, label]) => {
+              const item = selectedExportState(capabilityState, id)
+              return <label key={id} className={`cap-row ${exportFmt === id ? 'selected' : ''}`}>
+                <input type="radio" name="export-format" checked={exportFmt === id}
+                  onChange={() => onExportFmtChange(id)} />
+                <span><strong>{label}</strong>
+                  <span className={item.serverEnabled ? 'cap-local' : 'cap-reason'}>Model/mode: {item.decision.reason}</span>
+                  {!item.local.ready && <span className="cap-local">Local: {item.local.reason}</span>}
+                </span>
+              </label>
+            })}
             {exportFmt === 'gguf' && (
               <div className="row"><label title="bf16/f16 = plain conversion; q* = quantized with llama-quantize. The intermediate HF checkpoint is cached so other types don't re-bake.">type</label>
                 <select value={ggufType} onChange={(e) => setGgufType(e.target.value)}>
@@ -770,20 +790,16 @@ export default function Editor({
             )}
             <div className="row"><label>name</label>
               <input type="text" placeholder="edit name" value={exportName}
-                onChange={(e) => setExportName(e.target.value)} disabled={mode === 'standard'} />
+                onChange={(e) => setExportName(e.target.value)} />
             </div>
             <button className="primary"
-              disabled={mode === 'standard' || !exportName.trim()
-                || (exportFmt !== 'gguf' && !rules.length) || !!busy
+              disabled={!capabilityState.formats[exportFmt].enabled || !exportName.trim()
+                || !!busy
                 || ggufState?.state === 'running'}
               onClick={doExport}>Export</button>
-            {!llamaCppSet && (
-              <div className="src">tip: set the llama.cpp folder in the Options tab to
-                unlock a direct GGUF export.</div>
-            )}
             {exportFmt === 'gguf' && (
               <div className="row" style={{ marginTop: 2 }}>
-                <button disabled={!exportName.trim() || ggufState?.state === 'running'}
+                <button disabled={!capabilityState.actions.cleanGgufCache || !exportName.trim() || ggufState?.state === 'running'}
                   title="delete the cached intermediate HF checkpoint of this export (the .gguf files stay)"
                   onClick={cleanGgufCache}>clean cache</button>
               </div>
@@ -799,7 +815,6 @@ export default function Editor({
             {ggufState?.state === 'error' && (
               <div className="src reg-reason">GGUF failed: {ggufState.error}</div>
             )}
-            <div className="src">{MODE_INFO[mode]?.exportHelp || ''}</div>
           </div>
         </div>
       </div>
