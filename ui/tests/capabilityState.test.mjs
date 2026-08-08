@@ -91,6 +91,9 @@ test('cleanup survives stale status unless a transition or busy operation blocks
   assert.equal(state.actions.removeRule, true)
   assert.equal(state.actions.clearRules, true)
   assert.equal(state.actions.addRule, false)
+  assert.equal(state.modes.readthrough.enabled, false)
+  assert.equal(state.modes.readthrough.mechanicalReason,
+    'Load a model and wait for fresh session status.')
 })
 
 test('malformed diagnostics remain advisory for a fresh coherent session', () => {
