@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { createEditorMutationState, isEditorMutationCancellation, throwIfEditorMutationCancelled } from '../src/editorMutationState.js'
 
-const deferred = () => { let resolve; const promise = new Promise((done) => { resolve = done }); return { promise, resolve } }
+const deferred = () => { let resolve, reject; const promise = new Promise((done, fail) => { resolve = done; reject = fail }); return { promise, resolve, reject } }
 
 test('invalidation and unmount teardown cancel queued factor and scale timers', () => {
   const callbacks = new Map(); let id = 0
@@ -51,4 +51,28 @@ test('token preflight cannot continue to intervention mutation after turnover', 
 test('expected cancellation is silent-classified while real failures remain reportable', () => {
   assert.equal(isEditorMutationCancellation(new DOMException('aborted', 'AbortError')), true)
   assert.equal(isEditorMutationCancellation(new Error('server failed')), false)
+})
+
+test('late ordinary rejection after invalidation is reclassified as cancellation', async () => {
+  const pending = deferred(); const published = []
+  const state = createEditorMutationState()
+  const request = state.request(() => pending.promise, (value) => published.push(value))
+  state.invalidate()
+  pending.reject(new Error('late backend failure'))
+  await assert.rejects(request, (error) => {
+    assert.equal(isEditorMutationCancellation(error), true)
+    assert.doesNotMatch(error.message, /late backend failure/)
+    return true
+  })
+  assert.deepEqual(published, [])
+})
+
+test('ordinary rejection while current preserves the genuine error', async () => {
+  const failure = new Error('real failure')
+  const state = createEditorMutationState()
+  await assert.rejects(state.request(async () => { throw failure }), (error) => {
+    assert.equal(error, failure)
+    assert.equal(isEditorMutationCancellation(error), false)
+    return true
+  })
 })

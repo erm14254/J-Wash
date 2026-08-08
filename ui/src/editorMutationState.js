@@ -37,10 +37,15 @@ export function createEditorMutationState({ setTimer = setTimeout, clearTimer = 
     const controller = new AbortController()
     controllers.add(controller)
     try {
-      const value = await factory(controller.signal)
-      if (!current) throw new EditorMutationCancellation()
-      publish?.(value)
-      return value
+      try {
+        const value = await factory(controller.signal)
+        if (!current) throw new EditorMutationCancellation()
+        publish?.(value)
+        return value
+      } catch (error) {
+        if (!current) throw new EditorMutationCancellation()
+        throw error
+      }
     } finally {
       controllers.delete(controller)
     }
