@@ -34,6 +34,8 @@ The live preview mode (core/ablation) applies the SAME transform via hooks on th
 RMSNorm output: the preview and the exported checkpoint differ only by rounding.
 """
 
+from dataclasses import dataclass
+
 import torch
 
 from core.ablation import effective_coeffs
@@ -66,6 +68,30 @@ READS = {
 }
 # most archs read the MLP via post_attention_layernorm
 READS_POST = {"mlp.gate_proj", "mlp.up_proj"}
+
+
+@dataclass(frozen=True)
+class ReaderTarget:
+    """A residual read and its exact state-dict spelling."""
+
+    state_suffix: str
+    accessor: str
+    norm_name: str
+
+    def tensor(self, block):
+        value = _submodule(block, self.accessor)
+        if isinstance(value, torch.nn.Parameter):
+            return value
+        return getattr(value, "weight", None)
+
+
+_MOE_READS = (
+    ReaderTarget("mlp.gate.weight", "mlp.gate", "post_attention_layernorm"),
+    ReaderTarget("mlp.experts.gate_up_proj", "mlp.experts.gate_up_proj", "post_attention_layernorm"),
+    ReaderTarget("mlp.shared_expert.gate_proj.weight", "mlp.shared_expert.gate_proj", "post_attention_layernorm"),
+    ReaderTarget("mlp.shared_expert.up_proj.weight", "mlp.shared_expert.up_proj", "post_attention_layernorm"),
+    ReaderTarget("mlp.shared_expert_gate.weight", "mlp.shared_expert_gate", "post_attention_layernorm"),
+)
 
 # Writes into the residual (exact mode only)
 WRITES = ("self_attn.o_proj", "linear_attn.out_proj", "mlp.down_proj")
@@ -106,7 +132,21 @@ def iter_reads(block):
         norm = getattr(block, norm_name, None)
         if norm is None or not hasattr(norm, "weight"):
             raise ValueError(f"RMSNorm {norm_name} not found for {suffix}")
-        yield suffix, module, norm
+        yield ReaderTarget(suffix + ".weight", suffix, norm_name), module.weight, norm
+    if _submodule(block, "mlp.experts.gate_up_proj") is not None:
+        for target in _MOE_READS:
+            tensor = target.tensor(block)
+            norm = getattr(block, target.norm_name, None)
+            if tensor is None:
+                raise ValueError(f"packed MoE reader {target.state_suffix} not found")
+            if norm is None or not hasattr(norm, "weight"):
+                raise ValueError(f"RMSNorm {target.norm_name} not found for {target.state_suffix}")
+            yield target, tensor, norm
+
+
+def has_packed_moe(jl):
+    """Whether any decoder block contains Qwen's raw packed expert reader."""
+    return any(_submodule(block, "mlp.experts.gate_up_proj") is not None for block in jl.layers)
 
 
 def iter_writes(block):
@@ -205,9 +245,16 @@ def gamma_pair(norm, U, V):
 
 
 def apply_read(W, Ug, Vg):
-    """``W ← W·(I + Ug·Vgᵀ)``; returns ``(W_new, B, A)`` with delta = B·A."""
-    B = W @ Ug  # [out, r]
-    return W + B @ Vg.T, B, Vg.T.contiguous()
+    """Right-transform ``W[..., output_features, hidden_size]``."""
+    if W.ndim < 2:
+        raise ValueError("read tensor must have at least two dimensions")
+    if W.shape[-1] != Ug.shape[0] or Ug.shape[0] != Vg.shape[0]:
+        raise ValueError("read tensor residual hidden axis does not match transform")
+    B = W @ Ug
+    result = W + B @ Vg.T
+    if result.shape != W.shape:
+        raise ValueError("read transform changed tensor shape")
+    return result, B, Vg.T.contiguous()
 
 
 def inverse_uv(U, V):
@@ -261,6 +308,8 @@ def build_plan(rules, jl, scale, exact=False):
             "all coefficients neutral (factors at 1 and/or scale=0): "
             "the bake would change no weight"
         )
+    if exact and has_packed_moe(jl):
+        raise ValueError("Exact is not implemented for packed MoE; use Readthrough")
     path = jl.layout.path
     transforms = {}
     regularized_layers = []
@@ -269,11 +318,11 @@ def build_plan(rules, jl, scale, exact=False):
     for m in sorted(k for k in cums if k < n_layers):
         U, V = cums[m]
         block = jl.layers[m]
-        for suffix, _module, norm in iter_reads(block):
+        for target, _tensor, norm in iter_reads(block):
             Ug, Vg = gamma_pair(norm, U, V)
             g_min = effective_gamma(norm).abs().min().item()
             min_gamma = g_min if min_gamma is None else min(min_gamma, g_min)
-            transforms[f"{path}.layers.{m}.{suffix}.weight"] = ("read", Ug, Vg)
+            transforms[f"{path}.layers.{m}.{target.state_suffix}"] = ("read", Ug, Vg)
         if exact:
             U_inv, Vw, regularized = inverse_uv(U, V)
             if regularized:
@@ -296,5 +345,6 @@ def build_plan(rules, jl, scale, exact=False):
         "layers_span": [min(cums), n_layers - 1],
         "regularized_layers": regularized_layers,
         "min_gamma": min_gamma,
+        "packed_moe": has_packed_moe(jl),
     }
     return transforms, info

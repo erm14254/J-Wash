@@ -17,6 +17,7 @@ PRESETS_DIR = config.DATA_DIR / "presets"
 
 # Residual writes edited by the global abliteration (embed aside)
 TARGET_SUFFIXES = ("self_attn.o_proj", "mlp.down_proj")
+REBASE_EXPORT_ROW_BUDGET = 4096
 
 
 def _now():
@@ -361,6 +362,30 @@ def _disk_mapper(mem_embed_key, disk_keys):
     return to_disk
 
 
+def apply_read_transform_bounded(entry, tensor, *, row_budget=REBASE_EXPORT_ROW_BUDGET,
+                                 observer=None):
+    """Apply a packed rank-3 read transform with bounded float32 temporaries."""
+    if tensor.ndim != 3 or entry[0] != "read":
+        raise ValueError("bounded transform requires a rank-3 read tensor")
+    if row_budget < 1:
+        raise ValueError("row_budget must be positive")
+    source = tensor.detach().cpu().contiguous()
+    rows = source.reshape(-1, source.shape[-1])
+    destination = torch.empty_like(source)
+    dest_rows = destination.reshape_as(rows)
+    _kind, Ug, Vg = entry
+    delta_max = 0.0
+    for start in range(0, rows.shape[0], row_budget):
+        count = min(row_budget, rows.shape[0] - start)
+        if observer is not None:
+            observer(count)
+        chunk = rows[start:start + count].float()
+        updated = chunk + (chunk @ Ug) @ Vg.T
+        delta_max = max(delta_max, float((updated - chunk).abs().max()))
+        dest_rows[start:start + count].copy_(updated.to(source.dtype))
+    return destination, delta_max
+
+
 def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.0, exact=False):
     """Pure-weight export by change of basis of the reads (cf. core/rebase).
 
@@ -377,12 +402,26 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
         raise ValueError(f"unknown format for {method}: {fmt}")
     transforms, info = rebase.build_plan(rules, jl, scale, exact=exact)
     lm_head_key = info["lm_head_key"]
+    if info["packed_moe"]:
+        if exact:
+            raise ValueError("Exact is not implemented for packed MoE; use Readthrough")
+        if fmt == "lora":
+            raise ValueError("LoRA is not implemented for packed MoE; use Full Readthrough")
+        if fmt == "layers":
+            raise ValueError("Layers is not implemented for packed MoE; use Full Readthrough")
 
     delta_max = 0.0
     applied = set()
 
     def bake(key, tensor):
         nonlocal delta_max
+        if tensor.ndim == 3 and transforms[key][0] == "read":
+            W_new, chunk_delta = apply_read_transform_bounded(
+                transforms[key], tensor, row_budget=REBASE_EXPORT_ROW_BUDGET
+            )
+            delta_max = max(delta_max, chunk_delta)
+            applied.add(key)
+            return W_new
         W = tensor.detach().to("cpu", torch.float32)
         W_new, _B, _A = rebase.apply_transform(transforms[key], W)
         delta_max = max(delta_max, (W_new - W).abs().max().item())

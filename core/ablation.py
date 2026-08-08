@@ -333,6 +333,8 @@ class Interventions:
         cums = rebase.cumulative(active, self._scale, n_layers)
         if not cums:
             return
+        if exact and rebase.has_packed_moe(jl):
+            raise ValueError("Exact is not implemented for packed MoE; use Readthrough")
 
         def read_hook_for(norm, U, V):
             Ug, Vg = rebase.gamma_pair(norm, U, V)
