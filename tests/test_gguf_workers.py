@@ -83,26 +83,36 @@ def test_api_gguf_preparation_uses_nested_hf_name(tmp_path, monkeypatch):
     captured = {}
     monkeypatch.setattr(app.editing, "EDITS_DIR", tmp_path / "edits")
     monkeypatch.setattr(app, "_llamacpp_paths", lambda: (tmp_path / "convert.py", None, None))
-    monkeypatch.setattr(app, "resolve_local_dir", lambda _model: tmp_path / "source")
+    revisions = []
+    monkeypatch.setattr(
+        app, "resolve_local_dir",
+        lambda _model, *, revision=None: revisions.append(revision) or tmp_path / "source",
+    )
     _mock_loaded_readthrough(app, monkeypatch)
     def fake_export(*_args, **kwargs):
         captured["name"] = kwargs["name"]
         target = app.editing.EDITS_DIR / kwargs["name"]
-        target.mkdir(parents=True); (target / "config.json").write_text("{}")
+        stage = target.with_name(".hf.test-stage")
+        stage.mkdir(parents=True); (stage / "config.json").write_text("{}")
+        kwargs["publication_guard"].publish(lambda: stage.replace(target))
         return {"out_dir": str(target)}
     monkeypatch.setattr(app.editing, "export_rebase", fake_export)
-    monkeypatch.setattr(app, "_gguf_worker", lambda *_args: None)
+    pending = _deferred_threads(monkeypatch, app)
     app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
     result = asyncio.run(app.api_edit_export_gguf(SimpleNamespace(name="job", gguf_type="bf16")))
     assert captured["name"] == "job/hf" and result["checkpoint"] == "baked"
+    assert revisions == [None]
     assert (app.editing.EDITS_DIR / "job" / "hf" / "config.json").exists()
+    pending[0].run()
+    assert app._gguf_owner is None
 
 
 def test_api_gguf_maps_generic_export_error_to_500(tmp_path, monkeypatch):
     import api.app as app
     monkeypatch.setattr(app.editing, "EDITS_DIR", tmp_path / "edits")
     monkeypatch.setattr(app, "_llamacpp_paths", lambda: (tmp_path / "convert.py", None, None))
-    monkeypatch.setattr(app, "resolve_local_dir", lambda _model: tmp_path / "source")
+    monkeypatch.setattr(app, "resolve_local_dir",
+                        lambda _model, *, revision=None: tmp_path / "source")
     _mock_loaded_readthrough(app, monkeypatch)
     monkeypatch.setattr(app.editing, "export_rebase", lambda *_a, **_k: (_ for _ in ()).throw(OSError("disk failed")))
     app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
@@ -172,26 +182,19 @@ def test_fresh_gguf_predispatch_failure_releases_bake_owner(tmp_path, monkeypatc
     cached = app.editing.EDITS_DIR / "job" / "hf"
     cached.mkdir(parents=True)
     (cached / "config.json").write_text("{}")
-    started = []
-
-    class FakeThread:
-        def __init__(self, *args, **kwargs):
-            started.append((args, kwargs))
-
-        def start(self):
-            pass
-
-    monkeypatch.setattr(app, "threading", SimpleNamespace(Thread=FakeThread))
+    pending = _deferred_threads(monkeypatch, app)
     response = TestClient(app.app).post(
         "/api/edit/export-gguf", json={"name": "job", "gguf_type": "bf16"})
 
     assert response.status_code == 200
     assert response.json()["checkpoint"] == "reused"
-    assert started
+    assert pending
+    pending[0].run()
+    assert app._gguf_owner is None
     assert app.manager.coordinator.snapshot().operation is None
 
 
-def test_fresh_gguf_abliteration_rejected_before_dispatch_or_state(tmp_path, monkeypatch):
+def test_fresh_gguf_abliteration_rejected_after_terminal_reservation(tmp_path, monkeypatch):
     import api.app as app
     monkeypatch.setattr(app.editing, "EDITS_DIR", tmp_path / "edits")
     monkeypatch.setattr(app, "_llamacpp_paths",
@@ -211,7 +214,10 @@ def test_fresh_gguf_abliteration_rejected_before_dispatch_or_state(tmp_path, mon
             SimpleNamespace(name="global", gguf_type="bf16")
         ))
     assert exc.value.status_code == 422
-    assert app._gguf_state == original
+    assert app._gguf_state["state"] == "error"
+    assert app._gguf_state["name"] == "global"
+    assert app._gguf_state["result"] is None
+    assert app._gguf_owner is None
 
 
 @pytest.mark.parametrize("name", ["COM¹", "com²", "COM³.txt", "LPT¹", "lpt².json", "folder/LPT³"])
@@ -255,16 +261,13 @@ def test_gguf_valid_cached_reuse_and_delete(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "_llamacpp_paths", lambda: (tmp_path / "convert.py", None, None))
     monkeypatch.setattr(app.editing, "export_rebase",
                         lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("cache was not reused")))
-    started = []
-    class FakeThread:
-        def __init__(self, *args, **kwargs): started.append((args, kwargs))
-        def start(self): pass
-    monkeypatch.setattr(app, "threading", SimpleNamespace(Thread=FakeThread))
+    pending = _deferred_threads(monkeypatch, app)
     app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
     client = TestClient(app.app)
     response = client.post("/api/edit/export-gguf", json={"name": "job", "gguf_type": "bf16"})
-    assert response.status_code == 200 and response.json()["checkpoint"] == "reused" and started
-    app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
+    assert response.status_code == 200 and response.json()["checkpoint"] == "reused" and pending
+    pending[0].run()
+    assert app._gguf_owner is None
     response = client.post("/api/edit/gguf-cache/delete", json={"name": "job"})
     assert response.status_code == 200 and not cached.exists()
 
@@ -290,10 +293,13 @@ def test_gguf_nested_worker_outputs_use_leaf_stem(
     monkeypatch.setattr(app, "_llamacpp_paths", lambda: (convert, quantize, None))
     if not cached:
         _mock_loaded_readthrough(app, monkeypatch)
-        monkeypatch.setattr(app, "resolve_local_dir", lambda _model: tmp_path / "source")
+        monkeypatch.setattr(app, "resolve_local_dir",
+                            lambda _model, *, revision=None: tmp_path / "source")
         def fake_export(*_args, **kwargs):
             assert kwargs["name"] == name + "/hf"
-            hf_dir.mkdir(parents=True); (hf_dir / "config.json").write_text("{}")
+            stage = hf_dir.with_name(".hf.test-stage")
+            stage.mkdir(parents=True); (stage / "config.json").write_text("{}")
+            kwargs["publication_guard"].publish(lambda: stage.replace(hf_dir))
         monkeypatch.setattr(app.editing, "export_rebase", fake_export)
     pending = _deferred_threads(monkeypatch, app)
     app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)
@@ -354,9 +360,14 @@ def test_gguf_atomic_partial_failure_then_retry(name, cached, gguf_type, tmp_pat
     baked = []
     if not cached:
         _mock_loaded_readthrough(app, monkeypatch)
-        monkeypatch.setattr(app, "resolve_local_dir", lambda _model: tmp_path / "source")
-        def fake_export(*_args, **_kwargs):
-            baked.append(True); hf_dir.mkdir(parents=True); sentinel.write_text('{"baked": true}')
+        monkeypatch.setattr(app, "resolve_local_dir",
+                            lambda _model, *, revision=None: tmp_path / "source")
+        def fake_export(*_args, **kwargs):
+            baked.append(True)
+            stage = hf_dir.with_name(".hf.test-stage")
+            stage.mkdir(parents=True)
+            (stage / "config.json").write_text('{"baked": true}')
+            kwargs["publication_guard"].publish(lambda: stage.replace(hf_dir))
         monkeypatch.setattr(app.editing, "export_rebase", fake_export)
     pending = _deferred_threads(monkeypatch, app)
     app._gguf_state.update(state="idle", name=None, step=None, error=None, result=None)

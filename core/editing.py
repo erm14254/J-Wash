@@ -1897,7 +1897,14 @@ def _export_rebase_impl_from_inventory(rules, jl, model_meta, *, fmt, name, sour
             )
 
         lm_head_written = False
-        embed_shard_name = None
+        embed_shard_name = (source_index["weight_map"].get(embed_key)
+                            if source_index is not None else None)
+        if (source_index is not None and info["tied"]
+                and lm_head_key not in disk_keys):
+            if embed_shard_name is None:
+                raise ValueError("cannot untie: index does not own the embedding source")
+            if embed_key not in disk_keys:
+                raise ValueError("cannot untie: indexed embedding source is absent")
         for shard in shards:
             out = {}
             with safe_open(str(shard), framework="pt") as f:

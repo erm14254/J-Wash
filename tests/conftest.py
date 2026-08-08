@@ -29,11 +29,21 @@ def restore_api_gguf_state():
     yield
     app = sys.modules.get("api.app")
     if app is not None:
+        leaked_owner = leaked_delete = None
         with app._gguf_lock:
-            assert app._gguf_owner is None
-            assert app._gguf_delete_claim is None
+            leaked_owner = app._gguf_owner
+            leaked_delete = app._gguf_delete_claim
+            app._gguf_owner = None
+            app._gguf_delete_claim = None
             app._gguf_state.clear()
             app._gguf_state.update(original)
+        leaks = []
+        if leaked_owner is not None:
+            leaks.append(f"GGUF job owner leaked: {leaked_owner!r}")
+        if leaked_delete is not None:
+            leaks.append(f"GGUF cache-delete claim leaked: {leaked_delete!r}")
+        if leaks:
+            pytest.fail("; ".join(leaks))
 
 @pytest.fixture(scope="module")
 def tiny():

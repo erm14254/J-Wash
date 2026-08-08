@@ -16,6 +16,43 @@ from core.ablation import Interventions
 from core.model_manager import _rebase_capability_meta
 from helpers import *
 
+
+def test_resolve_local_dir_passes_hub_revision(monkeypatch, tmp_path):
+    from core import model_manager
+
+    cached = tmp_path / "snapshots" / "recorded-revision" / "config.json"
+    cached.parent.mkdir(parents=True)
+    cached.write_text("{}")
+    calls = []
+    monkeypatch.setattr(
+        model_manager, "try_to_load_from_cache",
+        lambda source, filename, *, revision=None: (
+            calls.append((source, filename, revision)) or str(cached)
+        ),
+    )
+
+    assert model_manager.resolve_local_dir(
+        "owner/model", revision="recorded-revision"
+    ) == str(cached.parent)
+    assert calls == [("owner/model", "config.json", "recorded-revision")]
+
+
+def test_resolve_local_dir_ignores_revision_for_local_directory(monkeypatch, tmp_path):
+    from core import model_manager
+
+    local = tmp_path / "local-model"
+    local.mkdir()
+    monkeypatch.setattr(
+        model_manager, "try_to_load_from_cache",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("local source must not consult the Hub cache")
+        ),
+    )
+
+    assert model_manager.resolve_local_dir(
+        str(local), revision="irrelevant-revision"
+    ) == str(local)
+
 def test_literal_reader_inventory_and_raw_key():
     assert {t.state_suffix for t, _, _ in rebase.iter_reads(block())} == FULL_READERS
     assert {t.state_suffix for t, _, _ in rebase.iter_reads(block(True))} == LINEAR_READERS

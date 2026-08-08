@@ -236,7 +236,8 @@ def test_global_mode_is_rejected_by_mode_and_export_apis(tmp_path, monkeypatch):
 
     iv._mode = "abliteration"
     iv._rules = [{"layers": [0], "enabled": True}]
-    monkeypatch.setattr(app, "resolve_local_dir", lambda _name: tmp_path)
+    monkeypatch.setattr(app, "resolve_local_dir",
+                        lambda _name, *, revision=None: tmp_path)
     with pytest.raises(app.HTTPException) as exc:
         __import__("asyncio").run(app.api_edit_export(
             SimpleNamespace(name="global", format="full")
