@@ -1195,6 +1195,16 @@ def apply_transform(entry, W):
     return apply_write(W, X, Y)
 
 
+@dataclass(frozen=True)
+class SourceTensorSpec:
+    """Inventory-derived structural identity for one transformed source."""
+    memory_key: str
+    shape: tuple[int, ...]
+    transform_kind: str
+    residual_axis: int
+    site: str
+
+
 def build_plan(rules, jl, scale, exact=False):
     """Bake plan: ``{param_name: entry}`` with ``entry = ("read", Ug, Vg)`` or
     ``("write", U_inv, V)`` — apply with :func:`apply_transform` — plus the
@@ -1223,6 +1233,7 @@ def _build_plan_from_inventory(rules, jl, scale, *, exact=False, inventory):
         )
     path = jl.layout.path
     transforms = {}
+    source_specs = {}
     regularized_layers = []
     min_gamma = None
 
@@ -1230,22 +1241,33 @@ def _build_plan_from_inventory(rules, jl, scale, *, exact=False, inventory):
         U, V = cums[m]
         block = jl.layers[m]
         block_inventory = inventory.blocks[m]
-        for target, _tensor, norm in block_inventory.reads:
+        for target, tensor, norm in block_inventory.reads:
             Ug, Vg = gamma_pair(norm, U, V)
             g_min = effective_gamma(norm).abs().min().item()
             min_gamma = g_min if min_gamma is None else min(min_gamma, g_min)
-            transforms[f"{path}.layers.{m}.{target.state_suffix}"] = ("read", Ug, Vg)
+            key = f"{path}.layers.{m}.{target.state_suffix}"
+            if key in transforms:
+                raise ValueError(f"duplicate transform key: {key}")
+            transforms[key] = ("read", Ug, Vg)
+            source_specs[key] = SourceTensorSpec(key, tuple(tensor.shape), "read", -1, "reader")
         if exact:
             U_inv, Vw, regularized = inverse_uv(U, V)
             if regularized:
                 regularized_layers.append(m)
-            for suffix, _module in block_inventory.writes:
-                transforms[f"{path}.layers.{m}.{suffix}.weight"] = ("write", U_inv, Vw)
+            for suffix, module in block_inventory.writes:
+                key = f"{path}.layers.{m}.{suffix}.weight"
+                if key in transforms:
+                    raise ValueError(f"duplicate transform key: {key}")
+                transforms[key] = ("write", U_inv, Vw)
+                source_specs[key] = SourceTensorSpec(key, tuple(module.weight.shape), "write", 0, "writer")
 
     U, V = cums[n_layers]
     Ug, Vg = gamma_pair(inventory.final_norm, U, V)
     lm_head_key, _head, _head_weight = inventory.final_head
     transforms[lm_head_key] = ("read", Ug, Vg)
+    source_specs[lm_head_key] = SourceTensorSpec(
+        lm_head_key, tuple(_head_weight.shape), "read", -1, "final_head"
+    )
 
     info = {
         "tied": inventory.tied,
@@ -1259,5 +1281,6 @@ def _build_plan_from_inventory(rules, jl, scale, *, exact=False, inventory):
         "targets": {f"{path}.layers.{m}.{target.state_suffix}": target
                     for m in sorted(k for k in cums if k < n_layers)
                     for target, _tensor, _norm in inventory.blocks[m].reads},
+        "source_specs": source_specs,
     }
     return transforms, info

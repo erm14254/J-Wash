@@ -365,3 +365,19 @@ def test_publish_loaded_rebound_failure_is_not_partial(monkeypatch):
     assert snap.model_session_id == 0
     assert snap.loaded is False
     assert c.snapshot().bundle is None
+
+
+def test_can_publish_requires_exact_current_uncancelled_owner():
+    c = ModelSessionCoordinator()
+    token, _ = c.acquire(OperationType.LOAD)
+    assert c.can_publish(token)
+    assert not c.can_publish(None)
+    assert c.request_cancel(token)
+    assert not c.can_publish(token)
+    assert c.release(token)
+    successor, _ = c.acquire(OperationType.LOAD)
+    assert not c.can_publish(token)
+    assert c.can_publish(successor)
+    assert not c.release(token)
+    assert c.can_publish(successor)
+    assert c.release(successor)

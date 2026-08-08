@@ -430,9 +430,8 @@ def test_quantized_gguf_is_published_atomically_and_retries(
         "sys.stderr.write('deliberate quantizer failure')\n"
         "sys.exit(3)\n",
     )
-    app._gguf_state.update(state="running", name="job/hf", step="starting",
-                           error=None, result=None)
-    app._gguf_worker("job/hf", job_dir, "hf", "q4_k_m", hf_dir,
+    token = app._reserve_gguf_job("job/hf")
+    app._gguf_worker(token, "job/hf", job_dir, "hf", "q4_k_m", hf_dir,
                      tmp_path / "unused-converter.py", quantize, None)
 
     failure = json.loads(failure_marker.read_text())
@@ -458,9 +457,8 @@ def test_quantized_gguf_is_published_atomically_and_retries(
         f"pathlib.Path({str(success_marker)!r}).write_text(json.dumps(sys.argv[1:]))\n"
         "pathlib.Path(sys.argv[2]).write_bytes(b'VALID-QUANTIZED')\n",
     )
-    app._gguf_state.update(state="running", name="job/hf", step="starting",
-                           error=None, result=None)
-    app._gguf_worker("job/hf", job_dir, "hf", "q4_k_m", hf_dir,
+    token = app._reserve_gguf_job("job/hf")
+    app._gguf_worker(token, "job/hf", job_dir, "hf", "q4_k_m", hf_dir,
                      tmp_path / "unused-converter.py", quantize, None)
 
     success_args = json.loads(success_marker.read_text())
@@ -486,8 +484,8 @@ def test_gguf_atomic_reuses_existing_published_base(tmp_path, monkeypatch):
     marker = tmp_path / "converter-invoked"
     convert = tmp_path / "convert.py"
     convert.write_text(f"import pathlib\npathlib.Path({str(marker)!r}).write_text('bad')\n")
-    app._gguf_state.update(state="running", name="job", step="starting", error=None, result=None)
-    app._gguf_worker("job", job_dir, "job", "bf16", hf_dir, convert, None, None)
+    token = app._reserve_gguf_job("job")
+    app._gguf_worker(token, "job", job_dir, "job", "bf16", hf_dir, convert, None, None)
     assert app._gguf_state["state"] == "done" and not marker.exists()
     assert base.read_bytes() == b"PUBLISHED-GGUF"
 
@@ -500,8 +498,8 @@ def test_gguf_atomic_rejects_missing_or_empty_converter_output(body, message, tm
     import api.app as app
     job_dir = tmp_path / "job"; hf_dir = job_dir / "hf"; hf_dir.mkdir(parents=True)
     convert = tmp_path / "convert.py"; convert.write_text(body)
-    app._gguf_state.update(state="running", name="job", step="starting", error=None, result=None)
-    app._gguf_worker("job", job_dir, "job", "bf16", hf_dir, convert, None, None)
+    token = app._reserve_gguf_job("job")
+    app._gguf_worker(token, "job", job_dir, "job", "bf16", hf_dir, convert, None, None)
     assert app._gguf_state["state"] == "error" and message in app._gguf_state["error"]
     assert not (job_dir / "job-bf16.gguf").exists()
     assert not list(job_dir.glob(".*.tmp-*.gguf"))

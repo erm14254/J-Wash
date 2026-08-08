@@ -23,14 +23,17 @@ def synthetic_decoder_specs(monkeypatch):
 @pytest.fixture(autouse=True)
 def restore_api_gguf_state():
     app = sys.modules.get("api.app")
-    original = (dict(app._gguf_state) if app is not None else
+    original = (app._gguf_state_snapshot() if app is not None else
                 {"state": "idle", "name": None, "step": None,
                  "error": None, "result": None})
     yield
     app = sys.modules.get("api.app")
     if app is not None:
-        app._gguf_state.clear()
-        app._gguf_state.update(original)
+        with app._gguf_lock:
+            assert app._gguf_owner is None
+            assert app._gguf_delete_claim is None
+            app._gguf_state.clear()
+            app._gguf_state.update(original)
 
 @pytest.fixture(scope="module")
 def tiny():
