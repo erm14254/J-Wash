@@ -1,6 +1,11 @@
 # Models and caches (large, regenerable)
 hf_cache/
 lenses/
+# model checkpoints / edited exports dropped in the repo root
+*-Preserved/
+*-Test*/
+*.safetensors
+*.gguf
 
 # Runtime data: conversation history (db), fits, frames, presets, edits, masks
 data/

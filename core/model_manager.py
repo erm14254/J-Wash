@@ -418,13 +418,36 @@ def _resolve_revision(source):
     return None
 
 
-def _sample(logits, temperature, top_p, top_k, generator=None, penalty=1.0, penalty_ids=None):
+def _shipped_sampling(hf_model):
+    """Sampling values the model's AUTHOR shipped in generation_config.json.
+
+    ``to_diff_dict`` keeps only non-default fields — plain attribute access
+    would return the HF class defaults (temp 1.0, top_k 50) for models that
+    never specified them, which are exactly the wrong values to adopt."""
+    gen_cfg = getattr(hf_model, "generation_config", None)
+    if gen_cfg is None or not hasattr(gen_cfg, "to_diff_dict"):
+        return {}
+    diff = gen_cfg.to_diff_dict()
+    return {
+        key: diff[key]
+        for key in ("temperature", "top_p", "top_k", "min_p", "repetition_penalty")
+        if diff.get(key) is not None
+    }
+
+
+def _sample(logits, temperature, top_p, top_k, generator=None, penalty=1.0,
+            penalty_ids=None, min_p=0.0):
     if penalty != 1.0 and penalty_ids is not None and penalty_ids.numel():
         score = logits[penalty_ids]
         logits[penalty_ids] = torch.where(score > 0, score / penalty, score * penalty)
     if temperature <= 0:
         return int(logits.argmax())
     probs = torch.softmax(logits / temperature, -1)
+    if 0 < min_p < 1:
+        # llama.cpp-style min-p: drop tokens below min_p × the top probability.
+        # The tail protection that matters most on edited/abliterated models,
+        # whose distributions are flattened by the direction edits.
+        probs = probs.masked_fill(probs < min_p * probs.max(), 0.0)
     if top_k > 0:
         kth = probs.topk(top_k).values[-1]
         probs = probs.masked_fill(probs < kth, 0.0)
@@ -508,6 +531,13 @@ class ModelManager:
                     rebase_supported = True
                 except ValueError:
                     rebase_supported = False
+                # sampling the model's author shipped (generation_config.json):
+                # surfaced so the UI can adopt it — runtimes like llama.cpp
+                # honor these values, and ignoring them makes the same weights
+                # behave differently here than in LM Studio.
+                recommended = _shipped_sampling(hf_model)
+                thinking_template = "enable_thinking" in (
+                    getattr(tokenizer, "chat_template", "") or "")
                 self.meta = {
                     "model_id": model_id,
                     "revision": _resolve_revision(source),
@@ -519,6 +549,8 @@ class ModelManager:
                     "rebase_supported": rebase_supported,
                     "chat_template_source": chat_template_source,
                     "chat_template_fallback": chat_template_fallback,
+                    "recommended_sampling": recommended,
+                    "thinking_template": thinking_template,
                     "load_seconds": round(time.perf_counter() - started, 1),
                 }
                 return self.meta
@@ -567,6 +599,9 @@ class ModelManager:
             if ablator is not None:
                 ablator.attach(self.jl)
             is_gpt_oss = "gpt-oss" in (self.meta or {}).get("model_id", "").lower()
+            # thinking-capable templates (Qwen3.5 style): honored only by
+            # templates that read enable_thinking; harmless elsewhere
+            think = bool(sampling.get("thinking", config.DEFAULT_SAMPLING["thinking"]))
             template_kwargs = {}
             if is_gpt_oss:
                 # harmony format: the system slot always carries an identity —
@@ -586,7 +621,7 @@ class ModelManager:
                 add_generation_prompt=not continue_final,
                 continue_final_message=continue_final,
                 return_tensors="pt",
-                enable_thinking=False,
+                enable_thinking=think,
                 **template_kwargs,
             )
             input_ids = encoded if isinstance(encoded, torch.Tensor) else encoded["input_ids"]
@@ -613,19 +648,28 @@ class ModelManager:
                         messages[:-1],
                         add_generation_prompt=False,
                         return_tensors="pt",
-                        enable_thinking=False,
+                        enable_thinking=think,
                         **template_kwargs,
                     )
                     prev_ids = prev if isinstance(prev, torch.Tensor) else prev["input_ids"]
                     read_from = min(prev_ids.shape[1], input_ids.shape[1] - 1)
 
-            temperature = float(sampling.get("temperature", config.DEFAULT_SAMPLING["temperature"]))
-            top_p = float(sampling.get("top_p", config.DEFAULT_SAMPLING["top_p"]))
-            top_k = int(sampling.get("top_k", config.DEFAULT_SAMPLING["top_k"]))
+            # default chain: explicit request → the model's OWN generation_config
+            # (the values its author shipped, e.g. Qwen3.5: temp 0.6, top_k 20)
+            # → J-Wash defaults. Runtimes like llama.cpp honor these; ignoring
+            # them is one reason the same weights behave differently here.
+            shipped = _shipped_sampling(hf_model)
+
+            def default_of(key):
+                return shipped.get(key, config.DEFAULT_SAMPLING[key])
+
+            temperature = float(sampling.get("temperature", default_of("temperature")))
+            top_p = float(sampling.get("top_p", default_of("top_p")))
+            top_k = int(sampling.get("top_k", default_of("top_k")))
+            min_p = float(sampling.get("min_p", default_of("min_p")))
             max_tokens = int(sampling.get("max_tokens", config.DEFAULT_SAMPLING["max_tokens"]))
             seed = int(sampling.get("seed", config.DEFAULT_SAMPLING["seed"]))
             # repetition penalty (HF-style, over prompt + generated); 1.0 = off.
-            # Deliberately NOT exposed through the MCP server.
             repetition_penalty = float(
                 sampling.get("repetition_penalty", config.DEFAULT_SAMPLING["repetition_penalty"])
             )
@@ -689,7 +733,7 @@ class ModelManager:
                 if stop_event.is_set():
                     break
                 next_id = _sample(logits[0].float(), temperature, top_p, top_k, generator,
-                                  repetition_penalty, penalty_ids)
+                                  repetition_penalty, penalty_ids, min_p)
                 if next_id in eos_ids:
                     break
                 reply_ids.append(next_id)

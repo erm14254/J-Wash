@@ -15,7 +15,7 @@ def default_layers(n_layers):
     return list(range(lo, hi + 1))
 
 
-def effective_coeffs(mode, factor, g):
+def effective_coeffs(mode, factor, g, keep=0.0):
     """Effective coefficients ``(alpha, beta)`` of a rule's effect under the
     global multiplier ``g``: ``delta = alpha·(v̂_A·h)·v̂_A + beta·(v̂_A·h)·v̂_B``
     (``beta = 0`` in scale mode).
@@ -26,6 +26,11 @@ def effective_coeffs(mode, factor, g):
     Without this bound, g·(factor-1) < -1 makes the component negative — a
     chaotic anti-direction (measured: "zap Paris" at scale 4 → "Paris Paris
     Paris..." in a loop).
+
+    ``keep`` (replace mode only, 0..1): fraction of the ORIGINAL component that
+    survives the replacement. The historical behavior (keep=0) removes A
+    entirely; keep=0.3 leaves 30 % of A in place while still adding B — a
+    partial replace that preserves the word's normal usability.
     """
     if mode == "scale":
         alpha = g * (factor - 1.0)
@@ -34,7 +39,65 @@ def effective_coeffs(mode, factor, g):
             alpha = max(alpha, min(factor, 0.0) - 1.0)
         return alpha, 0.0
     # replace: saturated removal of A (never anti-A), addition of B linear in g
-    return -min(g, 1.0), g * factor
+    keep = min(max(float(keep), 0.0), 1.0)
+    return -min(g, 1.0) * (1.0 - keep), g * factor
+
+
+def rule_token_ids(rule, side="a"):
+    """A rule's token ids as a list — ``token_ids`` when present (multi-token
+    composite), else the legacy single ``token_id`` (old presets)."""
+    if side == "a":
+        return rule.get("token_ids") or [rule["token_id"]]
+    return rule.get("replacement_ids") or [rule["replacement_id"]]
+
+
+def _composite_unembed(weight_u, token_ids, weights=None):
+    """Normalized (weighted) mean direction of several W_U rows (each row
+    normalized first, so a high-norm piece does not dominate). One id → the
+    plain normalized row, identical to the single-token behavior."""
+    rows = weight_u[list(token_ids)].detach().float().cpu()
+    rows = rows / rows.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+    if weights is not None:
+        rows = rows * torch.tensor([float(x) for x in weights]).unsqueeze(1)
+    v = rows.sum(0)
+    return v / v.norm().clamp_min(1e-8)
+
+
+# Replacement-side piece weighting: geometric decay of the pieces after the
+# first. The FIRST piece must dominate — it is the token that has to win the
+# next-token race for the word to start appearing at all — while the later
+# pieces steer the continuation (measured live: a uniform mean buries the
+# first piece and the model dodges the word entirely).
+ANCHOR_DECAY_DEFAULT = 0.5
+
+
+def piece_weights(n, decay):
+    """[1, decay, decay², …] — uniform when decay=1."""
+    return [decay ** i for i in range(n)]
+
+
+def composite_directions(lens, weight, token_ids, layers, weights=None):
+    """Per-layer J-space direction of a (possibly multi-token) word:
+    normalized weighted mean of the pieces' directions, each piece normalized
+    first (default uniform). One id → identical to the single-token behavior."""
+    rows = weight[list(token_ids)].float()
+    w = None
+    if weights is not None:
+        w = torch.tensor([float(x) for x in weights],
+                         device=weight.device).unsqueeze(1)
+    dirs = {}
+    for layer in layers:
+        J = lens.jacobians.get(layer)
+        if J is None:
+            # layer not fitted by the lens: direct logit lens (J = I),
+            # a good approximation near the output
+            v = rows
+        else:
+            v = rows @ J.float().to(weight.device)
+        v = v / v.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        v = (v * w).sum(0) if w is not None else v.sum(0)
+        dirs[layer] = v / v.norm().clamp_min(1e-8)
+    return dirs
 
 
 def abliteration_direction(weight_u, rule):
@@ -46,14 +109,15 @@ def abliteration_direction(weight_u, rule):
     ``(v_a, v_b)`` (float, CPU, normalized); ``v_b`` is None in scale mode. The
     effect applied to each residual write ``h`` is
     ``h += alpha·(v̂_A·h)·v̂_A + beta·(v̂_A·h)·v̂_B`` with ``(alpha, beta)`` given
-    by :func:`effective_coeffs` (which folds in the global scale).
+    by :func:`effective_coeffs` (which folds in the global scale). Multi-token
+    rules use the composite (normalized-mean) direction of their pieces.
     """
-    v_a = weight_u[rule["token_id"]].detach().float().cpu()
-    v_a = v_a / v_a.norm().clamp_min(1e-8)
+    v_a = _composite_unembed(weight_u, rule_token_ids(rule, "a"))
     v_b = None
     if rule["mode"] != "scale":
-        v_b = weight_u[rule["replacement_id"]].detach().float().cpu()
-        v_b = v_b / v_b.norm().clamp_min(1e-8)
+        ids_b = rule_token_ids(rule, "b")
+        decay = rule.get("anchor_decay", ANCHOR_DECAY_DEFAULT)
+        v_b = _composite_unembed(weight_u, ids_b, piece_weights(len(ids_b), decay))
     return v_a, v_b
 
 
@@ -83,6 +147,7 @@ class Interventions:
         self._handles = []
         self._scale = 1.0
         self._mode = "standard"
+        self._preserve_lm_head = False
 
     @property
     def active(self):
@@ -95,6 +160,18 @@ class Interventions:
     @property
     def mode(self):
         return self._mode
+
+    @property
+    def preserve_lm_head(self):
+        return self._preserve_lm_head
+
+    def set_preserve_lm_head(self, value):
+        # readthrough/exact only: leaves the final read (lm_head) untransformed,
+        # so the output vocabulary is untouched — the edit acts only through the
+        # downstream layers' reads. Ignored by standard steering and abliteration.
+        with self._lock:
+            self._preserve_lm_head = bool(value)
+            return self._preserve_lm_head
 
     def set_scale(self, scale):
         with self._lock:
@@ -127,41 +204,51 @@ class Interventions:
             {
                 "id": rule["id"],
                 "token_id": rule["token_id"],
+                "token_ids": rule["token_ids"],
                 "token": rule["token"],
+                "token_pieces": rule["token_pieces"],
                 "mode": rule["mode"],
                 "factor": rule["factor"],
+                "keep": rule.get("keep", 0.0),
                 "replacement_id": rule["replacement_id"],
+                "replacement_ids": rule["replacement_ids"],
                 "replacement": rule["replacement"],
+                "replacement_pieces": rule["replacement_pieces"],
                 "layers": rule["layers"],
                 "enabled": rule.get("enabled", True),
+                "anchor_decay": rule.get("anchor_decay", ANCHOR_DECAY_DEFAULT),
             }
             for rule in self._rules
         ]
 
-    def _direction(self, lens, weight, token_id, layers):
-        row = weight[token_id].float()
-        dirs = {}
-        for layer in layers:
-            J = lens.jacobians.get(layer)
-            if J is None:
-                # layer not fitted by the lens: direct logit lens (J = I),
-                # a good approximation near the output
-                v = row
-            else:
-                v = row @ J.float().to(weight.device)
-            dirs[layer] = v / v.norm().clamp_min(1e-8)
-        return dirs
+    @staticmethod
+    def _clean_ids(weight, token_ids, token_id, what):
+        """Canonical id list from either parameter (list wins); None = absent."""
+        ids = token_ids if token_ids is not None else (
+            [token_id] if token_id is not None else None
+        )
+        if ids is None:
+            return None
+        ids = [int(t) for t in ids]
+        if not ids:
+            raise ValueError(f"empty token sequence for {what}")
+        vocab = weight.shape[0]
+        if any(t < 0 or t >= vocab for t in ids):
+            raise ValueError(f"{what}: token id out of range (vocab {vocab})")
+        return ids
 
-    def add(self, lens_manager, jl, *, token_id, mode="scale", factor=0.0,
-            replacement_id=None, layers=None, enabled=True):
+    def _direction(self, lens, weight, token_ids, layers):
+        return composite_directions(lens, weight, token_ids, layers)
+
+    def add(self, lens_manager, jl, *, token_id=None, token_ids=None,
+            mode="scale", factor=0.0, keep=0.0, replacement_id=None,
+            replacement_ids=None, layers=None, enabled=True, anchor_decay=None):
         with self._lock:
             lens = lens_manager.lens
             if lens is None:
                 raise ValueError("no lens loaded")
             if mode not in ("scale", "replace"):
                 raise ValueError(f"invalid mode: {mode}")
-            if mode == "replace" and replacement_id is None:
-                raise ValueError("replacement_id required in replace mode")
             n_layers = len(jl.layers)
             if layers is None:
                 layers = default_layers(n_layers)
@@ -170,27 +257,44 @@ class Interventions:
             weight = jl._lm_head.weight
             if weight.dtype not in (torch.float16, torch.bfloat16, torch.float32):
                 raise ValueError("interventions unavailable on a quantized model")
+            ids_a = self._clean_ids(weight, token_ids, token_id, "token")
+            if ids_a is None:
+                raise ValueError("token_id or token_ids required")
+            ids_b = self._clean_ids(weight, replacement_ids, replacement_id, "replacement")
+            if mode == "replace" and ids_b is None:
+                raise ValueError("replacement_id required in replace mode")
+            if mode == "scale":
+                ids_b = None
+            decay = ANCHOR_DECAY_DEFAULT if anchor_decay is None else float(anchor_decay)
+            decay = min(max(decay, 0.0), 1.0)
             tokenizer = jl.tokenizer
             rule = {
                 "id": next(self._counter),
-                "token_id": int(token_id),
-                "token": tokenizer.decode([int(token_id)]),
+                "token_id": ids_a[0],
+                "token_ids": ids_a,
+                "token": tokenizer.decode(ids_a),
+                "token_pieces": [tokenizer.decode([t]) for t in ids_a],
                 "mode": mode,
                 "factor": float(factor),
-                "replacement_id": int(replacement_id) if replacement_id is not None else None,
-                "replacement": tokenizer.decode([int(replacement_id)]) if replacement_id is not None else None,
+                "keep": min(max(float(keep), 0.0), 1.0),
+                "replacement_id": ids_b[0] if ids_b else None,
+                "replacement_ids": ids_b,
+                "replacement": tokenizer.decode(ids_b) if ids_b else None,
+                "replacement_pieces": [tokenizer.decode([t]) for t in ids_b] if ids_b else None,
                 "layers": [int(l) for l in layers],
                 "enabled": bool(enabled),
-                "dirs_a": self._direction(lens, weight, int(token_id), layers),
-                "dirs_b": self._direction(lens, weight, int(replacement_id), layers)
-                if replacement_id is not None
-                else None,
+                "anchor_decay": decay,
+                "dirs_a": self._direction(lens, weight, ids_a, layers),
+                "dirs_b": composite_directions(
+                    lens, weight, ids_b, layers, piece_weights(len(ids_b), decay))
+                if ids_b else None,
             }
             self._rules.append(rule)
             return self.summary()
 
-    def update(self, rule_id, *, factor=None, layers=None, enabled=None,
-               token_id=None, replacement_id=None, mode=None,
+    def update(self, rule_id, *, factor=None, keep=None, layers=None,
+               enabled=None, token_id=None, token_ids=None, replacement_id=None,
+               replacement_ids=None, mode=None, anchor_decay=None,
                lens_manager=None, jl=None):
         with self._lock:
             for rule in self._rules:
@@ -198,11 +302,16 @@ class Interventions:
                     continue
                 if factor is not None:
                     rule["factor"] = float(factor)
+                if keep is not None:
+                    rule["keep"] = min(max(float(keep), 0.0), 1.0)
                 if enabled is not None:
                     rule["enabled"] = bool(enabled)
                 # token / replacement / mode / layers change the directions →
                 # the lens and model are required to re-resolve them
-                needs_dirs = any(x is not None for x in (layers, token_id, replacement_id, mode))
+                needs_dirs = any(x is not None for x in (
+                    layers, token_id, token_ids, replacement_id, replacement_ids,
+                    mode, anchor_decay
+                ))
                 if not needs_dirs:
                     return self.summary()
                 if lens_manager is None or jl is None:
@@ -211,30 +320,43 @@ class Interventions:
                 if lens is None:
                     raise ValueError("no lens loaded")
                 tokenizer = jl.tokenizer
+                weight = jl._lm_head.weight
                 if mode is not None:
                     if mode not in ("scale", "replace"):
                         raise ValueError(f"invalid mode: {mode}")
                     rule["mode"] = mode
-                if token_id is not None:
-                    rule["token_id"] = int(token_id)
-                    rule["token"] = tokenizer.decode([int(token_id)])
-                if replacement_id is not None:
-                    rule["replacement_id"] = int(replacement_id)
-                    rule["replacement"] = tokenizer.decode([int(replacement_id)])
+                ids_a = self._clean_ids(weight, token_ids, token_id, "token")
+                if ids_a is not None:
+                    rule["token_id"] = ids_a[0]
+                    rule["token_ids"] = ids_a
+                    rule["token"] = tokenizer.decode(ids_a)
+                    rule["token_pieces"] = [tokenizer.decode([t]) for t in ids_a]
+                ids_b = self._clean_ids(weight, replacement_ids, replacement_id, "replacement")
+                if ids_b is not None:
+                    rule["replacement_id"] = ids_b[0]
+                    rule["replacement_ids"] = ids_b
+                    rule["replacement"] = tokenizer.decode(ids_b)
+                    rule["replacement_pieces"] = [tokenizer.decode([t]) for t in ids_b]
                 if rule["mode"] == "scale":
                     rule["replacement_id"] = None
+                    rule["replacement_ids"] = None
                     rule["replacement"] = None
-                elif rule["replacement_id"] is None:
+                    rule["replacement_pieces"] = None
+                elif rule["replacement_ids"] is None:
                     raise ValueError("replacement_id required in replace mode")
                 if layers is not None:
                     n_layers = len(jl.layers)
                     # new_layers=[] is valid: rule kept but inactive
                     rule["layers"] = sorted({int(l) for l in layers if 0 <= int(l) < n_layers})
-                weight = jl._lm_head.weight
-                rule["dirs_a"] = self._direction(lens, weight, rule["token_id"], rule["layers"])
+                if anchor_decay is not None:
+                    rule["anchor_decay"] = min(max(float(anchor_decay), 0.0), 1.0)
+                decay = rule.get("anchor_decay", ANCHOR_DECAY_DEFAULT)
+                rule["dirs_a"] = self._direction(lens, weight, rule["token_ids"], rule["layers"])
                 rule["dirs_b"] = (
-                    self._direction(lens, weight, rule["replacement_id"], rule["layers"])
-                    if rule["replacement_id"] is not None
+                    composite_directions(
+                        lens, weight, rule["replacement_ids"], rule["layers"],
+                        piece_weights(len(rule["replacement_ids"]), decay))
+                    if rule["replacement_ids"] is not None
                     else None
                 )
                 return self.summary()
@@ -268,7 +390,8 @@ class Interventions:
                 h = output[0] if isinstance(output, tuple) else output
                 g = self._scale
                 for rule in rules:
-                    alpha, beta = effective_coeffs(rule["mode"], rule["factor"], g)
+                    alpha, beta = effective_coeffs(
+                        rule["mode"], rule["factor"], g, rule.get("keep", 0.0))
                     vA = rule["dirs_a"][layer].to(h.device, h.dtype)
                     coef = (h * vA).sum(-1, keepdim=True)
                     h = h + alpha * coef * vA
@@ -300,7 +423,8 @@ class Interventions:
         def apply(h):
             g = self._scale
             for (v_a, v_b), rule in dirs:
-                alpha, beta = effective_coeffs(rule["mode"], rule["factor"], g)
+                alpha, beta = effective_coeffs(
+                    rule["mode"], rule["factor"], g, rule.get("keep", 0.0))
                 va = v_a.to(h.device, h.dtype)
                 coef = (h * va).sum(-1, keepdim=True)
                 h = h + alpha * coef * va
@@ -370,10 +494,11 @@ class Interventions:
                 U_inv, Vw, _regularized = rebase.inverse_uv(U, V)
                 for _suffix, module in rebase.iter_writes(block):
                     handles.append(module.register_forward_hook(write_hook_for(module, U_inv, Vw)))
-        U, V = cums[n_layers]
-        handles.append(
-            jl._final_norm.register_forward_hook(read_hook_for(jl._final_norm, U, V))
-        )
+        if not self._preserve_lm_head:
+            U, V = cums[n_layers]
+            handles.append(
+                jl._final_norm.register_forward_hook(read_hook_for(jl._final_norm, U, V))
+            )
         self._handles = handles
 
     def detach(self):

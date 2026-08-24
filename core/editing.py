@@ -33,9 +33,16 @@ def list_presets():
     return out
 
 
-def save_preset(name, rules, model_id, scale=1.0):
+def save_preset(name, rules, model_id, scale=1.0, mode=None, preserve_lm_head=None):
     PRESETS_DIR.mkdir(parents=True, exist_ok=True)
     payload = {"model_id": model_id, "saved_at": _now(), "scale": scale, "rules": rules}
+    # record the intervention mode and head-protection: a preset built with the
+    # output head protected must not silently become a word-killing edit when
+    # re-applied under different settings
+    if mode is not None:
+        payload["mode"] = mode
+    if preserve_lm_head is not None:
+        payload["preserve_lm_head"] = bool(preserve_lm_head)
     (PRESETS_DIR / f"{name}.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8"
     )
@@ -82,7 +89,7 @@ def compute_abliteration(rules, jl, scale=1.0):
     pairs = []
     for r in rules:
         v_a, v_b = abliteration_direction(weight_u, r)
-        alpha, beta = effective_coeffs(r["mode"], r["factor"], scale)
+        alpha, beta = effective_coeffs(r["mode"], r["factor"], scale, r.get("keep", 0.0))
         w_eff = alpha * v_a
         if beta:
             w_eff = w_eff + beta * v_b
@@ -184,7 +191,8 @@ def export_abliteration(rules, jl, model_meta, *, fmt, name, source_dir=None, sc
     dtype = torch.bfloat16 if model_meta.get("dtype") == "bf16" else torch.float16
     lm_head_key = info["lm_head_key"]
     summary = [
-        {k: r[k] for k in ("token_id", "token", "mode", "factor", "replacement_id", "replacement")}
+        {k: r.get(k) for k in ("token_id", "token_ids", "token", "mode", "factor", "keep",
+                               "replacement_id", "replacement_ids", "replacement")}
         for r in rules
     ]
     meta = {
@@ -386,11 +394,14 @@ def apply_read_transform_bounded(entry, tensor, *, row_budget=REBASE_EXPORT_ROW_
     return destination, delta_max
 
 
-def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.0, exact=False):
+def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.0,
+                  exact=False, preserve_lm_head=False):
     """Pure-weight export by change of basis of the reads (cf. core/rebase).
 
     ``readthrough`` (exact=False): the downstream read matrices + lm_head.
     ``exact``: adds the counter-transform of the downstream writes.
+    ``preserve_lm_head``: leaves lm_head untransformed (output vocabulary
+    intact); a tied model then needs no untying either.
     Formats: ``full`` (checkpoint), ``layers`` (safetensors of the modified
     matrices) and ``lora`` (PEFT adapter = the exact low-rank diff between the
     baked weights and the originals; the lm_head delta is applied at forward
@@ -400,7 +411,13 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
     method = "rebase-exact" if exact else "rebase-readthrough"
     if fmt not in ("full", "layers", "lora"):
         raise ValueError(f"unknown format for {method}: {fmt}")
-    transforms, info = rebase.build_plan(rules, jl, scale, exact=exact)
+    transforms, info = rebase.build_plan(
+        rules, jl, scale, exact=exact, preserve_lm_head=preserve_lm_head)
+    if not transforms:
+        raise ValueError(
+            "nothing to bake: with the output head preserved, rules hooked on "
+            "the last layer only transform no downstream read"
+        )
     lm_head_key = info["lm_head_key"]
     if info["packed_moe"]:
         if exact:
@@ -438,7 +455,7 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
             f"{info['regularized_layers']} — the effect there equals readthrough; "
             "prefer readthrough mode for full removals"
         )
-    if fmt == "lora" and info["tied"]:
+    if fmt == "lora" and info["tied"] and lm_head_key in transforms:
         warnings.append(
             "tied embeddings: use the adapter at runtime (PEFT applies the "
             "lm_head delta at forward time, leaving the shared embed intact); "
@@ -568,8 +585,10 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
             del out
 
         # untie: the transformed un-embedding becomes a separate lm_head, baked
-        # from the original embed (which stays intact)
-        if info["tied"] and not lm_head_written:
+        # from the original embed (which stays intact). With the output head
+        # preserved, lm_head is not transformed and no untying is needed.
+        needs_untie = info["tied"] and lm_head_key in transforms
+        if needs_untie and not lm_head_written:
             if embed_shard_name is None:
                 raise ValueError("cannot untie: embed not found in the source")
             target_shard = out_dir / embed_shard_name
@@ -593,7 +612,7 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
         cfg_path = source_dir / "config.json"
         if cfg_path.exists():
             cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-            if info["tied"]:
+            if needs_untie:
                 cfg["tie_word_embeddings"] = False
                 text_cfg = cfg.get("text_config")
                 if isinstance(text_cfg, dict) and "tie_word_embeddings" in text_cfg:
@@ -607,7 +626,7 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
                     continue
                 shutil.copy2(extra, out_dir / extra.name)
         index_path = out_dir / "model.safetensors.index.json"
-        if info["tied"] and not lm_head_written and index_path.exists():
+        if needs_untie and not lm_head_written and index_path.exists():
             index = json.loads(index_path.read_text(encoding="utf-8"))
             wm = index.setdefault("weight_map", {})
             wm[lm_head_key] = embed_shard_name
@@ -625,9 +644,11 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
         )
 
     summary = [
-        {k: r[k] for k in ("token_id", "token", "mode", "factor", "replacement_id", "replacement", "layers")}
+        {k: r.get(k) for k in ("token_id", "token_ids", "token", "mode", "factor", "keep",
+                               "replacement_id", "replacement_ids", "replacement", "layers")}
         for r in rules if r["layers"]
     ]
+    head_transformed = lm_head_key in transforms
     meta = {
         "name": name,
         "format": fmt,
@@ -636,8 +657,9 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
         "model_revision": model_meta.get("revision"),
         "dtype": model_meta.get("dtype"),
         "global_scale": scale,
+        "preserve_lm_head": preserve_lm_head,
         # lora: no physical untying — the lm_head delta lives in the adapter
-        "untied_lm_head": info["tied"] and fmt != "lora",
+        "untied_lm_head": info["tied"] and fmt != "lora" and head_transformed,
         "rules": summary,
         "layers_span": info["layers_span"],
         "rank": info["rank_final"],
@@ -647,7 +669,8 @@ def export_rebase(rules, jl, model_meta, *, fmt, name, source_dir=None, scale=1.
         "warnings": warnings,
         "note": (
             "change of basis of the reads: every matrix that READS the residual "
-            "downstream of the hooked layers (q/k/v, in_proj*, gate/up + lm_head) sees "
+            "downstream of the hooked layers (q/k/v, in_proj*, gate/up"
+            + (" + lm_head" if head_transformed else "; lm_head preserved") + ") sees "
             "the residual transformed by the same J-space directions as the live preview"
             + (" ; downstream writes counter-transformed (exact mode)" if exact else "")
             + ". Pure weights: a standard safetensors checkpoint."

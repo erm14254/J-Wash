@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import logging
 import mimetypes
@@ -6,6 +7,7 @@ import os
 import re
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 
@@ -17,8 +19,11 @@ from pydantic import BaseModel
 
 import config
 from core import editing, registry
-from core.ablation import Interventions
+from core import wizard
+from core.ablation import Interventions, composite_directions
+from core.impact import impact_report
 from core.neighbors import TokenNeighbors
+from core.tokens import token_candidates
 from core import fitting
 from core.fitting import FitManager
 from core.gpus import gpu_stats
@@ -133,11 +138,18 @@ class ConversationPatch(BaseModel):
 
 
 class InterventionRequest(BaseModel):
-    token_id: int
+    # single-token (token_id) or multi-token composite (token_ids) — one required
+    token_id: int | None = None
+    token_ids: list[int] | None = None
     mode: str = "scale"
     factor: float = 0.0
+    keep: float = 0.0  # replace mode: fraction of the original component kept
     replacement_id: int | None = None
+    replacement_ids: list[int] | None = None
     layers: list[int] | None = None
+    # multi-token replacement: geometric weight of the pieces after the first
+    # (1 = uniform mean, 0 = first piece only). None = engine default.
+    anchor_decay: float | None = None
 
 
 _NAME_RE = re.compile(r"[\w][\w.\- ]*", re.UNICODE)
@@ -156,16 +168,21 @@ def _safe_name(name):
 
 class InterventionPatch(BaseModel):
     factor: float | None = None
+    keep: float | None = None
     layers: list[int] | None = None
     enabled: bool | None = None
     token_id: int | None = None
+    token_ids: list[int] | None = None
     replacement_id: int | None = None
+    replacement_ids: list[int] | None = None
     mode: str | None = None  # scale | replace
+    anchor_decay: float | None = None
 
 
 class InterventionsScale(BaseModel):
     scale: float | None = None
     mode: str | None = None
+    preserve_lm_head: bool | None = None
 
 
 class ExportRequest(BaseModel):
@@ -206,6 +223,8 @@ def api_status():
         "interventions": interventions.summary(),
         "interventions_scale": interventions.global_scale,
         "interventions_mode": interventions.mode,
+        "interventions_preserve_lm_head": interventions.preserve_lm_head,
+        "wizard": dict(_wizard_state),
         "last_generation": _last_generation,
     }
 
@@ -375,10 +394,14 @@ def api_interventions_add(req: InterventionRequest):
                 lens_manager,
                 manager.jl,
                 token_id=req.token_id,
+                token_ids=req.token_ids,
                 mode=req.mode,
                 factor=req.factor,
+                keep=req.keep,
                 replacement_id=req.replacement_id,
+                replacement_ids=req.replacement_ids,
                 layers=req.layers,
+                anchor_decay=req.anchor_decay,
             )
         }
     except ValueError as exc:
@@ -388,18 +411,25 @@ def api_interventions_add(req: InterventionRequest):
 @app.patch("/api/interventions/{rule_id}")
 def api_interventions_patch(rule_id: int, req: InterventionPatch):
     needs_dirs = any(
-        x is not None for x in (req.layers, req.token_id, req.replacement_id, req.mode)
+        x is not None
+        for x in (req.layers, req.token_id, req.token_ids,
+                  req.replacement_id, req.replacement_ids, req.mode,
+                  req.anchor_decay)
     )
     try:
         return {
             "rules": interventions.update(
                 rule_id,
                 factor=req.factor,
+                keep=req.keep,
                 layers=req.layers,
                 enabled=req.enabled,
                 token_id=req.token_id,
+                token_ids=req.token_ids,
                 replacement_id=req.replacement_id,
+                replacement_ids=req.replacement_ids,
                 mode=req.mode,
+                anchor_decay=req.anchor_decay,
                 lens_manager=lens_manager if needs_dirs else None,
                 jl=manager.jl if needs_dirs else None,
             )
@@ -412,6 +442,8 @@ def api_interventions_patch(rule_id: int, req: InterventionPatch):
 def api_interventions_scale(req: InterventionsScale):
     if req.scale is not None:
         interventions.set_scale(req.scale)
+    if req.preserve_lm_head is not None:
+        interventions.set_preserve_lm_head(req.preserve_lm_head)
     try:
         if req.mode is not None:
             if (
@@ -430,7 +462,132 @@ def api_interventions_scale(req: InterventionsScale):
     return {
         "scale": interventions.global_scale,
         "mode": interventions.mode,
+        "preserve_lm_head": interventions.preserve_lm_head,
     }
+
+
+_wizard_state = {"state": "idle", "step": None, "result": None, "error": None}
+_wizard_run = None
+
+
+class WizardRequest(BaseModel):
+    goals: list[dict]
+    thinking: bool = False  # probe with reasoning on (match deployment)
+
+
+@app.post("/api/wizard/start")
+def api_wizard_start(req: WizardRequest):
+    """Goal-driven auto-search: tries candidate rule stacks for each goal and
+    scores them on the live model (identity / vocabulary / control batteries).
+    The winner's rules are applied; every candidate's scorecard is reported."""
+    global _wizard_run
+    if manager.hf_model is None or lens_manager.lens is None:
+        raise HTTPException(422, "model and lens required")
+    if _wizard_state["state"] == "running":
+        raise HTTPException(409, "wizard already running")
+    if manager.busy:
+        raise HTTPException(409, f"busy: {manager.busy}")
+    goals = [g for g in req.goals if g]
+    if not goals:
+        raise HTTPException(422, "no goal given")
+    for g in goals:
+        if g.get("type") == "style":
+            if not g.get("boost") and not g.get("suppress"):
+                raise HTTPException(422, "a style goal needs boost and/or suppress words")
+        elif g.get("type") == "rename":
+            if not g.get("sources") or not g.get("target"):
+                raise HTTPException(422, "a rename goal needs sources=[...] and target")
+        else:
+            raise HTTPException(422, "each goal needs type 'rename' or 'style'")
+    _wizard_state.update(state="running", step="starting", result=None, error=None)
+    run = wizard.WizardRun(manager, lens_manager, interventions, thinking=req.thinking)
+    _wizard_run = run
+
+    def work():
+        try:
+            run.run(goals, _wizard_state)
+        except Exception as exc:  # noqa: BLE001 — surfaced in the UI
+            _wizard_state.update(state="error", step=None, error=str(exc))
+
+    threading.Thread(target=work, daemon=True).start()
+    return {"started": True, "state": dict(_wizard_state)}
+
+
+@app.post("/api/wizard/stop")
+def api_wizard_stop():
+    if _wizard_run is not None:
+        _wizard_run.stop_event.set()
+    return {"ok": True}
+
+
+class WizardParseRequest(BaseModel):
+    description: str
+
+
+@app.post("/api/wizard/parse")
+async def api_wizard_parse(req: WizardParseRequest):
+    """Free-text persona description → structured wizard goals, extracted by
+    the loaded model itself (rules detached during parsing)."""
+    if manager.hf_model is None or lens_manager.lens is None:
+        raise HTTPException(422, "model and lens required")
+    if manager.busy:
+        raise HTTPException(409, f"busy: {manager.busy}")
+    if _wizard_state["state"] == "running":
+        raise HTTPException(409, "wizard already running")
+    if not req.description.strip():
+        raise HTTPException(422, "empty description")
+    run = wizard.WizardRun(manager, lens_manager, interventions)
+    try:
+        return await asyncio.to_thread(run.parse_description, req.description)
+    except ValueError as exc:
+        raise HTTPException(422, f"could not parse the description: {exc}")
+    except Exception as exc:
+        raise HTTPException(500, str(exc))
+
+
+@app.get("/api/interventions/impact")
+async def api_interventions_impact():
+    """Analytic effect of the active rules on the output vocabulary: how much
+    of each edited word survives, what replaces it, and which OTHER words are
+    collaterally affected — computable before any generation or export."""
+    if manager.hf_model is None:
+        raise HTTPException(422, "no model loaded")
+    try:
+        return await asyncio.to_thread(
+            impact_report,
+            interventions.active_rules_full(),
+            manager.jl,
+            interventions.global_scale,
+            mode=interventions.mode,
+            preserve_lm_head=interventions.preserve_lm_head,
+            tokenizer=manager.tokenizer,
+        )
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
+
+
+@app.get("/api/token-profile")
+def api_token_profile(ids: str):
+    """Per-layer "surface-ness" of a word: cosine between its J-space direction
+    at each layer and its output (unembedding) direction. High cosine = editing
+    there rewrites the word itself; low = editing there shifts the concept."""
+    if manager.hf_model is None or lens_manager.lens is None:
+        raise HTTPException(422, "model and lens required")
+    try:
+        token_ids = [int(t) for t in ids.split(",") if t.strip() != ""]
+    except ValueError:
+        raise HTTPException(422, "ids must be a comma-separated list of token ids")
+    if not token_ids:
+        raise HTTPException(422, "no token id given")
+    weight = manager.jl._lm_head.weight
+    if any(t < 0 or t >= weight.shape[0] for t in token_ids):
+        raise HTTPException(422, "token id out of range")
+    layers = list(range(len(manager.jl.layers)))
+    dirs = composite_directions(lens_manager.lens, weight, token_ids, layers)
+    ref = composite_directions(
+        SimpleNamespace(jacobians={}), weight, token_ids, [0])[0]
+    surface = [round(float((dirs[l] * ref).sum()), 3) for l in layers]
+    return {"layers": layers, "surface": surface}
 
 
 @app.delete("/api/interventions/{rule_id}")
@@ -457,6 +614,8 @@ def api_presets_save(name: str):
     return editing.save_preset(
         name, rules, manager.meta.get("model_id") if manager.meta else None,
         scale=interventions.global_scale,
+        mode=interventions.mode,
+        preserve_lm_head=interventions.preserve_lm_head,
     )
 
 
@@ -480,20 +639,46 @@ def api_presets_apply(name: str):
             rules = interventions.add(
                 lens_manager,
                 manager.jl,
-                token_id=rule["token_id"],
+                token_id=rule.get("token_id"),
+                token_ids=rule.get("token_ids"),
                 mode=rule["mode"],
                 factor=rule["factor"],
+                keep=rule.get("keep", 0.0),
                 replacement_id=rule.get("replacement_id"),
+                replacement_ids=rule.get("replacement_ids"),
                 layers=rule.get("layers"),
                 enabled=rule.get("enabled", True),
+                anchor_decay=rule.get("anchor_decay"),
             )
         except ValueError as exc:
             warnings.append(f"rule {rule.get('token')!r} skipped: {exc}")
     if preset.get("scale") is not None:
         interventions.set_scale(preset["scale"])
+    # restore the mode and head-protection the preset was built with (older
+    # presets carry neither: current settings stay untouched)
+    mode = preset.get("mode")
+    if mode:
+        if (
+            mode in ("readthrough", "exact")
+            and manager.meta is not None
+            and manager.meta.get("rebase_supported") is False
+        ):
+            warnings.append(
+                f"preset was built in {mode} mode, unavailable on this "
+                "architecture — using global projection (abliteration) instead"
+            )
+            mode = "abliteration"
+        try:
+            interventions.set_mode(mode)
+        except ValueError as exc:
+            warnings.append(f"preset mode not restored: {exc}")
+    if preset.get("preserve_lm_head") is not None:
+        interventions.set_preserve_lm_head(preset["preserve_lm_head"])
     return {
         "rules": rules or interventions.summary(),
         "scale": interventions.global_scale,
+        "mode": interventions.mode,
+        "preserve_lm_head": interventions.preserve_lm_head,
         "warnings": warnings,
     }
 
@@ -520,6 +705,7 @@ async def api_edit_export(req: ExportRequest):
     if mode in ("readthrough", "exact"):
         export_fn = editing.export_rebase
         kwargs["exact"] = mode == "exact"
+        kwargs["preserve_lm_head"] = interventions.preserve_lm_head
     elif mode == "abliteration":
         export_fn = editing.export_abliteration
     else:
@@ -566,6 +752,43 @@ GGUF_QUANT_TYPES = ("q8_0", "q6_k", "q5_k_m", "q4_k_m", "q3_k_m")
 class GGUFExportRequest(BaseModel):
     name: str
     gguf_type: str = "q4_k_m"
+
+
+def _edit_fingerprint():
+    """A stable hash of the exact edit currently active (rules + scale + mode +
+    head-protection + model). ``None`` when nothing is loaded/active. Used to
+    detect when a cached GGUF checkpoint no longer matches the live edit."""
+    if manager.hf_model is None:
+        return None
+    rules = interventions.active_rules_full()
+    if not rules:
+        return None
+    payload = {
+        "model_id": (manager.meta or {}).get("model_id"),
+        "scale": interventions.global_scale,
+        "mode": interventions.mode,
+        "preserve_lm_head": interventions.preserve_lm_head,
+        "rules": interventions.summary(),
+    }
+    blob = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def _gguf_fingerprint_path(name):
+    return editing.EDITS_DIR / name / "hf" / ".edit_fingerprint"
+
+
+def _read_gguf_fingerprint(name):
+    path = _gguf_fingerprint_path(name)
+    return path.read_text(encoding="utf-8").strip() if path.exists() else None
+
+
+def _write_gguf_fingerprint(name, fingerprint):
+    if fingerprint is None:
+        return
+    path = _gguf_fingerprint_path(name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(fingerprint, encoding="utf-8")
 
 
 def _llamacpp_paths():
@@ -655,10 +878,16 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
         raise HTTPException(422, "llama-quantize not found — pick bf16 or f16")
 
     hf_dir = editing.EDITS_DIR / req.name / "hf"
+    fingerprint = _edit_fingerprint()  # None when no model/rules are active
+    cache_ok = (hf_dir / "config.json").exists() and (
+        # reuse the cache ONLY when it was baked from the SAME edit — a stale
+        # checkpoint under a reused name would silently ship the OLD rules
+        fingerprint is None or _read_gguf_fingerprint(req.name) == fingerprint
+    )
     baked = "reused"
-    if not (hf_dir / "config.json").exists():
-        # no cached checkpoint: bake one from the ACTIVE rules (same path as a
-        # plain full export)
+    if not cache_ok:
+        # no valid cached checkpoint: bake one from the ACTIVE rules (same path
+        # as a plain full export)
         if manager.hf_model is None:
             raise HTTPException(422, "no model loaded (and no cached checkpoint for this name)")
         rules = interventions.active_rules_full()
@@ -666,12 +895,18 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
             raise HTTPException(422, "no active intervention to export")
         mode = interventions.mode
         if mode in ("readthrough", "exact"):
-            export_fn, kwargs = editing.export_rebase, {"exact": mode == "exact"}
+            export_fn, kwargs = editing.export_rebase, {
+                "exact": mode == "exact",
+                "preserve_lm_head": interventions.preserve_lm_head,
+            }
         elif mode == "abliteration":
             export_fn, kwargs = editing.export_abliteration, {}
         else:
             raise HTTPException(422, "export requires a pure-weights mode")
         source_dir = resolve_local_dir(manager.meta["model_id"])
+        if (hf_dir / "config.json").exists():
+            # a stale checkpoint from a different edit under this name: clear it
+            shutil.rmtree(hf_dir, ignore_errors=True)
         try:
             await asyncio.to_thread(
                 export_fn, rules, manager.jl, manager.meta,
@@ -680,6 +915,7 @@ async def api_edit_export_gguf(req: GGUFExportRequest):
             )
         except ValueError as exc:
             raise HTTPException(422, str(exc))
+        _write_gguf_fingerprint(req.name, fingerprint)
         baked = "baked"
 
     _gguf_state.update(state="running", name=req.name, step="starting", error=None, result=None)
@@ -788,14 +1024,8 @@ async def api_token_neighbors(req: NeighborsRequest):
 def api_token_lookup(q: str):
     if manager.tokenizer is None:
         raise HTTPException(422, "no model loaded")
-    tokenizer = manager.tokenizer
-    candidates = {}
-    for variant in (q, " " + q, q.lower(), " " + q.lower(),
-                    q.capitalize(), " " + q.capitalize(), q.upper(), " " + q.upper()):
-        ids = tokenizer.encode(variant, add_special_tokens=False)
-        if len(ids) == 1 and ids[0] not in candidates:
-            candidates[ids[0]] = tokenizer.decode([ids[0]])
-    return {"candidates": [{"id": tid, "str": s} for tid, s in candidates.items()]}
+    singles, splits = token_candidates(manager.tokenizer, q)
+    return {"candidates": singles, "splits": splits}
 
 
 @app.get("/api/registry/local")

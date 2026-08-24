@@ -163,7 +163,8 @@ def rule_factors(rules, scale):
     Returns an empty dict if all coefficients are neutral."""
     by_layer = {}
     for rule in rules:
-        alpha, beta = effective_coeffs(rule["mode"], rule["factor"], scale)
+        alpha, beta = effective_coeffs(
+            rule["mode"], rule["factor"], scale, rule.get("keep", 0.0))
         if alpha == 0.0 and not beta:
             continue
         for layer in rule["layers"]:
@@ -290,10 +291,15 @@ def apply_transform(entry, W):
     return apply_write(W, X, Y)
 
 
-def build_plan(rules, jl, scale, exact=False):
+def build_plan(rules, jl, scale, exact=False, preserve_lm_head=False):
     """Bake plan: ``{param_name: entry}`` with ``entry = ("read", Ug, Vg)`` or
     ``("write", U_inv, V)`` — apply with :func:`apply_transform` — plus the
     diagnostic metadata.
+
+    ``preserve_lm_head``: leave the final read (lm_head) untransformed. The
+    output vocabulary stays intact — the edit acts only through the reads of
+    the layers downstream of the hooked ones (a rule hooking only the LAST
+    layer then has no effect at all).
 
     The names follow the model's layout (``{path}.layers.{m}.{suffix}.weight``,
     ``{lm_head}.weight``); the guard matching them against the checkpoint keys is
@@ -330,10 +336,11 @@ def build_plan(rules, jl, scale, exact=False):
             for suffix, _module in iter_writes(block):
                 transforms[f"{path}.layers.{m}.{suffix}.weight"] = ("write", U_inv, Vw)
 
-    U, V = cums[n_layers]
-    Ug, Vg = gamma_pair(jl._final_norm, U, V)
     lm_head_key = f"{jl.layout.lm_head}.weight"
-    transforms[lm_head_key] = ("read", Ug, Vg)
+    if not preserve_lm_head:
+        U, V = cums[n_layers]
+        Ug, Vg = gamma_pair(jl._final_norm, U, V)
+        transforms[lm_head_key] = ("read", Ug, Vg)
 
     tied = jl._lm_head.weight.data_ptr() == jl._embed_tokens.weight.data_ptr()
     info = {
@@ -346,5 +353,6 @@ def build_plan(rules, jl, scale, exact=False):
         "regularized_layers": regularized_layers,
         "min_gamma": min_gamma,
         "packed_moe": has_packed_moe(jl),
+        "preserve_lm_head": preserve_lm_head,
     }
     return transforms, info

@@ -28,9 +28,17 @@ DEFAULT_SAMPLING = {
     "temperature": 0.7,
     "top_p": 0.95,
     "top_k": 40,
+    # min_p and repetition_penalty default to llama.cpp / LM Studio parity:
+    # edited models have flattened logit distributions, and without these two
+    # protections the SAME weights loop in J-Wash while running fine elsewhere.
+    "min_p": 0.05,  # 0 = off; filters tokens below min_p × top probability
     "max_tokens": 512,
     "seed": -1,  # -1 = random
-    "repetition_penalty": 1.0,  # 1.0 = off
+    "repetition_penalty": 1.1,  # 1.0 = off
+    # thinking-capable chat templates (Qwen3.5 style): False renders the
+    # non-thinking turn; True lets the model reason in <think> first — models
+    # finetuned FOR thinking degrade when it is forced off.
+    "thinking": False,
 }
 
 

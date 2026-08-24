@@ -83,15 +83,19 @@ def _status():
 
 
 def _resolve_token(text):
-    """The EXACT single token for ``text`` (a leading space is significant)."""
+    """The EXACT token(s) for ``text`` (a leading space is significant): a
+    single token when one exists, else the multi-token split (composite)."""
     r = _call("GET", "/api/token-lookup?q=" + urllib.parse.quote(text.strip()))
     cands = r.get("candidates", [])
     for c in cands:
         if c["str"] == text:
             return c
+    for s in r.get("splits", []):
+        if s["str"] == text:
+            return s
     listing = ", ".join(f"{c['id']}:{c['str']!r}" for c in cands) or "none"
     raise ValueError(
-        f"No exact single-token match for {text!r}. A leading space is "
+        f"No exact token match for {text!r}. A leading space is "
         f"significant (mid-sentence words usually need one, e.g. ' model'). "
         f"Candidates: {listing}"
     )
@@ -145,7 +149,8 @@ def _edits_summary():
     }
 
 
-def _add_rule(token, op, factor, replacement, layers):
+def _add_rule(token, op, factor, replacement, layers, keep=None,
+              preserve_lm_head=None):
     st = _status()
     loaded = st.get("loaded")
     if not loaded:
@@ -160,12 +165,22 @@ def _add_rule(token, op, factor, replacement, layers):
         )
     # Force a pure-weights mode: read projection, or W_U abliteration on
     # architectures that normalize their writes (Gemma 2/3 style).
-    pure_mode = "abliteration" if loaded.get("rebase_supported") is False else "readthrough"
-    _call("PATCH", "/api/interventions", {"mode": pure_mode})
+    supports_readthrough = loaded.get("rebase_supported") is not False
+    pure_mode = "readthrough" if supports_readthrough else "abliteration"
+    patch = {"mode": pure_mode}
+    # protect the output vocabulary (readthrough only) so a common source word
+    # like ' user' or ' name' stays usable after the replace
+    if preserve_lm_head is not None and supports_readthrough:
+        patch["preserve_lm_head"] = bool(preserve_lm_head)
+    _call("PATCH", "/api/interventions", patch)
 
-    body = {"token_id": _resolve_token(token)["id"], "mode": op, "factor": float(factor)}
+    tok = _resolve_token(token)
+    body = {"token_ids": tok.get("ids") or [tok["id"]], "mode": op, "factor": float(factor)}
+    if keep is not None:
+        body["keep"] = float(keep)
     if op == "replace":
-        body["replacement_id"] = _resolve_token(replacement)["id"]
+        repl = _resolve_token(replacement)
+        body["replacement_ids"] = repl.get("ids") or [repl["id"]]
     parsed = _parse_layers(layers, loaded.get("n_layers"))
     if parsed is not None:
         body["layers"] = parsed
@@ -211,18 +226,29 @@ def scale_token(token: str, factor: float, layers: str) -> dict:
 
 
 @mcp.tool()
-def replace_token(token: str, replacement: str, layers: str, factor: float = 1.0) -> dict:
+def replace_token(token: str, replacement: str, layers: str, factor: float = 1.0,
+                  keep: float = 0.0, preserve_vocabulary: bool = False) -> dict:
     """Rewrite `token`'s component onto `replacement`'s direction (pure-weights),
     e.g. token=' model', replacement=' fish' to make the model talk like a fish.
+    `token` and `replacement` may be multi-token words (e.g. ' Ametista') — the
+    composite direction is built automatically.
 
     You MUST pass `layers` — it selects the layers where the replacement is
     applied, and WITHOUT it nothing happens. Give a 0-based range or list
     ('19-25', '20,24', or 'all'); call `list_layers` for the model's layers and
-    `find_token` for the exact ' token' strings (both must be single tokens, a
-    leading space usually being significant). `factor` scales the strength
-    (1.0 = full). The mode is forced to pure-weights (faithful to an export).
+    `find_token` for the token strings (a leading space is usually significant).
+    `factor` scales the strength (1.0 = full).
+
+    Two controls protect the ORIGINAL word from becoming unusable (a common
+    failure when replacing an everyday word like ' user' or ' name'):
+    `keep` (0..1) leaves that fraction of the original direction in place, and
+    `preserve_vocabulary=True` leaves the output head untouched so the word
+    stays fully sayable (read-projection architectures only; the concept still
+    shifts through the layers). The mode is forced to pure-weights (faithful to
+    an export).
     """
-    return _add_rule(token, "replace", factor, replacement, layers)
+    return _add_rule(token, "replace", factor, replacement, layers, keep=keep,
+                     preserve_lm_head=preserve_vocabulary)
 
 
 @mcp.tool()

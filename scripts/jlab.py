@@ -66,13 +66,19 @@ def parse_layers(spec, n_layers=None):
 
 
 def resolve_token(text):
-    """EXACT single token for ``text`` (leading space is significant)."""
+    """EXACT token(s) for ``text`` (leading space is significant): a single
+    token when one exists, else the multi-token split (composite rule)."""
     r = call("GET", "/api/token-lookup?q=" + urllib.parse.quote(text.strip()))
     for c in r["candidates"]:
         if c["str"] == text:
             return c
+    for s in r.get("splits", []):
+        if s["str"] == text:
+            return s
     listing = ", ".join(f"{c['id']}:{c['str']!r}" for c in r["candidates"]) or "none"
-    sys.exit(f"exact token {text!r} not found — candidates: {listing}")
+    splits = ", ".join(f"{'+'.join(map(str, s['ids']))}:{s['str']!r}" for s in r.get("splits", []))
+    sys.exit(f"exact token {text!r} not found — candidates: {listing}"
+             + (f" — splits: {splits}" if splits else ""))
 
 
 def show(obj):
@@ -128,16 +134,23 @@ def cmd_rules(args):
 
 def cmd_rule_add(args):
     tok = resolve_token(args.token)
-    body = {"token_id": tok["id"], "mode": args.mode, "factor": args.factor}
+    ids = tok.get("ids") or [tok["id"]]
+    body = {"token_ids": ids, "mode": args.mode, "factor": args.factor}
+    if args.keep is not None:
+        body["keep"] = args.keep
+    if args.anchor_decay is not None:
+        body["anchor_decay"] = args.anchor_decay
     if args.mode == "replace":
         if not args.repl:
             sys.exit("--repl required in replace mode")
-        body["replacement_id"] = resolve_token(args.repl)["id"]
+        repl = resolve_token(args.repl)
+        body["replacement_ids"] = repl.get("ids") or [repl["id"]]
     layers = parse_layers(args.layers)
     if layers is not None:
         body["layers"] = layers
     r = call("POST", "/api/interventions", body)
-    print(f"rule added: «{tok['str']}» (token id {tok['id']})")
+    kind = f"token ids {'+'.join(map(str, ids))} (composite)" if len(ids) > 1 else f"token id {ids[0]}"
+    print(f"rule added: «{tok['str']}» ({kind})")
     show(r)
 
 
@@ -165,6 +178,11 @@ def cmd_scale(args):
 
 def cmd_mode(args):
     show(call("PATCH", "/api/interventions", {"mode": args.value}))
+
+
+def cmd_preserve(args):
+    on = args.value.lower() in ("on", "1", "true", "yes")
+    show(call("PATCH", "/api/interventions", {"preserve_lm_head": on}))
 
 
 def _generate(prompt, system=None, temp=0.0, max_tokens=200, seed=1234):
@@ -280,6 +298,10 @@ def main():
     p.add_argument("--mode", default="scale", choices=["scale", "replace"])
     p.add_argument("--repl", default=None)
     p.add_argument("--factor", type=float, default=None)
+    p.add_argument("--keep", type=float, default=None,
+                   help="replace mode: fraction of the original word kept (0..1)")
+    p.add_argument("--anchor-decay", dest="anchor_decay", type=float, default=None,
+                   help="multi-token replacement: weight of pieces after the first (0..1)")
     p.add_argument("--layers", default=None)
     p.set_defaults(fn=cmd_rule_add, factor_default=True)
 
@@ -302,6 +324,10 @@ def main():
     p = sub.add_parser("mode")
     p.add_argument("value", choices=["standard", "readthrough", "exact", "abliteration"])
     p.set_defaults(fn=cmd_mode)
+
+    p = sub.add_parser("preserve", help="protect the output vocabulary (readthrough only)")
+    p.add_argument("value", choices=["on", "off"])
+    p.set_defaults(fn=cmd_preserve)
 
     p = sub.add_parser("gen")
     p.add_argument("prompt")

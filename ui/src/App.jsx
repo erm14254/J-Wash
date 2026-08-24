@@ -45,7 +45,9 @@ async function jsonFetch(url, options) {
   return body
 }
 
-const SAMPLING_DEFAULT = { temperature: 0.7, top_p: 0.95, top_k: 40, max_tokens: 512, seed: -1, repetition_penalty: 1 }
+// min_p 0.05 + repetition_penalty 1.1 = llama.cpp / LM Studio parity: edited
+// models have flattened distributions and loop without these protections.
+const SAMPLING_DEFAULT = { temperature: 0.7, top_p: 0.95, top_k: 40, min_p: 0.05, max_tokens: 512, seed: -1, repetition_penalty: 1.1, thinking: false }
 
 // Human-readable name of the loaded lens (local path or Hub file) for "which lens do I have?".
 function lensName(meta) {
@@ -186,6 +188,7 @@ export default function App() {
   const [ivRules, setIvRules] = useState([])
   const [ivScale, setIvScale] = useState(1)
   const [ivMode, setIvMode] = useState('standard')
+  const [ivPreserve, setIvPreserve] = useState(false)
   const [editorOpen, setEditorOpen] = useState(false)
   const [editorPrefill, setEditorPrefill] = useState(null)
   const [capLayers, setCapLayers] = useState('')
@@ -248,6 +251,22 @@ export default function App() {
       return saved && typeof saved === 'object' ? { ...SAMPLING_DEFAULT, ...saved } : SAMPLING_DEFAULT
     } catch { return SAMPLING_DEFAULT }
   })
+
+  // Adopt the sampling the model's AUTHOR shipped (generation_config.json) when
+  // a different model gets loaded — llama.cpp/LM Studio honor those values, and
+  // running a model off-spec is a common source of "it loops here but not there".
+  const loadedIdRef = useRef(null)
+  useEffect(() => {
+    const loaded = status?.loaded
+    if (!loaded?.model_id || loaded.model_id === loadedIdRef.current) return
+    const first = loadedIdRef.current === null // page load: keep saved sampling
+    loadedIdRef.current = loaded.model_id
+    const rec = loaded.recommended_sampling
+    if (first || !rec || !Object.keys(rec).length) return
+    setSampling((s) => ({ ...s, ...rec }))
+    const parts = Object.entries(rec).map(([k, v]) => `${k}=${v}`).join(', ')
+    setNotice({ kind: 'ok', text: `sampling set to the model's shipped values (${parts}) — adjust freely` })
+  }, [status?.loaded?.model_id])
 
   const wsRef = useRef(null)
   const draftRef = useRef('')
@@ -381,6 +400,7 @@ export default function App() {
     setIvRules(status.interventions || [])
     if (status.interventions_scale != null) setIvScale(status.interventions_scale)
     if (status.interventions_mode != null) setIvMode(status.interventions_mode)
+    if (status.interventions_preserve_lm_head != null) setIvPreserve(status.interventions_preserve_lm_head)
   }, [status])
 
   // auto-open the token editor when a lens just got loaded
@@ -1743,12 +1763,18 @@ export default function App() {
               onChange={(e) => setSampling({ ...sampling, top_p: +e.target.value })} /></label>
             <label>top_k <input type="number" step="1" min="0" value={sampling.top_k}
               onChange={(e) => setSampling({ ...sampling, top_k: +e.target.value })} /></label>
+            <label title="min-p (llama.cpp style): drops tokens below min_p × the top probability — 0 = off. The main protection against nonsense tails on edited models.">min_p <input type="number" step="0.01" min="0" max="1" value={sampling.min_p ?? 0.05}
+              onChange={(e) => setSampling({ ...sampling, min_p: +e.target.value })} /></label>
             <label>max <input type="number" step="16" min="1" value={sampling.max_tokens}
               onChange={(e) => setSampling({ ...sampling, max_tokens: +e.target.value })} /></label>
             <label title="-1 = random; ≥ 0 = reproducible sampling">seed <input type="number" step="1" min="-1" value={sampling.seed}
               onChange={(e) => setSampling({ ...sampling, seed: Math.trunc(+e.target.value) })} /></label>
-            <label title="repetition penalty — 1 = off, >1 penalizes tokens already in the context (curbs loops)">rep <input type="number" step="0.05" min="1" max="2" value={sampling.repetition_penalty ?? 1}
+            <label title="repetition penalty — 1 = off, >1 penalizes tokens already in the context (curbs loops). LM Studio / llama.cpp default: 1.1.">rep <input type="number" step="0.05" min="1" max="2" value={sampling.repetition_penalty ?? 1.1}
               onChange={(e) => setSampling({ ...sampling, repetition_penalty: +e.target.value })} /></label>
+            <label title="thinking-capable templates (Qwen3 style): let the model reason in <think> before answering. Models finetuned FOR thinking degrade when it is forced off — tick this if the same model behaves better in LM Studio."
+              style={{ display: 'flex', alignItems: 'center', gap: 3 }}>
+              <input type="checkbox" checked={!!sampling.thinking}
+                onChange={(e) => setSampling({ ...sampling, thinking: e.target.checked })} />think</label>
             <button onClick={onRegenerate} disabled={streaming || !messages.some((m) => m.role === 'assistant')}>Regenerate</button>
             <button onClick={onContinue}
               title="extend the last reply: the model picks up exactly where it stopped"
@@ -1795,11 +1821,14 @@ export default function App() {
         onRules={setIvRules}
         onScale={setIvScale}
         onMode={setIvMode}
+        preserve={ivPreserve}
+        onPreserve={setIvPreserve}
         onNotice={(text, kind) => setNotice({ kind: kind || 'err', text })}
         rebaseSupported={status?.loaded?.rebase_supported}
         autoLayerRadius={settings?.auto_layer_radius}
         llamaCppSet={!!settings?.llamacpp_dir}
         ggufState={status?.gguf}
+        wizardState={status?.wizard}
       />
     </>
   )
