@@ -768,7 +768,10 @@ def _edit_fingerprint():
         "scale": interventions.global_scale,
         "mode": interventions.mode,
         "preserve_lm_head": interventions.preserve_lm_head,
-        "rules": interventions.summary(),
+        # drop the session-local rule ids: the SAME edit rebuilt in a new
+        # session must produce the SAME fingerprint, or the cache never reuses
+        "rules": [{k: v for k, v in r.items() if k != "id"}
+                  for r in interventions.summary()],
     }
     blob = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
